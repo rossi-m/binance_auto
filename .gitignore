@@ -1,0 +1,7 @@
+.env.local
+__pycache__/
+*.pyc
+.qoder/
+.venv/
+venv/
+
