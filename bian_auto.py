@@ -8,6 +8,9 @@ ccxt==4.5.33
 pandas_ta==0.4.71b0
 说明:
 该脚本是币安合约交易自动脚本（只交易ETH）
+
+策略：
+该脚本使用了MACD,EMA,BOLL，RSI,ATR，交易量作为指标；15分钟，1小时，4小时多周期共振和长影响趋势判断作为执行策略
 """
 import ccxt  # 导入ccxt库，用于连接加密货币交易所API
 import pandas as pd  # 导入pandas库，用于数据处理和分析
