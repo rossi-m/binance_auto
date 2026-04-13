@@ -10,7 +10,7 @@ pandas_ta==0.4.71b0
 该脚本是币安合约交易自动脚本（只交易ETH）
 
 策略：
-该脚本使用了MACD,EMA,BOLL，RSI,ATR，交易量作为指标；15分钟，1小时，4小时多周期共振和长影响趋势判断作为执行策略
+该脚本使用了MACD,EMA,BOLL，RSI,ATR，交易量作为指标，15分钟，1小时，4小时多周期共振和长影响趋势判断作为执行策略
 """
 import ccxt  # 导入ccxt库，用于连接加密货币交易所API
 import pandas as pd  # 导入pandas库，用于数据处理和分析
@@ -89,6 +89,8 @@ LIQUIDATION_SAFE_BUFFER_RATIO = 0.003  # 止损价和强平价之间至少保留
 ESTIMATED_LIQUIDATION_GUARD_RATIO = 0.8  # 用于开仓前估算强平距离，取 0.8 / 杠杆，故意保守一点
 POSITION_AMT_EPSILON = 1e-8  # 持仓数量小于该阈值视为0，避免浮点噪音误判
 EXTERNAL_CLOSE_CONFIRM_MISS_COUNT = 3  # 连续3轮查不到仓位才触发外部平仓重置，降低瞬时接口波动误判
+OSCILLATION_THRESHOLD_4H = 0.04  # 4H 布林带宽比低于 4% 视为震荡
+OSCILLATION_THRESHOLD_1H = 0.023  # 1H 单独收紧到 2.3%，避免过滤范围过大
 
 # --- 全局运行状态记录 ---
 trade_state = {  # 定义一个字典用于保存当前交易的状态信息
@@ -718,6 +720,8 @@ def format_condition_snapshot_for_mail(timeframe, state):
 
     details = state.get('details', {})
     shadow = details.get('shadow', {})
+    close_long_checks = details.get('close_long_checks', {})
+    close_short_checks = details.get('close_short_checks', {})
     parts = [
         f"{timeframe}信号时间={state.get('signal_bar_time', '')}",
         f"long_trend={state.get('long_trend')}",
@@ -736,6 +740,8 @@ def format_condition_snapshot_for_mail(timeframe, state):
         f"pl={details.get('pl')}",
         f"st={details.get('st')}",
         f"ps={details.get('ps')}",
+        f"close_long_checks={close_long_checks}",
+        f"close_short_checks={close_short_checks}",
         f"shadow={shadow}"
     ]
     return ' | '.join(parts)
@@ -762,8 +768,12 @@ def is_long_upper_shadow(row):
         return False, {'a1': False, 'a2': False, 'a3': False, 'upper_shadow': upper_shadow, 'body': body, 'full_range': full_range}
     # a1：上影线至少占整根K线一半，说明上方抛压很明显
     a1 = safe_ratio(upper_shadow, full_range) >= 0.5
-    # a2：收盘靠近低位，说明冲高之后被压回来了
-    a2 = safe_ratio(abs(row['close'] - row['low']), full_range) <= 0.35
+    # a2：实体顶部靠近低位，说明冲高之后被压回来了
+    #    阳线时 close 是实体顶部，用 |close - low|；阴线时 open 是实体顶部，用 |open - low|
+    if row['close'] >= row['open']:  # 阳线
+        a2 = safe_ratio(abs(row['close'] - row['low']), full_range) <= 0.35
+    else:  # 阴线
+        a2 = safe_ratio(abs(row['open'] - row['low']), full_range) <= 0.35
     # a3：整根K线的波动不能太小，防止把细小抖动误判成强信号
     a3 = full_range >= 0.6 * atr
     # 三个子条件里满足两个，就认为这根K线是长上影线
@@ -792,8 +802,12 @@ def is_long_lower_shadow(row):
         return False, {'b1': False, 'b2': False, 'b3': False, 'lower_shadow': lower_shadow, 'body': body, 'full_range': full_range}
     # b1：下影线至少占整根K线一半，说明下方承接很明显
     b1 = safe_ratio(lower_shadow, full_range) >= 0.5
-    # b2：收盘靠近高位，说明下探之后又被拉回来了
-    b2 = safe_ratio(abs(row['high'] - row['close']), full_range) <= 0.35
+    # b2：实体底部靠近高位，说明下探之后又被拉回来了
+    #    阳线时 open 是实体底部，用 |high - open|；阴线时 close 是实体底部，用 |high - close|
+    if row['close'] >= row['open']:  # 阳线
+        b2 = safe_ratio(abs(row['high'] - row['open']), full_range) <= 0.35
+    else:  # 阴线
+        b2 = safe_ratio(abs(row['high'] - row['close']), full_range) <= 0.35
     # b3：整根K线波动不能太小
     b3 = full_range >= 0.6 * atr
     # 三个子条件里满足两个，就认为这根K线是长下影线
@@ -916,6 +930,7 @@ def evaluate_trend(df, timeframe, time_factor, is_4h=False, now_dt=None):  # 定
         'short_trend': False,    # 标记是否为空头趋势，初始为False
         'close_short': False,    # 标记是否满足强劲空头平仓条件，初始为False
         'close_long': False,     # 标记是否满足强劲多头平仓条件，初始为False
+        'is_oscillation': False, # 标记当前周期是否被识别为震荡行情
         'signal_bar_time': format_bar_time(last['timestamp']), # 当前这次评估对应的已收盘信号K线时间
         'long_upper_shadow': False, # 最新已收盘K线本身是否是长上影线
         'long_lower_shadow': False, # 最新已收盘K线本身是否是长下影线
@@ -932,10 +947,14 @@ def evaluate_trend(df, timeframe, time_factor, is_4h=False, now_dt=None):  # 定
         'upper_shadow_long_protect_ref': None, # 多单因为长上影收紧止损时的新保护位
         'lower_shadow_short_protect_ref': None # 空单因为长下影收紧止损时的新保护位
     }
+    boll_band_width_ratio = safe_ratio(last['boll_up'] - last['boll_dn'], last['boll_dn'])
+    res['boll_band_width_ratio'] = boll_band_width_ratio
+    res['oscillation_threshold'] = None
 
     if is_4h:  # 如果当前评估的是4小时级别数据，执行以下特定逻辑
         # 震荡过滤：(UP - DN) / DN < 0.04 不开仓 (这里仅计算指标，在run_strategy拦截)
-        res['is_oscillation'] = (last['boll_up'] - last['boll_dn']) / last['boll_dn'] < 0.04  # 判断布林带上下轨间距率是否小于0.04，若是则为震荡
+        res['oscillation_threshold'] = OSCILLATION_THRESHOLD_4H
+        res['is_oscillation'] = boll_band_width_ratio < OSCILLATION_THRESHOLD_4H  # 判断布林带上下轨间距率是否小于4H阈值，若是则为震荡
 
         # 4H 四类趋势都额外加入 RSI14 条件，并统一要求至少满足 3 个点
         # A. 空头转多头 -> 回调趋势还是空头 (满足任意3个)
@@ -975,45 +994,60 @@ def evaluate_trend(df, timeframe, time_factor, is_4h=False, now_dt=None):  # 定
         st_c4 = last['rsi'] > 40  # 条件4：最新收盘蜡烛图 RSI14 > 40
         res['short_trend'] = sum([st_c1, st_c2, st_c3, st_c4]) >= 3  # 满足至少3个条件，即判定为空头趋势
 
-        # 空头平仓 (满足2个条件)
-        cs_c1 = last['volume'] < prev['volume']  # 条件1：最新已收盘K线缩量
-        cs_c2 = last['rsi'] < 30  # 条件2：最新已收盘K线RSI处于超卖区域
-        cs_c3 = last['close'] <= last['boll_dn'] or tol(last['close'], last['boll_dn'])  # 条件3：最新已收盘K线收盘价接近或跌破布林下轨
-        res['close_short'] = sum([cs_c1, cs_c2, cs_c3]) >= 2  # 满足至少2个条件，即触发强劲空头平仓信号
+        # 空头平仓：改为“上一根严重超卖 + 当前RSI拐头回升 + 收回布林带内”
+        cs_c1 = prev['rsi'] < 30
+        cs_c2 = last['rsi'] > prev['rsi']
+        cs_c3 = last['close'] > last['boll_dn']
+        res['close_short'] = all([cs_c1, cs_c2, cs_c3])
+        close_short_checks = {
+            'prev_rsi_lt_30': cs_c1,
+            'rsi_rebound': cs_c2,
+            'back_inside_boll_dn': cs_c3
+        }
 
-        # 多头平仓 (满足2个条件)
-        cl_c1 = last['volume'] < prev['volume']  # 条件1：最新已收盘K线缩量
-        cl_c2 = last['rsi'] > 75  # 条件2：最新已收盘K线RSI处于超买区域
-        cl_c3 = last['close'] >= last['boll_up'] or tol(last['close'], last['boll_up'])  # 条件3：最新已收盘K线收盘价接近或突破布林上轨
-        res['close_long'] = sum([cl_c1, cl_c2, cl_c3]) >= 2  # 满足至少2个条件，即触发强劲多头平仓信号
+        # 多头平仓：改为“上一根严重超买 + 当前RSI拐头回落 + 收回布林带内”
+        cl_c1 = prev['rsi'] > 75
+        cl_c2 = last['rsi'] < prev['rsi']
+        cl_c3 = last['close'] < last['boll_up']
+        res['close_long'] = all([cl_c1, cl_c2, cl_c3])
+        close_long_checks = {
+            'prev_rsi_gt_75': cl_c1,
+            'rsi_pullback': cl_c2,
+            'back_inside_boll_up': cl_c3
+        }
 
         # 记录 4H 级别的具体条件判断结果
         res['details'] = {
             'ps': [ps_c1, ps_c2, ps_c3, ps_c4],
             'lt': [lt_c1, lt_c2, lt_c3, lt_c4],
             'pl': [pl_c1, pl_c2, pl_c3, pl_c4],
-            'st': [st_c1, st_c2, st_c3, st_c4]
+            'st': [st_c1, st_c2, st_c3, st_c4],
+            'close_long_checks': close_long_checks,
+            'close_short_checks': close_short_checks
         }
 
     else:  # 如果当前评估的是15分钟或1小时级别数据，执行以下逻辑
         # 15分钟，1小时级别逻辑  # 注释说明这是针对小级别的数据逻辑
-
+        if timeframe == '1h':
+            res['oscillation_threshold'] = OSCILLATION_THRESHOLD_1H
+            res['is_oscillation'] = boll_band_width_ratio < OSCILLATION_THRESHOLD_1H
+ 
         # 回调趋势还是空头 (满足3个条件)
         ps_c1 = last['volume'] > prev['volume']  # 条件1：当前K线成交量相比上一根有所上升
         ps_c2 = last['rsi'] > 40  # 条件2：当前RSI大于40
         ps_c3 = (prev['close'] < min(prev['ema20'], prev['ema50']) and  # 条件3：上一根收盘价低于EMA20/50的极小值，且...
-                 last['open'] < min(last['ema20'], last['ema50']) and prev['close'] < prev['open'])  # 当前开盘价低于EMA极小值，并且上一根是阴线
+                 last['open'] < min(last['ema20'], last['ema50']) and last['close'] < last['open'])  # 当前开盘价低于EMA极小值，并且上一根是阴线
         ps_c4 = (prev['close'] < prev['boll_mid'] and  # 条件4：上一根收盘价低于布林中轨，且...
-                 last['open'] < last['boll_mid'] and prev['close'] < prev['open'])  # 当前开盘价低于布林中轨，并且上一根是阴线
+                 last['open'] < last['boll_mid'] and last['close'] < last['open'])  # 当前开盘价低于布林中轨，并且上一根是阴线
         res['pullback_short'] = sum([ps_c1, ps_c2, ps_c3, ps_c4]) >= 3  # 上述4个条件满足至少3个，判定为回调空头结构
 
         # 多头趋势 (满足3个条件)
         lt_c1 = last['volume'] > prev['volume']  # 条件1：当前K线成交量相比上一根有所上升
         lt_c2 = last['rsi'] < 60  # 条件2：当前RSI小于60
         lt_c3 = (prev['close'] > min(prev['ema20'], prev['ema50']) and  # 条件3：上一根收盘价高于EMA20/50的极小值，且...
-                 last['open'] > min(last['ema20'], last['ema50']) and prev['close'] > prev['open'])  # 当前开盘价高于EMA极小值，并且上一根是阳线
+                 last['open'] > min(last['ema20'], last['ema50']) and last['close'] > last['open'])  # 当前开盘价高于EMA极小值，并且上一根是阳线
         lt_c4 = (prev['close'] > prev['boll_mid'] and  # 条件4：上一根收盘价高于布林中轨，且...
-                 last['open'] > last['boll_mid'] and prev['close'] > prev['open'])  # 当前开盘价高于布林中轨，并且上一根是阳线
+                 last['open'] > last['boll_mid'] and last['close'] > last['open'])  # 当前开盘价高于布林中轨，并且上一根是阳线
         lt_c5 = (last['macd'] > last['macd_signal']) and (abs(last['macd_hist']) > abs(prev['macd_hist']))  # 条件5：MACD为金叉状态（快线>慢线），且当前MACD值比上一个大（动能向上）
         res['long_trend'] = sum([lt_c1, lt_c2, lt_c3, lt_c4, lt_c5]) >= 3  # 上述5个条件满足至少3个，判定为多头趋势
 
@@ -1040,28 +1074,64 @@ def evaluate_trend(df, timeframe, time_factor, is_4h=False, now_dt=None):  # 定
 
         res['short_trend'] = sum([st_c1, st_c2, st_c3, st_c4, st_c5]) >= 3  # 满足至少3个条件，判定为空头趋势
 
-        # 空头平仓 (满足2个条件)
-        cs_c1 = last['volume'] < prev['volume']  # 条件1：最新已收盘K线缩量
-        cs_c2 = last['rsi'] < 30  # 条件2：最新已收盘K线RSI小于30（严重超卖）
-        cs_c3 = last['close'] <= last['boll_dn'] or tol(last['close'], last['boll_dn'])  # 条件3：最新已收盘K线收盘价接近或跌破布林带下轨
-        res['close_short'] = sum([cs_c1, cs_c2, cs_c3]) >= 2  # 满足至少2个条件，触发小级别强劲空头平仓信号
+        if timeframe == '1h':
+            # 1H 空头平仓：上一根先严重超卖/贴下轨，这一根出现阳线反抽且 MACD 动能衰减
+            cs_c1 = prev['close'] <= prev['boll_dn'] or prev['rsi'] < 28
+            cs_c2 = last['close'] > last['open']
+            cs_c3 = abs(last['macd_hist']) < abs(prev['macd_hist'])
+            res['close_short'] = all([cs_c1, cs_c2, cs_c3])
+            close_short_checks = {
+                'prev_touch_boll_dn_or_rsi_lt_28': cs_c1,
+                'bullish_rebound_bar': cs_c2,
+                'macd_hist_weakening': cs_c3
+            }
 
-        # 多头平仓 (满足2个条件)
-        cl_c1 = last['volume'] < prev['volume']  # 条件1：最新已收盘K线缩量
-        cl_c2 = last['rsi'] > 75  # 条件2：最新已收盘K线RSI大于75（严重超买）
-        cl_c3 = last['close'] >= last['boll_up'] or tol(last['close'], last['boll_up'])  # 条件3：最新已收盘K线收盘价接近或突破布林带上轨
-        res['close_long'] = sum([cl_c1, cl_c2, cl_c3]) >= 2  # 满足至少2个条件，触发小级别强劲多头平仓信号
+            # 1H 多头平仓：上一根先严重超买/贴上轨，这一根出现阴线回落且 MACD 动能衰减
+            cl_c1 = prev['close'] >= prev['boll_up'] or prev['rsi'] > 72
+            cl_c2 = last['close'] < last['open']
+            cl_c3 = abs(last['macd_hist']) < abs(prev['macd_hist'])
+            res['close_long'] = all([cl_c1, cl_c2, cl_c3])
+            close_long_checks = {
+                'prev_touch_boll_up_or_rsi_gt_72': cl_c1,
+                'bearish_pullback_bar': cl_c2,
+                'macd_hist_weakening': cl_c3
+            }
+        else:
+            # 15M 维持原有更灵敏的平仓条件
+            cs_c1 = last['volume'] < prev['volume']  # 条件1：最新已收盘K线缩量
+            cs_c2 = last['rsi'] < 30  # 条件2：最新已收盘K线RSI小于30（严重超卖）
+            cs_c3 = last['close'] <= last['boll_dn'] or tol(last['close'], last['boll_dn'])  # 条件3：最新已收盘K线收盘价接近或跌破布林带下轨
+            res['close_short'] = sum([cs_c1, cs_c2, cs_c3]) >= 2  # 满足至少2个条件，触发小级别强劲空头平仓信号
+            close_short_checks = {
+                'volume_shrink': cs_c1,
+                'rsi_lt_30': cs_c2,
+                'touch_or_break_boll_dn': cs_c3
+            }
+
+            # 15M 维持原有更灵敏的平仓条件
+            cl_c1 = last['volume'] < prev['volume']  # 条件1：最新已收盘K线缩量
+            cl_c2 = last['rsi'] > 75  # 条件2：最新已收盘K线RSI大于75（严重超买）
+            cl_c3 = last['close'] >= last['boll_up'] or tol(last['close'], last['boll_up'])  # 条件3：最新已收盘K线收盘价接近或突破布林带上轨
+            res['close_long'] = sum([cl_c1, cl_c2, cl_c3]) >= 2  # 满足至少2个条件，触发小级别强劲多头平仓信号
+            close_long_checks = {
+                'volume_shrink': cl_c1,
+                'rsi_gt_75': cl_c2,
+                'touch_or_break_boll_up': cl_c3
+            }
 
         # 记录 1H / 15M 级别的具体条件判断结果
         res['details'] = {
             'ps': [ps_c1, ps_c2, ps_c3, ps_c4],
             'lt': [lt_c1, lt_c2, lt_c3, lt_c4, lt_c5],
             'pl': [pl_c1, pl_c2, pl_c3, pl_c4, pl_c5],
-            'st': [st_c1, st_c2, st_c3, st_c4, st_c5]
+            'st': [st_c1, st_c2, st_c3, st_c4, st_c5],
+            'close_long_checks': close_long_checks,
+            'close_short_checks': close_short_checks
         }
 
     # 先给影线细节预留一个空字典，只有在 4H / 1H 上才会真正填充内容
     res['details']['shadow'] = {}
+    #包括了，长影线止损，长影线确认反转，判断是否是长影线，长影线是否达到支撑或者压力位置。
     if timeframe in ('4h', '1h'):
         # 先判断最新一根K线是不是长上影线
         last_upper_shadow, last_upper_shadow_details = is_long_upper_shadow(last)
@@ -1453,9 +1523,11 @@ def monitor_position(state_4h, state_1h, state_15m, atr_1h, signal_bar_15m='', a
 
                 # 如果影线没有触发平仓，再退回原来的 close_long 逻辑，4H / 1H 各自独立可平仓
                 if state_4h.get('close_long'):
+                    logging.info(f"4H close_long 触发明细: {format_condition_snapshot_for_mail('4H', state_4h)}")
                     close_position("4H close_long 策略平仓", curr_price, signal_bar_15m=signal_bar_15m, trigger_label="4H close_long")
                     return
                 if state_1h.get('close_long'):
+                    logging.info(f"1H close_long 触发明细: {format_condition_snapshot_for_mail('1H', state_1h)}")
                     close_position("1H close_long 策略平仓", curr_price, signal_bar_15m=signal_bar_15m, trigger_label="1H close_long")
                     return
 
@@ -1526,9 +1598,11 @@ def monitor_position(state_4h, state_1h, state_15m, atr_1h, signal_bar_15m='', a
 
                 # 如果影线没有触发平仓，再退回原来的 close_short 逻辑，4H / 1H 各自独立可平仓
                 if state_4h.get('close_short'):
+                    logging.info(f"4H close_short 触发明细: {format_condition_snapshot_for_mail('4H', state_4h)}")
                     close_position("4H close_short 策略平仓", curr_price, signal_bar_15m=signal_bar_15m, trigger_label="4H close_short")
                     return
                 if state_1h.get('close_short'):
+                    logging.info(f"1H close_short 触发明细: {format_condition_snapshot_for_mail('1H', state_1h)}")
                     close_position("1H close_short 策略平仓", curr_price, signal_bar_15m=signal_bar_15m, trigger_label="1H close_short")
                     return
 
@@ -1720,7 +1794,12 @@ def run_strategy():  # 定义策略运行的主函数，负责统筹数据获取
         return
     # 4. 入场逻辑判断
     # 震荡行情过滤
-    if state_4h.get('is_oscillation', False):  # 检查4H级别的评估结果是否标记为震荡行情
+    if state_4h.get('is_oscillation', False) or state_1h.get('is_oscillation', False):  # 4H 或 1H 任一震荡都先跳过开仓
+        logging.info(
+            "跳过震荡行情: "
+            f"4H宽度比={state_4h.get('boll_band_width_ratio', float('nan')):.4f}, 阈值={state_4h.get('oscillation_threshold')}; "
+            f"1H宽度比={state_1h.get('boll_band_width_ratio', float('nan')):.4f}, 阈值={state_1h.get('oscillation_threshold')}"
+        )
         trade_state['last_processed_bar_15m'] = signal_bar_15m
         return  # 如果是震荡行情，直接返回不开仓
     if signal_bar_15m == trade_state['last_entry_bar_15m'] or signal_bar_15m == trade_state['last_exit_bar_15m']:
