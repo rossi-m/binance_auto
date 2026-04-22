@@ -189,7 +189,7 @@ def start_strategy():
 
         try:
             strategy_proc = subprocess.Popen(
-                [sys.executable, STRATEGY_SCRIPT],
+                ['/home/ubuntu/.local/bin/python', STRATEGY_SCRIPT],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 cwd=PROJECT_ROOT,
@@ -397,6 +397,12 @@ def api_pause_verify():
 # ---------- 入口 ----------
 
 if __name__ == '__main__':
+    # 启动前清理旧日志文件
+    for _f in ['nohup.out', LOG_FILE]:
+        if os.path.exists(_f):
+            os.remove(_f)
+            print(f"已删除: {_f}")
+
     Path(LOG_FILE).touch()
     print(f"监控台启动: http://0.0.0.0:5000")
     print(f"策略脚本: {STRATEGY_SCRIPT}")
