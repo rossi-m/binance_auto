@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ETH 交易策略监控台</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body>
+    <header class="header">
+        <h1><span id="daily-emoji" class="daily-emoji"></span> ETH 交易策略监控台</h1>
+        <div class="status-bar">
+            <button id="btn-theme" class="theme-toggle" title="切换主题">
+                <span id="theme-icon">🌙</span>
+                <span id="theme-label">深色</span>
+            </button>
+            <span id="status-dot" class="dot stopped"></span>
+            <span id="status-text">已停止</span>
+            <span id="pid-label" class="pid"></span>
+        </div>
+    </header>
+
+    <main class="container">
+        <!-- Controls -->
+        <section class="controls card">
+            <button id="btn-start" class="btn btn-start">开始策略</button>
+            <button id="btn-pause" class="btn btn-pause" disabled>暂停策略</button>
+        </section>
+
+        <!-- Stats -->
+        <section class="stats card">
+            <div class="stat-item">
+                <div class="stat-label">当天收益 (USDT)</div>
+                <div id="today-pnl" class="stat-value">--</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-label">整体收益 (USDT)</div>
+                <div id="total-pnl" class="stat-value">--</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-label">总交易笔数</div>
+                <div id="trade-count" class="stat-value">--</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-label">今日交易笔数</div>
+                <div id="today-count" class="stat-value">--</div>
+            </div>
+        </section>
+
+        <!-- Chart -->
+        <section class="chart card">
+            <div class="section-title">本月每日收益折线图</div>
+            <div class="chart-wrap">
+                <canvas id="pnl-chart"></canvas>
+            </div>
+        </section>
+
+        <!-- Logs (above trades) -->
+        <section class="logs card">
+            <div class="section-title">
+                策略日志
+                <label class="autoscroll-label">
+                    <input type="checkbox" id="autoscroll" checked> 自动滚动
+                </label>
+            </div>
+            <div id="log-box" class="log-box"></div>
+        </section>
+
+        <!-- Trades Table -->
+        <section class="trades card">
+            <div class="section-title">
+                交易记录
+                <span id="trades-file" class="file-label"></span>
+                <span id="trades-updated" class="update-label"></span>
+            </div>
+            <div class="table-wrap">
+                <table id="trades-table">
+                    <thead>
+                        <tr>
+                            <th>建仓时间</th>
+                            <th>趋势方向</th>
+                            <th>入场原因</th>
+                            <th>平仓时间</th>
+                            <th>平仓原因</th>
+                            <th>点数盈亏</th>
+                            <th>手续费</th>
+                            <th>净利润(USDT)</th>
+                            <th>是否盈利</th>
+                            <th>持仓秒数</th>
+                        </tr>
+                    </thead>
+                    <tbody id="trades-tbody">
+                        <tr><td colspan="10" class="empty">暂无数据</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+    </main>
+
+    <!-- Start Verification Modal -->
+    <div id="start-modal-overlay" class="modal-overlay hidden">
+        <div class="modal">
+            <div class="modal-title">启动策略 - 邮件验证</div>
+            <p class="modal-desc">验证码已发送至配置邮箱，请输入6位验证码以启动策略。</p>
+            <input id="start-verify-input" type="text" maxlength="6" placeholder="6位验证码" inputmode="numeric">
+            <div class="modal-actions">
+                <button id="start-modal-cancel" class="btn btn-secondary">取消</button>
+                <button id="start-modal-confirm" class="btn btn-start">确认启动</button>
+            </div>
+            <div id="start-modal-error" class="modal-error"></div>
+        </div>
+    </div>
+
+    <!-- Pause Verification Modal -->
+    <div id="modal-overlay" class="modal-overlay hidden">
+        <div class="modal">
+            <div class="modal-title">暂停策略 - 邮件验证</div>
+            <p class="modal-desc">验证码已发送至配置邮箱，请输入6位验证码以暂停策略。</p>
+            <input id="verify-input" type="text" maxlength="6" placeholder="6位验证码" inputmode="numeric">
+            <div class="modal-actions">
+                <button id="modal-cancel" class="btn btn-secondary">取消</button>
+                <button id="modal-confirm" class="btn btn-pause">确认暂停</button>
+            </div>
+            <div id="modal-error" class="modal-error"></div>
+        </div>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>
