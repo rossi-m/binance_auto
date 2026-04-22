@@ -96,9 +96,10 @@ LIQUIDATION_SAFE_BUFFER_RATIO = 0.003  # 止损价和强平价之间至少保留
 ESTIMATED_LIQUIDATION_GUARD_RATIO = 0.8  # 用于开仓前估算强平距离，取 0.8 / 杠杆，故意保守一点
 POSITION_AMT_EPSILON = 1e-8  # 持仓数量小于该阈值视为0，避免浮点噪音误判
 EXTERNAL_CLOSE_CONFIRM_MISS_COUNT = 3  # 连续3轮查不到仓位才触发外部平仓重置，降低瞬时接口波动误判
-OSCILLATION_THRESHOLD_4H = 0.04  # 4H 布林带宽比低于 4% 视为震荡
-OSCILLATION_THRESHOLD_1H = 0.023  # 1H 单独收紧到 2.3%，避免过滤范围过大
+OSCILLATION_THRESHOLD_4H = 0.037  # 4H 布林带宽比低于 3.7% 视为震荡
+OSCILLATION_THRESHOLD_1H = 0.021  # 1H 单独收紧到 2.1%，避免过滤范围过大
 SHADOW_REVERSAL_LOOKBACK_BARS = 4  # 长影线反转信号允许向前追踪的已收盘K线数
+EXTREME_EXIT_LOOKBACK_BARS_1H = 3  # 1H 极值平仓允许向前追踪的参考K数量，给“后续几根确认”留窗口
 EXCHANGE_HTTP_TIMEOUT_MS = 10000  # 单次交易所HTTP请求最多等待10秒，避免底层请求长时间挂起
 FETCH_DF_TASK_TIMEOUT_SECONDS = 15  # 单个周期抓取任务最多等待15秒，超过就跳过本轮
 FETCH_DF_SLOW_LOG_SECONDS = 5  # 单次抓K线+算指标超过5秒就记慢查询日志
@@ -1247,6 +1248,50 @@ def evaluate_trend(df, timeframe, time_factor, is_4h=False, now_dt=None):  # 定
 
         return None
 
+    def find_recent_extreme_exit_reference(direction):
+        """寻找最近几根 1H 极值K，以及其后是否已经出现实体确认。"""
+        max_offset = min(EXTREME_EXIT_LOOKBACK_BARS_1H, last_idx)
+        if max_offset < 1:
+            return None
+
+        for offset in range(1, max_offset + 1):
+            candidate_idx = last_idx - offset
+            candidate = df.iloc[candidate_idx]
+
+            if direction == 'short':
+                extreme_hit = candidate['close'] <= candidate['boll_dn'] or candidate['rsi'] < 30
+                body_threshold = max(candidate['open'], candidate['close'])
+                confirm_cmp = lambda bar_close: bar_close > body_threshold
+            else:
+                extreme_hit = candidate['close'] >= candidate['boll_up'] or candidate['rsi'] > 72
+                body_threshold = min(candidate['open'], candidate['close'])
+                confirm_cmp = lambda bar_close: bar_close < body_threshold
+
+            if not extreme_hit:
+                continue
+
+            confirm_bar_time = ''
+            confirm_close = None
+            confirmed = False
+            for follow_idx in range(candidate_idx + 1, last_idx + 1):
+                follow_bar = df.iloc[follow_idx]
+                if confirm_cmp(follow_bar['close']):
+                    confirmed = True
+                    confirm_bar_time = format_bar_time(follow_bar['timestamp'])
+                    confirm_close = follow_bar['close']
+                    break
+
+            return {
+                'offset': offset,
+                'bar_time': format_bar_time(candidate['timestamp']),
+                'body_threshold': body_threshold,
+                'confirmed': confirmed,
+                'confirm_bar_time': confirm_bar_time,
+                'confirm_close': confirm_close
+            }
+
+        return None
+
     res = {  # 初始化存放各个趋势判断结果的字典
         'pullback_short': False, # 标记是否为回调空头结构，初始为False
         'long_trend': False,     # 标记是否为多头趋势，初始为False
@@ -1351,7 +1396,7 @@ def evaluate_trend(df, timeframe, time_factor, is_4h=False, now_dt=None):  # 定
 
         # 空头平仓：改为“上一根严重超卖 + 当前RSI拐头回升 + 收回布林带内”
         cs_c1 = prev['rsi'] < 32
-        cs_c2 = last['rsi'] > prev['rsi']
+        cs_c2 = last['rsi']-prev['rsi']>4
         cs_c3 = last['close'] > last['boll_dn']
         res['close_short'] = all([cs_c1, cs_c2, cs_c3])
         close_short_checks = {
@@ -1362,7 +1407,7 @@ def evaluate_trend(df, timeframe, time_factor, is_4h=False, now_dt=None):  # 定
 
         # 多头平仓：改为“上一根严重超买 + 当前RSI拐头回落 + 收回布林带内”
         cl_c1 = prev['rsi'] > 70
-        cl_c2 = last['rsi'] < prev['rsi']
+        cl_c2 = last['rsi']-prev['rsi']<-4
         cl_c3 = last['close'] < last['boll_up']
         res['close_long'] = all([cl_c1, cl_c2, cl_c3])
         close_long_checks = {
@@ -1457,27 +1502,43 @@ def evaluate_trend(df, timeframe, time_factor, is_4h=False, now_dt=None):  # 定
         res['short_trend'] = st_ema_or_boll and sum([st_c1, st_c2, st_c3]) >= 2  # 满足至少3个条件，且 EMA/BOLL 至少命中一个
 
         if timeframe == '1h':
-            # 1H 空头平仓：上一根先严重超卖/贴下轨，这一根出现阳线反抽且 MACD 动能衰减
-            cs_c1 = prev['close'] <= prev['boll_dn'] or prev['rsi'] < 30
-            cs_c2 = last['close'] > last['open']
+            # 1H 空头平仓：最近几根先出现严重超卖/贴下轨，后续任一收盘站上参考K实体上沿，再叠加 MACD 动能衰减
+            short_exit_ref = find_recent_extreme_exit_reference('short')
+            cs_c1 = short_exit_ref is not None
+            cs_c2 = bool(short_exit_ref and short_exit_ref['confirmed'])
             cs_c3 = abs(last['macd_hist']) < abs(prev['macd_hist'])
             res['close_short'] = all([cs_c1, cs_c2, cs_c3])
             close_short_checks = {
-                'prev_touch_boll_dn_or_rsi_lt_28': cs_c1,
-                'bullish_rebound_bar': cs_c2,
+                'recent_touch_boll_dn_or_rsi_lt_30': cs_c1,
+                'close_back_above_ref_body_high': cs_c2,
                 'macd_hist_weakening': cs_c3
             }
+            if short_exit_ref:
+                close_short_checks.update({
+                    'ref_bar_time': short_exit_ref['bar_time'],
+                    'ref_offset': short_exit_ref['offset'],
+                    'ref_body_high': short_exit_ref['body_threshold'],
+                    'confirm_bar_time': short_exit_ref['confirm_bar_time'] or '无'
+                })
 
-            # 1H 多头平仓：上一根先严重超买/贴上轨，这一根出现阴线回落且 MACD 动能衰减
-            cl_c1 = prev['close'] >= prev['boll_up'] or prev['rsi'] > 72
-            cl_c2 = last['close'] < last['open']
+            # 1H 多头平仓：最近几根先出现严重超买/贴上轨，后续任一收盘跌破参考K实体下沿，再叠加 MACD 动能衰减
+            long_exit_ref = find_recent_extreme_exit_reference('long')
+            cl_c1 = long_exit_ref is not None
+            cl_c2 = bool(long_exit_ref and long_exit_ref['confirmed'])
             cl_c3 = abs(last['macd_hist']) < abs(prev['macd_hist'])
             res['close_long'] = all([cl_c1, cl_c2, cl_c3])
             close_long_checks = {
-                'prev_touch_boll_up_or_rsi_gt_72': cl_c1,
-                'bearish_pullback_bar': cl_c2,
+                'recent_touch_boll_up_or_rsi_gt_72': cl_c1,
+                'close_back_below_ref_body_low': cl_c2,
                 'macd_hist_weakening': cl_c3
             }
+            if long_exit_ref:
+                close_long_checks.update({
+                    'ref_bar_time': long_exit_ref['bar_time'],
+                    'ref_offset': long_exit_ref['offset'],
+                    'ref_body_low': long_exit_ref['body_threshold'],
+                    'confirm_bar_time': long_exit_ref['confirm_bar_time'] or '无'
+                })
         else:
             # 15M 维持原有更灵敏的平仓条件
             cs_c1 = last['volume'] < prev['volume']  # 条件1：最新已收盘K线缩量
