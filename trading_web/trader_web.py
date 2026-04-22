@@ -9,6 +9,8 @@ import csv
 import time
 import json
 import random
+import signal
+import atexit
 import datetime
 import threading
 import subprocess
@@ -218,6 +220,28 @@ def stop_strategy():
         except Exception as e:
             return False, str(e)
 
+def _cleanup_child():
+    """父进程退出时强制杀掉策略子进程，防止孤儿进程。"""
+    global strategy_proc
+    if strategy_proc is not None and strategy_proc.poll() is None:
+        print(f"[清理] 正在终止策略子进程 PID={strategy_proc.pid} ...")
+        try:
+            strategy_proc.kill()
+            strategy_proc.wait(timeout=5)
+        except Exception:
+            pass
+        strategy_proc = None
+
+atexit.register(_cleanup_child)
+
+def _signal_handler(signum, frame):
+    """收到 SIGTERM/SIGINT 时先清理子进程再退出。"""
+    _cleanup_child()
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, _signal_handler)
+signal.signal(signal.SIGINT, _signal_handler)
+
 # ---------- 路由 ----------
 
 @app.route('/')
@@ -233,6 +257,21 @@ def api_status():
             running = True
             pid = strategy_proc.pid
     return jsonify({'running': running, 'pid': pid})
+
+@app.route('/api/log-content')
+def api_log_content():
+    """读取日志文件最后N行，直接返回给前端展示。"""
+    max_lines = int(request.args.get('lines', 15))
+    try:
+        if not os.path.exists(LOG_FILE):
+            return jsonify({'lines': []})
+        with open(LOG_FILE, 'r', encoding='utf-8', errors='replace') as f:
+            all_lines = f.read().splitlines()
+        # 取最后 max_lines 行
+        recent = all_lines[-max_lines:] if len(all_lines) > max_lines else all_lines
+        return jsonify({'lines': recent})
+    except Exception as e:
+        return jsonify({'lines': [f'[读取日志出错: {e}]']})
 
 @app.route('/api/logs')
 def api_logs():

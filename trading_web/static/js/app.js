@@ -41,9 +41,13 @@
     let statusTimer = null;
     let statsTimer = null;
     let tradesTimer = null;
+    let logTimer = null;
     let lastTradesFetch = 0;
     const TRADES_REFRESH_MS = 2 * 60 * 60 * 1000; // 2 hours
+    const LOG_REFRESH_MS = 3000; // 3秒刷新日志
+    const MAX_LOG_LINES = 15;
     let currentTheme = 'dark';
+    let userScrolled = false; // 用户手动滚动时暂停自动滚动
 
     // ---------- Theme ----------
 
@@ -236,36 +240,55 @@
         }
     }
 
-    // ---------- Logs (SSE) ----------
+    // ---------- Logs (Polling) ----------
 
     function connectLogs() {
-        const source = new EventSource('/api/logs');
-        source.onmessage = (e) => {
-            appendLog(e.data);
-        };
-        source.onerror = () => {
-            console.warn('SSE error, reconnecting...');
-            source.close();
-            setTimeout(connectLogs, 3000);
-        };
+        // 用轮询方式直接加载日志文件内容，避免SSE丢失数据
+        updateLogs();
+        logTimer = setInterval(updateLogs, LOG_REFRESH_MS);
+
+        // 检测用户手动滚动，暂停自动滚动
+        els.logBox.addEventListener('scroll', () => {
+            const atBottom = els.logBox.scrollHeight - els.logBox.scrollTop - els.logBox.clientHeight < 30;
+            if (!atBottom) {
+                userScrolled = true;
+            } else {
+                userScrolled = false;
+            }
+        });
     }
 
-    function appendLog(text) {
-        const line = document.createElement('div');
-        line.className = 'log-line';
-        line.textContent = text;
-        // Colorize by prefix
-        if (text.includes('[ERR]')) line.style.color = '#ef4444';
-        else if (text.includes('【已开仓】') || text.includes('开仓成功')) line.style.color = '#22c55e';
-        else if (text.includes('【已平仓】') || text.includes('清仓成功')) line.style.color = '#f59e0b';
-        els.logBox.appendChild(line);
-        if (els.autoscroll.checked) {
+    async function updateLogs() {
+        try {
+            const data = await apiGet('/api/log-content?lines=' + MAX_LOG_LINES);
+            const lines = data.lines || [];
+            renderLogs(lines);
+        } catch (e) {
+            console.error('logs error', e);
+        }
+    }
+
+    function renderLogs(lines) {
+        // 只在内容变化时更新DOM，避免闪烁
+        const html = lines.map(text => {
+            let color = '';
+            if (text.includes('[ERR]')) color = 'color:#ef4444;';
+            else if (text.includes('【已开仓】') || text.includes('开仓成功')) color = 'color:#22c55e;';
+            else if (text.includes('【已平仓】') || text.includes('清仓成功')) color = 'color:#f59e0b;';
+            return `<div class="log-line" style="${color}">${escHtml(text)}</div>`;
+        }).join('');
+        els.logBox.innerHTML = html;
+
+        // 自动滚动到底部（除非用户手动滚动过）
+        if (els.autoscroll.checked && !userScrolled) {
             els.logBox.scrollTop = els.logBox.scrollHeight;
         }
-        // Keep last 2000 lines to avoid memory bloat
-        while (els.logBox.children.length > 2000) {
-            els.logBox.removeChild(els.logBox.firstChild);
-        }
+    }
+
+    function escHtml(s) {
+        const d = document.createElement('div');
+        d.textContent = s;
+        return d.innerHTML;
     }
 
     // ---------- Trades Table ----------
