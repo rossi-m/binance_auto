@@ -15,6 +15,7 @@ import datetime
 import threading
 import subprocess
 import smtplib
+import sqlite3
 from pathlib import Path
 from email.mime.text import MIMEText
 from email.header import Header
@@ -29,6 +30,7 @@ PROJECT_ROOT = os.path.dirname(WEB_DIR)
 LOCAL_ENV_PATH = os.path.join(PROJECT_ROOT, '.env.local')
 LOG_FILE = os.path.join(WEB_DIR, 'strategy_output.log')
 STRATEGY_SCRIPT = os.path.join(PROJECT_ROOT, 'bian_auto.py')
+STATS_DB_PATH = os.path.join(PROJECT_ROOT, 'trade_stats.db')
 
 # ---------- 环境变量加载 ----------
 
@@ -74,6 +76,11 @@ start_verification_state = {   # 启动策略邮件验证码状态
     'lock': threading.Lock()
 }
 
+stats_sync_state = {
+    'signature': None,
+    'lock': threading.Lock()
+}
+
 # ---------- 工具函数 ----------
 
 def get_current_csv_path():
@@ -107,40 +114,171 @@ def parse_pnl(val):
     except (ValueError, TypeError):
         return 0.0
 
-def compute_stats():
-    all_csv = list_all_csv_files()
-    all_rows = []
-    for fp in all_csv:
-        all_rows.extend(read_csv_rows(fp))
+def ensure_stats_db():
+    with sqlite3.connect(STATS_DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS daily_pnl (
+                trade_day TEXT PRIMARY KEY,
+                pnl REAL NOT NULL DEFAULT 0,
+                trade_count INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
 
+def build_csv_signature(filepaths):
+    signature = []
+    for filepath in filepaths:
+        try:
+            stat = os.stat(filepath)
+            signature.append((filepath, stat.st_mtime_ns, stat.st_size))
+        except FileNotFoundError:
+            continue
+    return tuple(signature)
+
+def aggregate_daily_stats_from_rows(rows):
+    daily_stats = defaultdict(lambda: {'pnl': 0.0, 'trade_count': 0})
+    for row in rows:
+        exit_time = row.get('平仓时间', '')
+        if not exit_time or len(exit_time) < 10:
+            continue
+        trade_day = exit_time[:10]
+        daily_stats[trade_day]['pnl'] += parse_pnl(row.get('净利润(USDT)', '0'))
+        daily_stats[trade_day]['trade_count'] += 1
+    return daily_stats
+
+def sync_daily_stats_from_csv(force=False):
+    ensure_stats_db()
+    all_csv = list_all_csv_files()
+    signature = build_csv_signature(all_csv)
+
+    with stats_sync_state['lock']:
+        if not force and signature == stats_sync_state['signature']:
+            return
+
+        all_rows = []
+        for filepath in all_csv:
+            all_rows.extend(read_csv_rows(filepath))
+
+        daily_stats = aggregate_daily_stats_from_rows(all_rows)
+        now_iso = datetime.datetime.now().isoformat(timespec='seconds')
+
+        with sqlite3.connect(STATS_DB_PATH) as conn:
+            for trade_day, stats in daily_stats.items():
+                conn.execute(
+                    """
+                    INSERT INTO daily_pnl (trade_day, pnl, trade_count, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(trade_day) DO UPDATE SET
+                        pnl = excluded.pnl,
+                        trade_count = excluded.trade_count,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        trade_day,
+                        round(stats['pnl'], 8),
+                        stats['trade_count'],
+                        now_iso
+                    )
+                )
+
+        stats_sync_state['signature'] = signature
+
+def fetch_daily_pnl_rows():
+    sync_daily_stats_from_csv()
+    with sqlite3.connect(STATS_DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT trade_day, pnl, trade_count
+            FROM daily_pnl
+            ORDER BY trade_day ASC
+            """
+        ).fetchall()
+    return rows
+
+def build_period_summaries(daily_rows):
+    yearly_map = defaultdict(lambda: {'pnl': 0.0, 'trade_count': 0})
+    monthly_map = defaultdict(lambda: {'pnl': 0.0, 'trade_count': 0})
+
+    for row in daily_rows:
+        trade_day = row['trade_day']
+        year_key = trade_day[:4]
+        month_key = trade_day[:7]
+        pnl = float(row['pnl'])
+        trade_count = int(row['trade_count'])
+
+        yearly_map[year_key]['pnl'] += pnl
+        yearly_map[year_key]['trade_count'] += trade_count
+        monthly_map[month_key]['pnl'] += pnl
+        monthly_map[month_key]['trade_count'] += trade_count
+
+    yearly_summary = [
+        {
+            'year': year_key,
+            'pnl': round(stats['pnl'], 2),
+            'trade_count': stats['trade_count']
+        }
+        for year_key, stats in sorted(yearly_map.items(), reverse=True)
+    ]
+
+    monthly_summary_by_year = {}
+    for month_key, stats in sorted(monthly_map.items(), reverse=True):
+        year_key = month_key[:4]
+        monthly_summary_by_year.setdefault(year_key, []).append({
+            'month': month_key,
+            'pnl': round(stats['pnl'], 2),
+            'trade_count': stats['trade_count']
+        })
+
+    return yearly_summary, monthly_summary_by_year
+
+def compute_stats():
+    daily_rows = fetch_daily_pnl_rows()
+    now = datetime.datetime.now()
     today_str = datetime.datetime.now().strftime('%Y-%m-%d')
+    current_month_prefix = now.strftime('%Y-%m')
+    current_year_prefix = now.strftime('%Y')
     today_pnl = 0.0
     total_pnl = 0.0
-    daily_map = defaultdict(float)
+    total_trade_count = 0
+    today_trade_count = 0
+    month_pnl = 0.0
+    year_pnl = 0.0
+    daily_chart = []
 
-    for row in all_rows:
-        pnl = parse_pnl(row.get('净利润(USDT)', '0'))
+    for row in daily_rows:
+        trade_day = row['trade_day']
+        pnl = float(row['pnl'])
+        trade_count = int(row['trade_count'])
+
         total_pnl += pnl
-        exit_time = row.get('平仓时间', '')
-        if exit_time and len(exit_time) >= 10:
-            day = exit_time[:10]
-            daily_map[day] += pnl
-            if day == today_str:
-                today_pnl += pnl
+        total_trade_count += trade_count
 
-    # 构建本月折线图数据
-    current_month_prefix = datetime.datetime.now().strftime('%Y-%m')
-    chart_days = sorted([d for d in daily_map if d.startswith(current_month_prefix)])
-    daily_chart = [{'date': d, 'pnl': round(daily_map[d], 2)} for d in chart_days]
+        if trade_day == today_str:
+            today_pnl += pnl
+            today_trade_count += trade_count
+        if trade_day.startswith(current_month_prefix):
+            month_pnl += pnl
+            daily_chart.append({'date': trade_day, 'pnl': round(pnl, 2)})
+        if trade_day.startswith(current_year_prefix):
+            year_pnl += pnl
+
+    yearly_summary, monthly_summary_by_year = build_period_summaries(daily_rows)
 
     return {
         'today_pnl': round(today_pnl, 2),
         'total_pnl': round(total_pnl, 2),
-        'trade_count': len(all_rows),
-        'today_trade_count': sum(
-            1 for r in all_rows
-            if r.get('平仓时间', '').startswith(today_str)
-        ),
+        'trade_count': total_trade_count,
+        'today_trade_count': today_trade_count,
+        'month_pnl': round(month_pnl, 2),
+        'year_pnl': round(year_pnl, 2),
+        'current_month': current_month_prefix,
+        'current_year': current_year_prefix,
+        'available_years': [item['year'] for item in yearly_summary],
+        'yearly_summary': yearly_summary,
+        'monthly_summary_by_year': monthly_summary_by_year,
         'daily_chart': daily_chart
     }
 

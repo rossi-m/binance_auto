@@ -9,23 +9,35 @@
 </head>
 <body>
     <header class="header">
-        <h1><span id="daily-emoji" class="daily-emoji"></span> ETH 交易策略监控台</h1>
+        <div class="brand-block">
+            <div class="header-kicker">ETH Auto Trader</div>
+            <h1><span id="daily-emoji" class="daily-emoji"></span> ETH 交易策略监控台</h1>
+        </div>
         <div class="status-bar">
             <button id="btn-theme" class="theme-toggle" title="切换主题">
                 <span id="theme-icon">🌙</span>
                 <span id="theme-label">深色</span>
             </button>
-            <span id="status-dot" class="dot stopped"></span>
-            <span id="status-text">已停止</span>
-            <span id="pid-label" class="pid"></span>
+            <div class="status-pill">
+                <span id="status-dot" class="dot stopped"></span>
+                <span id="status-text">已停止</span>
+                <span id="pid-label" class="pid"></span>
+            </div>
         </div>
     </header>
 
     <main class="container">
         <!-- Controls -->
         <section class="controls card">
-            <button id="btn-start" class="btn btn-start">开始策略</button>
-            <button id="btn-pause" class="btn btn-pause" disabled>暂停策略</button>
+            <div class="controls-copy">
+                <div class="section-kicker">策略控制</div>
+                <div class="controls-title">运行操作</div>
+                <p class="controls-desc">启动和暂停都需要邮件验证码确认，手机端保留大按钮操作区。</p>
+            </div>
+            <div class="controls-actions">
+                <button id="btn-start" class="btn btn-start">开始策略</button>
+                <button id="btn-pause" class="btn btn-pause" disabled>暂停策略</button>
+            </div>
         </section>
 
         <!-- Stats -->
@@ -33,6 +45,14 @@
             <div class="stat-item">
                 <div class="stat-label">当天收益 (USDT)</div>
                 <div id="today-pnl" class="stat-value">--</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-label">本月收益 (USDT)</div>
+                <div id="month-pnl" class="stat-value">--</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-label">本年收益 (USDT)</div>
+                <div id="year-pnl" class="stat-value">--</div>
             </div>
             <div class="stat-item">
                 <div class="stat-label">整体收益 (USDT)</div>
@@ -48,31 +68,112 @@
             </div>
         </section>
 
+        <section class="performance card">
+            <div class="section-title">
+                <span class="section-title-main">
+                    <span>收益汇总</span>
+                    <span class="section-hint">SQLite 日收益聚合</span>
+                </span>
+                <label class="summary-filter">
+                    <span>查看年份</span>
+                    <select id="summary-year"></select>
+                </label>
+            </div>
+            <div class="performance-grid">
+                <section class="performance-panel">
+                    <div class="performance-panel-title">年度收益</div>
+                    <div id="yearly-summary" class="summary-list">
+                        <div class="summary-empty">暂无数据</div>
+                    </div>
+                </section>
+                <section class="performance-panel">
+                    <div class="performance-panel-title">月度收益</div>
+                    <div id="monthly-summary" class="summary-list">
+                        <div class="summary-empty">暂无数据</div>
+                    </div>
+                </section>
+            </div>
+        </section>
+
         <!-- Chart -->
-        <section class="chart card">
-            <div class="section-title">本月每日收益折线图</div>
-            <div class="chart-wrap">
+        <section id="chart-section" class="chart card collapsible-section" data-section-key="chart">
+            <div class="section-title">
+                <span class="section-title-main">
+                    <span>本月每日收益折线图</span>
+                    <span class="section-hint">聚焦月内波动</span>
+                </span>
+                <button type="button" class="section-toggle" data-target="chart-section" aria-expanded="true">
+                    <span class="section-toggle-text">收起</span>
+                    <span class="section-toggle-icon">⌃</span>
+                </button>
+            </div>
+            <div class="section-body">
+                <div class="chart-summary">
+                    <div class="chart-legend">
+                        <span class="legend-item">
+                            <span class="legend-swatch profit"></span>
+                            <span>盈利区间</span>
+                        </span>
+                        <span class="legend-item">
+                            <span class="legend-swatch loss"></span>
+                            <span>亏损区间</span>
+                        </span>
+                        <span class="legend-item">
+                            <span class="legend-swatch baseline"></span>
+                            <span>盈亏平衡线</span>
+                        </span>
+                    </div>
+                    <div class="chart-metrics">
+                        <div class="chart-metric">
+                            <span class="chart-metric-label">盈利天数</span>
+                            <span id="chart-win-days" class="chart-metric-value">--</span>
+                        </div>
+                        <div class="chart-metric">
+                            <span class="chart-metric-label">亏损天数</span>
+                            <span id="chart-loss-days" class="chart-metric-value">--</span>
+                        </div>
+                        <div class="chart-metric">
+                            <span class="chart-metric-label">最佳单日</span>
+                            <span id="chart-best-day" class="chart-metric-value">--</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="chart-wrap">
                 <canvas id="pnl-chart"></canvas>
+                </div>
             </div>
         </section>
 
         <!-- Logs (above trades) -->
-        <section class="logs card">
+        <section id="logs-section" class="logs card collapsible-section" data-section-key="logs">
             <div class="section-title">
-                策略日志
-                <label class="autoscroll-label">
-                    <input type="checkbox" id="autoscroll" checked> 自动滚动
-                </label>
+                <span class="section-title-main">
+                    <span>策略日志</span>
+                    <label class="autoscroll-label">
+                        <input type="checkbox" id="autoscroll" checked> 自动滚动
+                    </label>
+                </span>
+                <button type="button" class="section-toggle" data-target="logs-section" aria-expanded="true">
+                    <span class="section-toggle-text">收起</span>
+                    <span class="section-toggle-icon">⌃</span>
+                </button>
             </div>
-            <div id="log-box" class="log-box"></div>
+            <div class="section-body">
+                <div id="log-box" class="log-box"></div>
+            </div>
         </section>
 
         <!-- Trades Table -->
         <section class="trades card">
             <div class="section-title">
-                交易记录
-                <span id="trades-file" class="file-label"></span>
-                <span id="trades-updated" class="update-label"></span>
+                <span>交易记录</span>
+                <span class="section-meta">
+                    <span id="trades-file" class="file-label"></span>
+                    <span id="trades-updated" class="update-label"></span>
+                </span>
+            </div>
+            <div id="trades-mobile-list" class="trades-mobile-list">
+                <div class="trade-mobile-empty">暂无数据</div>
             </div>
             <div class="table-wrap">
                 <table id="trades-table">
@@ -97,6 +198,11 @@
             </div>
         </section>
     </main>
+
+    <div class="mobile-action-dock" aria-label="移动端快捷操作">
+        <button id="btn-start-mobile" class="btn btn-start">开始策略</button>
+        <button id="btn-pause-mobile" class="btn btn-pause" disabled>暂停策略</button>
+    </div>
 
     <!-- Start Verification Modal -->
     <div id="start-modal-overlay" class="modal-overlay hidden">

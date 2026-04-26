@@ -9,7 +9,7 @@
 - **图表**: Chart.js v4 (CDN)
 - **进程管理**: `subprocess.Popen` + `threading`
 - **实时日志**: Server-Sent Events (SSE)
-- **数据源**: `trades_log_YYYY-MM.csv` 文件
+- **数据源**: `trades_log_YYYY-MM.csv` + `trade_stats.db`（SQLite 日收益汇总）
 
 ## 3. 功能模块
 
@@ -20,9 +20,11 @@
 - 日志面板自动滚动，鼠标悬停可暂停
 
 ### 3.2 收益统计
-- **当天收益**: 今日所有平仓交易的 `净利润(USDT)` 求和
+- **当天收益**: 从 SQLite 日收益汇总读取今日 `净利润(USDT)` 聚合值
 - **本月折线图**: 按日聚合当月净利润，Chart.js 渲染
-- **整体收益**: 跨所有历史 CSV 文件的净利润累计
+- **整体收益**: 跨所有历史日收益数据的净利润累计
+- **本月 / 本年收益**: 从 SQLite 日收益汇总按月份、年份聚合
+- **年/月汇总**: 按年查看全年收益，按选中年份查看各月收益
 - **交易笔数**: 总笔数 / 今日笔数
 
 ### 3.3 交易记录表格
@@ -52,7 +54,7 @@
 | GET | `/api/status` | 策略运行状态 JSON |
 | GET | `/api/logs` | SSE 日志流 |
 | GET | `/api/trades` | 当月交易数据 JSON |
-| GET | `/api/stats` | 统计数据 JSON |
+| GET | `/api/stats` | 统计数据 JSON（今日 / 本月 / 本年 / 整体 / 年月汇总 / 曲线） |
 | POST | `/api/start` | 启动策略 |
 | POST | `/api/pause-request` | 请求暂停验证码 |
 | POST | `/api/pause-verify` | 验证并暂停 |
@@ -66,7 +68,8 @@
 ```
 binance/
 ├── bian_auto.py                    # 原策略脚本（不动）
-├── trades_log_2026-04.csv          # 交易记录 CSV（不动）
+├── trades_log_2026-04.csv          # 交易记录 CSV（按月）
+├── trade_stats.db                  # SQLite 日收益汇总
 ├── .env.local                      # 环境变量（不动）
 └── trading_web/                    # Web 监控台目录
     ├── trader_web.py               # Flask 后端
@@ -94,8 +97,10 @@ binance/
 
 ## 8. 数据流
 ```
-trades_log_2026-04.csv  ->  trader_web.py 读取并解析
-                        ->  /api/stats 计算聚合数据
-                        ->  /api/trades 返回原始行
-                        ->  前端渲染表格和 Chart.js 折线图
+trades_log_2026-04.csv  ->  bian_auto.py 平仓时写入
+trade_stats.db          ->  bian_auto.py 同步更新日收益
+CSV 历史文件            ->  trader_web.py 启动/查询时补齐同步到 SQLite
+trade_stats.db          ->  /api/stats 返回今日、本月、本年、整体、年/月汇总和曲线
+当月 CSV                ->  /api/trades 返回原始行
+前端                    ->  渲染表格、汇总列表和 Chart.js 折线图
 ```
