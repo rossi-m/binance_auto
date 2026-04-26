@@ -20,7 +20,11 @@ DEEPSEEK_BASE_URL=https://api.deepseek.com
 DEEPSEEK_MODEL=deepseek-v4-pro
 DEEPSEEK_THINKING_ENABLED=true
 DEEPSEEK_TIMEOUT_SECONDS=18
+# 表示单次调用 DeepSeek 时，AI 最多输出 700 个 token
 DEEPSEEK_MAX_TOKENS=700
+# 表示喂给 AI 的最近已收盘 K 线数量是 3 根，用来压缩行情上下文，减少 token 消耗
 DEEPSEEK_BAR_LIMIT=3
+# 表示“AI 开仓审核异常时，是否还允许开仓”。
 DEEPSEEK_ALLOW_ENTRY_ON_ERROR=false
+# 表示“AI 平仓审核异常时，是否还允许平仓”。
 DEEPSEEK_ALLOW_EXIT_ON_ERROR=true
