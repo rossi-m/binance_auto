@@ -1,0 +1,26 @@
+# bian_auto_deepseek.py 当前版本环境变量
+# 注意：脚本里启用了 exchange.enable_demo_trading(True)，当前默认是币安合约模拟盘
+
+# 必填：币安 API（模拟盘或你自己准备的对应 key）
+BINANCE_API_KEY=your_binance_api_key
+BINANCE_SECRET_KEY=your_binance_secret_key
+
+# 可选：邮件通知。不需要通知可以留空
+SMTP_HOST=smtp.qq.com
+SMTP_PORT=465
+EMAIL_SENDER=
+EMAIL_PASSWORD=
+EMAIL_RECEIVER=
+
+# DeepSeek AI 审核层
+# 当前脚本默认启用；如果你暂时不想让 AI 参与开平仓审核，可改成 false
+DEEPSEEK_AI_ENABLED=true
+DEEPSEEK_API_KEY=your_deepseek_api_key
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEEPSEEK_MODEL=deepseek-v4-pro
+DEEPSEEK_THINKING_ENABLED=true
+DEEPSEEK_TIMEOUT_SECONDS=18
+DEEPSEEK_MAX_TOKENS=700
+DEEPSEEK_BAR_LIMIT=3
+DEEPSEEK_ALLOW_ENTRY_ON_ERROR=false
+DEEPSEEK_ALLOW_EXIT_ON_ERROR=true
