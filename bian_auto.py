@@ -104,7 +104,7 @@ LIQUIDATION_SAFE_BUFFER_RATIO = 0.003  # 止损价和强平价之间至少保留
 ESTIMATED_LIQUIDATION_GUARD_RATIO = 0.8  # 用于开仓前估算强平距离，取 0.8 / 杠杆，故意保守一点
 POSITION_AMT_EPSILON = 1e-8  # 持仓数量小于该阈值视为0，避免浮点噪音误判
 EXTERNAL_CLOSE_CONFIRM_MISS_COUNT = 3  # 连续3轮查不到仓位才触发外部平仓重置，降低瞬时接口波动误判
-OSCILLATION_THRESHOLD_4H = 0.037  # 4H 布林带宽比低于 3.7% 视为震荡
+OSCILLATION_THRESHOLD_4H = 0.033  # 4H 布林带宽比低于 3.7% 视为震荡
 OSCILLATION_THRESHOLD_1H = 0.020  # 1H 单独收紧到 2%，避免过滤范围过大
 SHADOW_REVERSAL_LOOKBACK_BARS = 4  # 长影线反转信号允许向前追踪的已收盘K线数
 SHADOW_REVERSAL_CONFIRM_MAX_OFFSET_BARS = 3  # 长影线反转确认最多只允许引用 3 根以内的参考K，避免信号过期
@@ -732,9 +732,7 @@ def update_daily_pnl_stats(exit_time, net_pnl_usdt):
 def fetch_open_close_position_orders(side=None):
     """读取当前仓位方向上的全平仓条件单，便于做撤单确认和冲突排查。"""
     try:
-        # 对 Binance U 本位合约，closePosition 条件单属于 conditional/algo orders，
-        # 这里必须显式声明 trigger=True，CCXT 才会走 openAlgoOrders 接口。
-        open_orders = exchange.fetch_open_orders(SYMBOL, params={'trigger': True})
+        open_orders = exchange.fetch_open_orders(SYMBOL)
     except Exception as e:
         logging.warning(f"查询未成交条件单失败: {e}")
         return None
@@ -922,8 +920,7 @@ def cancel_protective_stop_order(silent=False):
     cancel_failed = False
     for stop_order_id in stop_order_ids:
         try:
-            # 对 Binance U 本位合约条件单，撤单也必须显式走 conditional/algo 接口。
-            exchange.cancel_order(stop_order_id, SYMBOL, params={'trigger': True})
+            exchange.cancel_order(stop_order_id, SYMBOL)
             if not silent:
                 logging.info(f"已撤销旧服务端止损单: {stop_order_id}")
         except Exception as e:
