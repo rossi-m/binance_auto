@@ -2139,6 +2139,7 @@ def evaluate_trend(df, timeframe, time_factor, is_4h=False, now_dt=None):  # 定
         upper_shadow_mid_hit = upper_shadow_candidate is not None and last['close'] <= upper_shadow_candidate['body_mid']
         upper_shadow_body_low_hit = upper_shadow_candidate is not None and last['close'] <= upper_shadow_candidate['body_low']
         lower_shadow_mid_hit = lower_shadow_candidate is not None and last['close'] >= lower_shadow_candidate['body_mid']
+        lower_shadow_body_high_hit = lower_shadow_candidate is not None and last['close'] >= lower_shadow_candidate['body_high']
         upper_shadow_offset_ok = upper_shadow_candidate is not None and upper_shadow_candidate.get('offset', 99) <= SHADOW_REVERSAL_CONFIRM_MAX_OFFSET_BARS
         lower_shadow_offset_ok = lower_shadow_candidate is not None and lower_shadow_candidate.get('offset', 99) <= SHADOW_REVERSAL_CONFIRM_MAX_OFFSET_BARS
         upper_shadow_bearish_confirm = last['close'] < last['open']
@@ -2216,6 +2217,7 @@ def evaluate_trend(df, timeframe, time_factor, is_4h=False, now_dt=None):  # 定
             'upper_shadow_mid_hit': upper_shadow_mid_hit,
             'upper_shadow_body_low_hit': upper_shadow_body_low_hit,
             'lower_shadow_mid_hit': lower_shadow_mid_hit,
+            'lower_shadow_body_high_hit': lower_shadow_body_high_hit,
             'upper_shadow_offset_ok': upper_shadow_offset_ok,
             'lower_shadow_offset_ok': lower_shadow_offset_ok,
             'upper_shadow_bearish_confirm': upper_shadow_bearish_confirm,
@@ -3012,7 +3014,7 @@ def run_strategy():  # 定义策略运行的主函数，负责统筹数据获取
     if reversal_conflict:
         logging.info("检测到多空影线确认反转同时出现，跳过影线反转开仓，继续等待趋势分支")
 
-    if not reversal_conflict and reversal_long_state is not None and long_cond_15m and not upper_shadow_filter_long:
+    if not reversal_conflict and reversal_long_state is not None and (long_cond_15m or reversal_long_state.get('details', {}).get('shadow', {}).get('lower_shadow_body_high_hit')) and not upper_shadow_filter_long:
         try:
             # 真正下单时，还是以当前最新成交价作为入场价
             curr_price = get_latest_price()
