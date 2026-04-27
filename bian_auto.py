@@ -732,7 +732,9 @@ def update_daily_pnl_stats(exit_time, net_pnl_usdt):
 def fetch_open_close_position_orders(side=None):
     """读取当前仓位方向上的全平仓条件单，便于做撤单确认和冲突排查。"""
     try:
-        open_orders = exchange.fetch_open_orders(SYMBOL)
+        # 对 Binance U 本位合约，closePosition 条件单属于 conditional/algo orders，
+        # 这里必须显式声明 trigger=True，CCXT 才会走 openAlgoOrders 接口。
+        open_orders = exchange.fetch_open_orders(SYMBOL, params={'trigger': True})
     except Exception as e:
         logging.warning(f"查询未成交条件单失败: {e}")
         return None
@@ -920,7 +922,8 @@ def cancel_protective_stop_order(silent=False):
     cancel_failed = False
     for stop_order_id in stop_order_ids:
         try:
-            exchange.cancel_order(stop_order_id, SYMBOL)
+            # 对 Binance U 本位合约条件单，撤单也必须显式走 conditional/algo 接口。
+            exchange.cancel_order(stop_order_id, SYMBOL, params={'trigger': True})
             if not silent:
                 logging.info(f"已撤销旧服务端止损单: {stop_order_id}")
         except Exception as e:
