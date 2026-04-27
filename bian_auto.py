@@ -230,6 +230,72 @@ def extract_order_id(order):
     return ''
 
 
+def format_exception_message(error):
+    """尽量把异常格式化成稳定可读的字符串。"""
+    if error is None:
+        return ''
+    text = str(error).strip()
+    if text:
+        return text
+    return repr(error)
+
+
+def clear_local_stop_order_state():
+    """清空本地缓存的服务端止损单状态。"""
+    trade_state['stop_order_id'] = ''
+    trade_state['stop_order_price'] = 0.0
+
+
+def extract_order_timestamp_ms(order):
+    """尽量提取订单时间戳，便于在多张条件单里选最新的一张。"""
+    if not isinstance(order, dict):
+        return 0
+
+    info = order.get('info', {})
+    if not isinstance(info, dict):
+        info = {}
+
+    candidates = [
+        order.get('timestamp'),
+        order.get('lastTradeTimestamp'),
+        info.get('updateTime'),
+        info.get('workingTime'),
+        info.get('time')
+    ]
+    for candidate in candidates:
+        try:
+            if candidate not in (None, ''):
+                return int(candidate)
+        except Exception:
+            continue
+    return 0
+
+
+def extract_order_stop_price(order):
+    """从交易所订单对象里提取条件触发价。"""
+    if not isinstance(order, dict):
+        return None
+
+    info = order.get('info', {})
+    if not isinstance(info, dict):
+        info = {}
+
+    candidates = [
+        order.get('stopPrice'),
+        order.get('triggerPrice'),
+        info.get('stopPrice'),
+        info.get('triggerPrice'),
+        info.get('activatePrice')
+    ]
+    for candidate in candidates:
+        try:
+            if candidate not in (None, ''):
+                return float(candidate)
+        except Exception:
+            continue
+    return None
+
+
 def format_order_id_lines(open_order_id='', close_order_id='', stop_order_id=''):
     """把可用的订单ID格式化成邮件/日志可直接复用的多行文本"""
     lines = []
@@ -678,24 +744,114 @@ def fetch_open_close_position_orders(side=None):
     return matched_orders
 
 
-def wait_until_stop_order_disappears(stop_order_id, side, retries=STOP_ORDER_CANCEL_CONFIRM_RETRIES, sleep_seconds=STOP_ORDER_CANCEL_CONFIRM_SLEEP_SECONDS):
+def fetch_open_protective_stop_orders(side=None):
+    """读取当前方向的 STOP / STOP_MARKET 全平仓条件单。"""
+    matched_orders = fetch_open_close_position_orders(side=side)
+    if matched_orders is None:
+        return None
+
+    stop_orders = []
+    for order in matched_orders:
+        order_type = str(order.get('type') or order.get('info', {}).get('type') or '').strip().upper()
+        if order_type in ('STOP', 'STOP_MARKET'):
+            stop_orders.append(order)
+    return stop_orders
+
+
+def pick_active_protective_stop_order(orders, preferred_order_id=''):
+    """在多张候选止损单里优先选本地记录对应的，否则选最新的一张。"""
+    if not orders:
+        return None
+
+    preferred_order_id = str(preferred_order_id or '')
+    if preferred_order_id:
+        for order in orders:
+            if extract_order_id(order) == preferred_order_id:
+                return order
+
+    return max(orders, key=extract_order_timestamp_ms)
+
+
+def sync_protective_stop_order_state(side=None, silent=False):
+    """用交易所未成交条件单刷新本地 stop_order 缓存。"""
+    side = side or trade_state.get('side', '')
+    if not side:
+        return None
+
+    stop_orders = fetch_open_protective_stop_orders(side=side)
+    if stop_orders is None:
+        return None
+
+    local_order_id = str(trade_state.get('stop_order_id', '') or '')
+    local_stop_price = float(trade_state.get('stop_order_price', 0.0) or 0.0)
+
+    if not stop_orders:
+        if local_order_id or local_stop_price:
+            if not silent:
+                logging.warning(
+                    f"交易所未找到当前方向的服务端止损单，已清空本地缓存: "
+                    f"side={side}, local_order_id={local_order_id}, local_stop={local_stop_price}"
+                )
+            clear_local_stop_order_state()
+        return {'orders': [], 'active_order': None, 'active_order_id': '', 'active_stop_price': 0.0}
+
+    active_order = pick_active_protective_stop_order(stop_orders, preferred_order_id=local_order_id)
+    active_order_id = extract_order_id(active_order)
+    active_stop_price = extract_order_stop_price(active_order)
+    if active_stop_price is None:
+        active_stop_price = local_stop_price
+
+    if len(stop_orders) > 1 and not silent:
+        order_ids = [extract_order_id(order) or 'unknown' for order in stop_orders]
+        logging.warning(f"检测到同方向存在多张服务端止损单: side={side}, order_ids={order_ids}，将优先处理 {active_order_id}")
+
+    if (local_order_id != active_order_id) or (
+        active_stop_price and abs(local_stop_price - active_stop_price) > 1e-12
+    ):
+        if not silent:
+            logging.info(
+                f"已按交易所状态刷新服务端止损缓存: side={side}, "
+                f"local_order_id={local_order_id}, exchange_order_id={active_order_id}, "
+                f"local_stop={local_stop_price}, exchange_stop={active_stop_price}"
+            )
+        trade_state['stop_order_id'] = active_order_id
+        trade_state['stop_order_price'] = float(active_stop_price or 0.0)
+
+    return {
+        'orders': stop_orders,
+        'active_order': active_order,
+        'active_order_id': active_order_id,
+        'active_stop_price': float(active_stop_price or 0.0)
+    }
+
+
+def wait_until_stop_order_disappears(stop_order_ids, side, retries=STOP_ORDER_CANCEL_CONFIRM_RETRIES, sleep_seconds=STOP_ORDER_CANCEL_CONFIRM_SLEEP_SECONDS):
     """轮询确认指定止损单已经不在交易所未成交列表里。"""
-    if not stop_order_id:
+    if not stop_order_ids:
         return True
 
-    target_order_id = str(stop_order_id)
+    if isinstance(stop_order_ids, (list, tuple, set)):
+        target_order_ids = {str(order_id) for order_id in stop_order_ids if order_id}
+    else:
+        target_order_ids = {str(stop_order_ids)}
+    if not target_order_ids:
+        return True
+
     for attempt in range(1, retries + 1):
-        matched_orders = fetch_open_close_position_orders(side=side)
+        matched_orders = fetch_open_protective_stop_orders(side=side)
         if matched_orders is None:
             time.sleep(sleep_seconds)
             continue
 
-        still_exists = any(extract_order_id(order) == target_order_id for order in matched_orders)
-        if not still_exists:
+        remaining_ids = [
+            extract_order_id(order) for order in matched_orders
+            if extract_order_id(order) in target_order_ids
+        ]
+        if not remaining_ids:
             return True
 
         logging.info(
-            f"等待旧服务端止损单从交易所消失: order_id={target_order_id}, "
+            f"等待旧服务端止损单从交易所消失: order_ids={remaining_ids}, "
             f"attempt={attempt}/{retries}"
         )
         time.sleep(sleep_seconds)
@@ -705,8 +861,21 @@ def wait_until_stop_order_disappears(stop_order_id, side, retries=STOP_ORDER_CAN
 
 def is_close_position_conflict_error(error):
     """识别 Binance 同方向 closePosition 条件单冲突(-4130)。"""
-    error_text = str(error)
+    error_text = format_exception_message(error)
     return 'code":-4130' in error_text or 'closePosition in the direction is existing' in error_text
+
+
+def is_order_already_absent_error(error):
+    """识别撤单时常见的“订单已不存在”类错误。"""
+    error_text = format_exception_message(error).lower()
+    absent_markers = (
+        'code":-2011',
+        'unknown order',
+        'order does not exist',
+        'order not found',
+        'cancel rejected'
+    )
+    return any(marker in error_text for marker in absent_markers)
 
 
 def reset_stop_order_refresh_failure_state():
@@ -733,20 +902,53 @@ def handle_stop_order_refresh_failure(close_reason, curr_price, signal_bar_15m='
 
 def cancel_protective_stop_order(silent=False):
     """撤销当前记录的服务端止损单，平仓或替换止损时要先撤旧单"""
-    stop_order_id = trade_state.get('stop_order_id', '')
-    if not stop_order_id:
+    side = trade_state.get('side', '')
+    sync_result = sync_protective_stop_order_state(side=side, silent=True) if side else None
+    stop_order_ids = []
+    if sync_result is not None:
+        stop_order_ids = [extract_order_id(order) for order in sync_result['orders'] if extract_order_id(order)]
+
+    local_stop_order_id = str(trade_state.get('stop_order_id', '') or '')
+    if local_stop_order_id and local_stop_order_id not in stop_order_ids:
+        stop_order_ids.append(local_stop_order_id)
+
+    stop_order_ids = list(dict.fromkeys([order_id for order_id in stop_order_ids if order_id]))
+    if not stop_order_ids:
+        clear_local_stop_order_state()
         return True
-    try:
-        exchange.cancel_order(stop_order_id, SYMBOL)
-        if not silent:
-            logging.info(f"已撤销旧服务端止损单: {stop_order_id}")
-        trade_state['stop_order_id'] = ''
-        trade_state['stop_order_price'] = 0.0
-        return True
-    except Exception as e:
-        if not silent:
-            logging.warning(f"撤销服务端止损单失败({stop_order_id}): {e}")
+
+    cancel_failed = False
+    for stop_order_id in stop_order_ids:
+        try:
+            exchange.cancel_order(stop_order_id, SYMBOL)
+            if not silent:
+                logging.info(f"已撤销旧服务端止损单: {stop_order_id}")
+        except Exception as e:
+            error_text = format_exception_message(e)
+            trade_state['last_stop_order_refresh_error'] = error_text
+
+            if is_order_already_absent_error(e):
+                if not silent:
+                    logging.warning(f"撤销服务端止损单时提示已不存在，按成功处理({stop_order_id}): {error_text}")
+                continue
+
+            matched_orders = fetch_open_protective_stop_orders(side=side or None)
+            if matched_orders is not None:
+                still_exists = any(extract_order_id(order) == str(stop_order_id) for order in matched_orders)
+                if not still_exists:
+                    if not silent:
+                        logging.warning(f"撤单接口报错，但旧服务端止损单已不在交易所未成交列表中，按成功处理({stop_order_id}): {error_text}")
+                    continue
+
+            cancel_failed = True
+            if not silent:
+                logging.warning(f"撤销服务端止损单失败({stop_order_id}): {error_text}")
+
+    if cancel_failed:
         return False
+
+    clear_local_stop_order_state()
+    return True
 
 
 def refresh_protective_stop_order(stop_price):
@@ -755,15 +957,28 @@ def refresh_protective_stop_order(stop_price):
         return True
 
     side = trade_state['side']
-    previous_stop_order_id = trade_state.get('stop_order_id', '')
-    if previous_stop_order_id:
+    sync_result = sync_protective_stop_order_state(side=side, silent=True)
+    previous_stop_order_ids = []
+    if sync_result is not None:
+        previous_stop_order_ids = [extract_order_id(order) for order in sync_result['orders'] if extract_order_id(order)]
+    elif trade_state.get('stop_order_id', ''):
+        previous_stop_order_ids = [trade_state.get('stop_order_id', '')]
+
+    if previous_stop_order_ids:
         if not cancel_protective_stop_order(silent=True):
-            logging.error(f"撤销旧服务端止损单失败，已取消重挂: order_id={previous_stop_order_id}")
+            trade_state['last_stop_order_refresh_error'] = (
+                trade_state.get('last_stop_order_refresh_error', '') or
+                f"cancel stop order failed: order_ids={previous_stop_order_ids}"
+            )
+            logging.error(f"撤销旧服务端止损单失败，已取消重挂: order_ids={previous_stop_order_ids}")
             return False
 
-        if not wait_until_stop_order_disappears(previous_stop_order_id, side=side):
+        if not wait_until_stop_order_disappears(previous_stop_order_ids, side=side):
+            trade_state['last_stop_order_refresh_error'] = (
+                f"old stop order still visible after cancel confirm retries: order_ids={previous_stop_order_ids}"
+            )
             logging.error(
-                f"旧服务端止损单撤销后仍未从交易所消失，已取消重挂: order_id={previous_stop_order_id}"
+                f"旧服务端止损单撤销后仍未从交易所消失，已取消重挂: order_ids={previous_stop_order_ids}"
             )
             return False
 
@@ -784,7 +999,8 @@ def refresh_protective_stop_order(stop_price):
             )
             return True
         except Exception as e:
-            trade_state['last_stop_order_refresh_error'] = str(e)
+            error_text = format_exception_message(e)
+            trade_state['last_stop_order_refresh_error'] = error_text
             if is_close_position_conflict_error(e) and attempt < len(retry_delays):
                 matched_orders = fetch_open_close_position_orders(side=side)
                 matched_order_ids = []
@@ -792,11 +1008,11 @@ def refresh_protective_stop_order(stop_price):
                     matched_order_ids = [extract_order_id(order) or 'unknown' for order in matched_orders]
                 logging.warning(
                     f"重挂服务端止损单遇到 closePosition 冲突，准备重试: attempt={attempt}, "
-                    f"stop={stop_price}, open_close_position_orders={matched_order_ids}, error={e}"
+                    f"stop={stop_price}, open_close_position_orders={matched_order_ids}, error={error_text}"
                 )
                 continue
 
-            logging.error(f"重挂服务端止损单失败: {e}")
+            logging.error(f"重挂服务端止损单失败: {error_text}")
             return False
 
     return False
@@ -1921,6 +2137,7 @@ def evaluate_trend(df, timeframe, time_factor, is_4h=False, now_dt=None):  # 定
         upper_shadow_candidate = find_recent_shadow_candidate('upper')
         lower_shadow_candidate = find_recent_shadow_candidate('lower')
         upper_shadow_mid_hit = upper_shadow_candidate is not None and last['close'] <= upper_shadow_candidate['body_mid']
+        upper_shadow_body_low_hit = upper_shadow_candidate is not None and last['close'] <= upper_shadow_candidate['body_low']
         lower_shadow_mid_hit = lower_shadow_candidate is not None and last['close'] >= lower_shadow_candidate['body_mid']
         upper_shadow_offset_ok = upper_shadow_candidate is not None and upper_shadow_candidate.get('offset', 99) <= SHADOW_REVERSAL_CONFIRM_MAX_OFFSET_BARS
         lower_shadow_offset_ok = lower_shadow_candidate is not None and lower_shadow_candidate.get('offset', 99) <= SHADOW_REVERSAL_CONFIRM_MAX_OFFSET_BARS
@@ -1997,6 +2214,7 @@ def evaluate_trend(df, timeframe, time_factor, is_4h=False, now_dt=None):  # 定
             'upper_reversal_volume_ok': upper_reversal_volume_ok,
             'lower_reversal_volume_ok': lower_reversal_volume_ok,
             'upper_shadow_mid_hit': upper_shadow_mid_hit,
+            'upper_shadow_body_low_hit': upper_shadow_body_low_hit,
             'lower_shadow_mid_hit': lower_shadow_mid_hit,
             'upper_shadow_offset_ok': upper_shadow_offset_ok,
             'lower_shadow_offset_ok': lower_shadow_offset_ok,
@@ -2248,7 +2466,6 @@ def monitor_position(state_4h, state_1h, state_15m, atr_1h, atr_4h, signal_bar_1
             signal_bar_15m and
             signal_bar_15m != trade_state.get('last_shadow_adjust_bar_15m', '')
         )
-
         # --- A. 多单监控 ---
         if trade_state['side'] == 'long':  # 如果当前持仓方向为做多
             # 更新最高价
@@ -2812,7 +3029,7 @@ def run_strategy():  # 定义策略运行的主函数，负责统筹数据获取
         trade_state['last_processed_bar_15m'] = signal_bar_15m
         return
 
-    if not reversal_conflict and reversal_short_state is not None and short_cond_15m and not lower_shadow_filter_short:
+    if not reversal_conflict and reversal_short_state is not None and (short_cond_15m or reversal_short_state.get('details', {}).get('shadow', {}).get('upper_shadow_body_low_hit')) and not lower_shadow_filter_short:
         try:
             # 真正下单时，还是以当前最新成交价作为入场价
             curr_price = get_latest_price()
