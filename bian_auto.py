@@ -703,13 +703,18 @@ def stop_price_is_still_valid(entry_price, stop_price, side):
 def place_protective_stop_order(side, stop_price):
     """在交易所挂一个服务端 STOP_MARKET 止损单，避免本地轮询来不及止损"""
     stop_side = 'sell' if side == 'long' else 'buy'
-    # Binance 的全平仓条件单使用 closePosition 即可，额外传 reduceOnly 会报 -1106。
+    amount = float(trade_state.get('amount', 0.0) or 0.0)
+    if amount <= 0:
+        raise RuntimeError("缺少有效持仓数量，无法挂 reduceOnly 服务端止损单")
+
+    # 使用显式数量 + reduceOnly，避免 closePosition 条件单在 demo/futures 环境里查不到、
+    # 撤不掉，进而导致后续重挂持续 -4130 冲突。
     params = {
         'stopPrice': stop_price,
-        'closePosition': True,
+        'reduceOnly': True,
         'workingType': STOP_WORKING_TYPE
     }
-    return exchange.create_order(SYMBOL, 'STOP_MARKET', stop_side, None, None, params)
+    return exchange.create_order(SYMBOL, 'STOP_MARKET', stop_side, amount, None, params)
 
 
 def normalize_exchange_bool(value):
@@ -733,7 +738,10 @@ def is_close_position_conditional_order(order, side=None):
     close_position = normalize_exchange_bool(
         info.get('closePosition', order.get('closePosition'))
     )
-    if not close_position:
+    reduce_only = normalize_exchange_bool(
+        info.get('reduceOnly', order.get('reduceOnly'))
+    )
+    if not close_position and not reduce_only:
         return False
 
     order_type = str(order.get('type') or info.get('type') or '').strip().upper()
@@ -812,6 +820,7 @@ def normalize_raw_open_order(raw_order):
         'timestamp': raw_order.get('time') or raw_order.get('updateTime') or raw_order.get('workingTime'),
         'stopPrice': raw_order.get('stopPrice') or raw_order.get('triggerPrice') or raw_order.get('activatePrice'),
         'closePosition': raw_order.get('closePosition'),
+        'reduceOnly': raw_order.get('reduceOnly'),
         'info': raw_order
     }
 
@@ -874,6 +883,41 @@ def fetch_open_protective_stop_orders(side=None):
         if order_type in ('STOP', 'STOP_MARKET'):
             stop_orders.append(order)
     return stop_orders
+
+
+def cancel_all_open_orders_for_symbol(silent=False):
+    """撤销当前交易对的所有未成交单，用作 closePosition 隐藏冲突的最后恢复手段。"""
+    cancel_succeeded = False
+    error_messages = []
+
+    try:
+        exchange.cancel_all_orders(SYMBOL, {'type': 'future'})
+        cancel_succeeded = True
+        if not silent:
+            logging.warning(f"已通过 cancel_all_orders 撤销 {SYMBOL} 全部未成交单")
+    except Exception as unified_error:
+        error_messages.append(f"cancel_all_orders failed: {format_exception_message(unified_error)}")
+
+    raw_method = getattr(exchange, 'fapiPrivateDeleteAllOpenOrders', None)
+    if raw_method is not None:
+        try:
+            raw_method({'symbol': get_exchange_symbol_id()})
+            cancel_succeeded = True
+            if not silent:
+                logging.warning(f"已通过原始接口撤销 {SYMBOL} 全部未成交单")
+        except Exception as raw_error:
+            error_messages.append(f"raw cancel all failed: {format_exception_message(raw_error)}")
+    else:
+        error_messages.append("raw cancel all failed: fapiPrivateDeleteAllOpenOrders unavailable")
+
+    if cancel_succeeded:
+        clear_local_stop_order_state()
+        return True
+
+    trade_state['last_stop_order_refresh_error'] = '; '.join(error_messages)
+    if not silent:
+        logging.warning(f"批量撤销 {SYMBOL} 未成交单失败: {trade_state['last_stop_order_refresh_error']}")
+    return False
 
 
 def pick_active_protective_stop_order(orders, preferred_order_id=''):
@@ -1021,12 +1065,13 @@ def handle_stop_order_refresh_failure(close_reason, curr_price, signal_bar_15m='
 def cancel_protective_stop_order(silent=False):
     """撤销当前记录的服务端止损单，平仓或替换止损时要先撤旧单"""
     side = trade_state.get('side', '')
+    local_stop_order_id_before_sync = str(trade_state.get('stop_order_id', '') or '')
     sync_result = sync_protective_stop_order_state(side=side, silent=True) if side else None
     stop_order_ids = []
     if sync_result is not None:
         stop_order_ids = [extract_order_id(order) for order in sync_result['orders'] if extract_order_id(order)]
 
-    local_stop_order_id = str(trade_state.get('stop_order_id', '') or '')
+    local_stop_order_id = str(trade_state.get('stop_order_id', '') or '') or local_stop_order_id_before_sync
     if local_stop_order_id and local_stop_order_id not in stop_order_ids:
         stop_order_ids.append(local_stop_order_id)
 
@@ -1075,12 +1120,14 @@ def refresh_protective_stop_order(stop_price):
         return True
 
     side = trade_state['side']
+    local_stop_order_id_before_sync = str(trade_state.get('stop_order_id', '') or '')
     sync_result = sync_protective_stop_order_state(side=side, silent=True)
     previous_stop_order_ids = []
     if sync_result is not None:
         previous_stop_order_ids = [extract_order_id(order) for order in sync_result['orders'] if extract_order_id(order)]
-    elif trade_state.get('stop_order_id', ''):
-        previous_stop_order_ids = [trade_state.get('stop_order_id', '')]
+    local_stop_order_id = str(trade_state.get('stop_order_id', '') or '') or local_stop_order_id_before_sync
+    if local_stop_order_id and local_stop_order_id not in previous_stop_order_ids:
+        previous_stop_order_ids.append(local_stop_order_id)
 
     if previous_stop_order_ids:
         if not cancel_protective_stop_order(silent=True):
@@ -1133,7 +1180,18 @@ def refresh_protective_stop_order(stop_price):
                                 f"closePosition 冲突恢复失败：撤销旧条件单失败，order_ids={matched_order_ids}"
                             )
                             return False
-                        wait_until_stop_order_disappears(matched_order_ids, side=side)
+                        if not wait_until_stop_order_disappears(matched_order_ids, side=side):
+                            logging.warning(
+                                f"closePosition 冲突恢复时旧条件单仍可见，准备继续重试: order_ids={matched_order_ids}"
+                            )
+                    else:
+                        logging.warning("closePosition 冲突但未查询到具体条件单，准备批量撤销当前交易对未成交单后重试")
+                        if not cancel_all_open_orders_for_symbol(silent=True):
+                            logging.error(
+                                f"closePosition 冲突恢复失败：批量撤销未成交单失败，error={trade_state.get('last_stop_order_refresh_error', '')}"
+                            )
+                            return False
+                        time.sleep(max(STOP_ORDER_POST_CANCEL_DELAY_SECONDS, 0.5))
                 logging.warning(
                     f"重挂服务端止损单遇到 closePosition 冲突，准备重试: attempt={attempt}, "
                     f"stop={stop_price}, open_close_position_orders={matched_order_ids}, error={error_text}"
