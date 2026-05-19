@@ -12,6 +12,11 @@ pandas_ta==0.4.71b0
 策略：
 该脚本使用了MACD,EMA,BOLL，RSI,ATR，交易量作为指标，15分钟，1小时，4小时多周期共振和长影响趋势判断作为执行策略
 """
+import os  # 导入os模块，用于处理系统级操作和环境变量
+
+# pandas_ta 会触发 numba 缓存；部分服务器/打包环境没有可用locator，会导致启动即失败。
+os.environ.setdefault('NUMBA_DISABLE_JIT', '1')
+
 import ccxt  # 导入ccxt库，用于连接加密货币交易所API
 import pandas as pd  # 导入pandas库，用于数据处理和分析
 import pandas_ta as ta  # 导入pandas_ta库，用于计算技术指标（如EMA, MACD, BOLL等）
@@ -20,7 +25,7 @@ import logging  # 导入logging库，用于记录程序运行日志
 import smtplib  # 导入smtplib库，用于发送邮件通知
 from email.mime.text import MIMEText  # 导入MIMEText，用于构建纯文本格式的邮件内容
 from email.header import Header  # 导入Header，用于设置邮件头信息（如主题等）
-import os,sys  # 导入os和sys模块，用于处理系统级操作和路径（目前未深入使用）
+import sys  # 导入sys模块，用于处理系统级操作和路径（目前未深入使用）
 import concurrent.futures  # 导入concurrent.futures模块，用于并行执行多个任务
 import csv  # 导入csv库，用于将交易记录写入文件
 import datetime  # 导入datetime库，用于获取和格式化时间
@@ -116,6 +121,7 @@ FETCH_DF_SLOW_LOG_SECONDS = 5  # 单次抓K线+算指标超过5秒就记慢查�
 MAIN_LOOP_SLEEP_SECONDS = 1  # 主循环正常节奏
 MAIN_LOOP_ERROR_SLEEP_SECONDS = 5  # 主循环遇到顶层异常后，先休息5秒再继续
 HEARTBEAT_INTERVAL_SECONDS = 15 * 60  # 每15分钟输出一次心跳日志，方便判断进程是否还活着
+MAX_SIGNAL_BAR_STALENESS_SECONDS = 45 * 60  # 15M信号K线最多允许落后45分钟，防止交易所/测试网返回旧K线
 
 # --- 全局运行状态记录 ---
 trade_state = {  # 定义一个字典用于保存当前交易的状态信息
@@ -149,7 +155,9 @@ trade_state = {  # 定义一个字典用于保存当前交易的状态信息
     'last_entry_bar_15m': '',     # 最近一次入场所对应的15M已收盘信号K线时间（防止同根K线重复开仓）
     'last_exit_bar_15m': '',      # 最近一次平仓所对应的15M已收盘信号K线时间（防止同根K线平仓后立即重开）
     'last_processed_bar_15m': '', # 最近一次已处理过的15M已收盘信号K线时间（核心去重字段，防止同一根K线重复执行策略逻辑）
+    'max_seen_bar_15m': '',       # 运行期间见过的最大15M信号时间，防止接口回跳旧K线后被当成新信号
     'last_shadow_adjust_bar_15m': '',  # 最近一次因影线调整止损的15M信号时间（防止同根K线重复收紧止损）
+    'used_shadow_reference_keys': set(),  # 已使用过的影线参考K，避免同一根1H/4H影线反复开仓
     'position_miss_count': 0  # 连续几轮未在交易所查到仓位，用于避免误判“外部平仓”
 }
 
@@ -518,6 +526,58 @@ def get_closed_bar_time(df, timeframe, now_dt=None):
     return format_bar_time(df.iloc[closed_idx]['timestamp'])
 
 
+def parse_bar_time(value):
+    """把CSV/状态里的K线时间字符串解析成东八区datetime。"""
+    if not value:
+        return None
+    try:
+        parsed = datetime.datetime.strptime(str(value), BAR_TIME_FORMAT)
+        return parsed.replace(tzinfo=EXCHANGE_TZ)
+    except Exception:
+        return None
+
+
+def validate_signal_bar_15m(signal_bar_15m, now_dt=None):
+    """校验15M信号K线是否新鲜且相对历史最大值单调向前。"""
+    if not signal_bar_15m:
+        return {'valid': False, 'is_new': False, 'reason': 'empty'}
+
+    signal_dt = parse_bar_time(signal_bar_15m)
+    if signal_dt is None:
+        return {'valid': False, 'is_new': False, 'reason': 'parse_failed'}
+
+    if now_dt is None:
+        now_dt = get_server_now_dt()
+    elif now_dt.tzinfo is None:
+        now_dt = now_dt.replace(tzinfo=EXCHANGE_TZ)
+    else:
+        now_dt = now_dt.astimezone(EXCHANGE_TZ)
+
+    signal_close_dt = signal_dt + datetime.timedelta(seconds=TIMEFRAME_SECONDS['15m'])
+    stale_seconds = (now_dt - signal_close_dt).total_seconds()
+    if stale_seconds < -5:
+        return {'valid': False, 'is_new': False, 'reason': 'future_bar', 'stale_seconds': stale_seconds}
+    if stale_seconds > MAX_SIGNAL_BAR_STALENESS_SECONDS:
+        return {'valid': False, 'is_new': False, 'reason': 'stale_bar', 'stale_seconds': stale_seconds}
+
+    max_seen_dt = parse_bar_time(trade_state.get('max_seen_bar_15m', ''))
+    if max_seen_dt is not None and signal_dt < max_seen_dt:
+        return {
+            'valid': False,
+            'is_new': False,
+            'reason': 'bar_time_rollback',
+            'max_seen_bar_15m': trade_state.get('max_seen_bar_15m', ''),
+            'stale_seconds': stale_seconds
+        }
+
+    last_processed_dt = parse_bar_time(trade_state.get('last_processed_bar_15m', ''))
+    is_new = last_processed_dt is None or signal_dt > last_processed_dt
+    if max_seen_dt is None or signal_dt > max_seen_dt:
+        trade_state['max_seen_bar_15m'] = signal_bar_15m
+
+    return {'valid': True, 'is_new': is_new, 'reason': 'ok', 'stale_seconds': stale_seconds}
+
+
 def get_latest_price():
     """获取最新成交价，用于真实下单和风控"""
     ticker = exchange.fetch_ticker(SYMBOL)
@@ -729,13 +789,71 @@ def update_daily_pnl_stats(exit_time, net_pnl_usdt):
         logging.warning(f"写入 SQLite 日收益失败: {e}")
 
 
+def get_exchange_symbol_id():
+    """获取交易所原生symbol，未load_markets时用ETHUSDT兜底。"""
+    try:
+        market = exchange.market(SYMBOL)
+        market_id = market.get('id')
+        if market_id:
+            return market_id
+    except Exception:
+        pass
+    return SYMBOL.replace('/', '').replace(':USDT', '')
+
+
+def normalize_raw_open_order(raw_order):
+    """把交易所原始未成交单包装成可复用的CCXT-like结构。"""
+    if not isinstance(raw_order, dict):
+        return raw_order
+    return {
+        'id': raw_order.get('orderId') or raw_order.get('id') or raw_order.get('clientOrderId'),
+        'type': raw_order.get('type'),
+        'side': raw_order.get('side'),
+        'timestamp': raw_order.get('time') or raw_order.get('updateTime') or raw_order.get('workingTime'),
+        'stopPrice': raw_order.get('stopPrice') or raw_order.get('triggerPrice') or raw_order.get('activatePrice'),
+        'closePosition': raw_order.get('closePosition'),
+        'info': raw_order
+    }
+
+
+def fetch_raw_future_open_orders():
+    """直接调用币安U本位未成交单接口，补齐CCXT统一接口漏掉的条件单。"""
+    method = getattr(exchange, 'fapiPrivateGetOpenOrders', None)
+    if method is None:
+        return []
+    try:
+        raw_orders = method({'symbol': get_exchange_symbol_id()})
+    except Exception as e:
+        logging.warning(f"原始接口查询U本位未成交单失败: {e}")
+        return None
+    if not isinstance(raw_orders, list):
+        return []
+    return [normalize_raw_open_order(order) for order in raw_orders]
+
+
 def fetch_open_close_position_orders(side=None):
     """读取当前仓位方向上的全平仓条件单，便于做撤单确认和冲突排查。"""
+    open_orders = []
+    unified_fetch_failed = False
     try:
         open_orders = exchange.fetch_open_orders(SYMBOL)
     except Exception as e:
         logging.warning(f"查询未成交条件单失败: {e}")
-        return None
+        unified_fetch_failed = True
+        open_orders = []
+
+    raw_open_orders = fetch_raw_future_open_orders()
+    if raw_open_orders is None:
+        if unified_fetch_failed:
+            return None
+        raw_open_orders = []
+    if raw_open_orders:
+        known_order_ids = {extract_order_id(order) for order in open_orders if extract_order_id(order)}
+        for raw_order in raw_open_orders:
+            raw_order_id = extract_order_id(raw_order)
+            if raw_order_id and raw_order_id in known_order_ids:
+                continue
+            open_orders.append(raw_order)
 
     matched_orders = []
     for order in open_orders:
@@ -1006,6 +1124,16 @@ def refresh_protective_stop_order(stop_price):
                 matched_order_ids = []
                 if matched_orders is not None:
                     matched_order_ids = [extract_order_id(order) or 'unknown' for order in matched_orders]
+                    if matched_order_ids:
+                        logging.warning(
+                            f"发现导致 closePosition 冲突的未成交条件单，准备撤销后重试: order_ids={matched_order_ids}"
+                        )
+                        if not cancel_protective_stop_order(silent=True):
+                            logging.error(
+                                f"closePosition 冲突恢复失败：撤销旧条件单失败，order_ids={matched_order_ids}"
+                            )
+                            return False
+                        wait_until_stop_order_disappears(matched_order_ids, side=side)
                 logging.warning(
                     f"重挂服务端止损单遇到 closePosition 冲突，准备重试: attempt={attempt}, "
                     f"stop={stop_price}, open_close_position_orders={matched_order_ids}, error={error_text}"
@@ -1485,6 +1613,47 @@ def pick_state_signal(state_4h, state_1h, key):
         return '1H', state_1h
     # 两个周期都没有这个信号，就返回空结果
     return '', None
+
+
+def get_shadow_reference_key(side, trigger_tf, state):
+    """生成影线参考K去重key，防止同一根影线被反复交易。"""
+    if not state or side not in ('long', 'short'):
+        return ''
+    if side == 'long':
+        reference_bar = state.get('shadow_lower_reference_bar', '')
+        shadow_label = 'lower'
+    else:
+        reference_bar = state.get('shadow_upper_reference_bar', '')
+        shadow_label = 'upper'
+    if not reference_bar:
+        return ''
+    return f"{side}:{trigger_tf}:{shadow_label}:{reference_bar}"
+
+
+def get_used_shadow_reference_keys():
+    """读取并规范化已使用影线参考K集合。"""
+    used_keys = trade_state.get('used_shadow_reference_keys')
+    if isinstance(used_keys, set):
+        return used_keys
+    if isinstance(used_keys, (list, tuple)):
+        normalized = set(used_keys)
+    elif used_keys:
+        normalized = {str(used_keys)}
+    else:
+        normalized = set()
+    trade_state['used_shadow_reference_keys'] = normalized
+    return normalized
+
+
+def is_shadow_reference_used(shadow_reference_key):
+    if not shadow_reference_key:
+        return False
+    return shadow_reference_key in get_used_shadow_reference_keys()
+
+
+def mark_shadow_reference_used(shadow_reference_key):
+    if shadow_reference_key:
+        get_used_shadow_reference_keys().add(shadow_reference_key)
 
 
 def clamp(value, min_value, max_value):
@@ -2568,12 +2737,17 @@ def monitor_position(state_4h, state_1h, state_15m, atr_1h, atr_4h, signal_bar_1
 
                 # 如果已经满足完整的反手做空条件，直接平多并反手开空
                 if entry_allowed and not reversal_conflict and reversal_short_state is not None and short_cond_15m and not lower_shadow_filter_short:
+                    shadow_reference_key = get_shadow_reference_key('short', reversal_short_tf, reversal_short_state)
+                    if is_shadow_reference_used(shadow_reference_key):
+                        logging.info(f"跳过已使用过的影线反转空参考K，不执行多转空: {shadow_reference_key}")
+                        return
                     if close_position(f"{reversal_short_tf} 长上影确认反转平多并开空", curr_price, signal_bar_15m=signal_bar_15m, trigger_label=f"{reversal_short_tf} 长上影确认反转平多并开空"):
                         try:
                             reverse_price = get_latest_price()
                             reverse_sl = reversal_short_state.get('shadow_short_stop_ref')
                             if reverse_sl is None or pd.isna(reverse_sl):
                                 reverse_sl = reverse_price + atr_4h
+                            mark_shadow_reference_used(shadow_reference_key)
                             if open_order('short', reverse_price, reverse_sl, state_4h, state_1h, state_15m, signal_bar_15m, entry_reason='shadow_reversal_short', entry_trigger_tf=reversal_short_tf):
                                 logging.info(f"{reversal_short_tf} 影线反转触发，已完成多转空")
                         except Exception:
@@ -2721,12 +2895,17 @@ def monitor_position(state_4h, state_1h, state_15m, atr_1h, atr_4h, signal_bar_1
 
                 # 如果已经满足完整的反手做多条件，直接平空并反手开多
                 if entry_allowed and not reversal_conflict and reversal_long_state is not None and long_cond_15m and not upper_shadow_filter_long:
+                    shadow_reference_key = get_shadow_reference_key('long', reversal_long_tf, reversal_long_state)
+                    if is_shadow_reference_used(shadow_reference_key):
+                        logging.info(f"跳过已使用过的影线反转多参考K，不执行空转多: {shadow_reference_key}")
+                        return
                     if close_position(f"{reversal_long_tf} 长下影确认反转平空并开多", curr_price, signal_bar_15m=signal_bar_15m, trigger_label=f"{reversal_long_tf} 长下影确认反转平空并开多"):
                         try:
                             reverse_price = get_latest_price()
                             reverse_sl = reversal_long_state.get('shadow_long_stop_ref')
                             if reverse_sl is None or pd.isna(reverse_sl):
                                 reverse_sl = reverse_price - atr_4h
+                            mark_shadow_reference_used(shadow_reference_key)
                             if open_order('long', reverse_price, reverse_sl, state_4h, state_1h, state_15m, signal_bar_15m, entry_reason='shadow_reversal_long', entry_trigger_tf=reversal_long_tf):
                                 logging.info(f"{reversal_long_tf} 影线反转触发，已完成空转多")
                         except Exception:
@@ -2963,7 +3142,14 @@ def run_strategy():  # 定义策略运行的主函数，负责统筹数据获取
     state_1h = evaluate_trend(df_1h, '1h', time_factor=1.3, is_4h=False, now_dt=server_now_dt)  # 调用评估函数，计算1H级别的状态，时间系数设为1.3
     state_15m = evaluate_trend(df_15m, '15m', time_factor=1.8, is_4h=False, now_dt=server_now_dt)  # 调用评估函数，计算15M级别的状态，时间系数设为1.8
     signal_bar_15m = get_closed_bar_time(df_15m, '15m', now_dt=server_now_dt)
-    is_new_signal_bar = signal_bar_15m and signal_bar_15m != trade_state['last_processed_bar_15m']
+    signal_bar_guard = validate_signal_bar_15m(signal_bar_15m, now_dt=server_now_dt)
+    if not signal_bar_guard['valid']:
+        logging.warning(
+            f"跳过异常15M信号K线: signal={signal_bar_15m}, reason={signal_bar_guard.get('reason')}, "
+            f"max_seen={signal_bar_guard.get('max_seen_bar_15m', trade_state.get('max_seen_bar_15m', ''))}, "
+            f"stale_seconds={signal_bar_guard.get('stale_seconds')}"
+        )
+    is_new_signal_bar = bool(signal_bar_guard['valid'] and signal_bar_guard['is_new'])
     last_closed_idx_4h = get_last_closed_index(df_4h, '4h', now_dt=server_now_dt)
     last_closed_idx_1h = get_last_closed_index(df_1h, '1h', now_dt=server_now_dt)
     if last_closed_idx_4h is None or last_closed_idx_1h is None:
@@ -2973,7 +3159,8 @@ def run_strategy():  # 定义策略运行的主函数，负责统筹数据获取
     atr_1h = atr_1h * 1.5
     # 3. 检查是否有持仓
     if trade_state['has_position']:  # 判断当前是否已经有仓位在手
-        monitor_position(state_4h, state_1h, state_15m, atr_1h, atr_4h, signal_bar_15m=signal_bar_15m, allow_strategy_close=is_new_signal_bar)  # 如果有持仓，进入监控持仓和止盈止损逻辑
+        effective_signal_bar_15m = signal_bar_15m if signal_bar_guard['valid'] else ''
+        monitor_position(state_4h, state_1h, state_15m, atr_1h, atr_4h, signal_bar_15m=effective_signal_bar_15m, allow_strategy_close=is_new_signal_bar)  # 如果有持仓，进入监控持仓和止盈止损逻辑
         if is_new_signal_bar:
             trade_state['last_processed_bar_15m'] = signal_bar_15m
         return  # 监控结束后直接返回，不需要执行开仓逻辑
@@ -3016,6 +3203,11 @@ def run_strategy():  # 定义策略运行的主函数，负责统筹数据获取
 
     if not reversal_conflict and reversal_long_state is not None and (long_cond_15m or reversal_long_state.get('details', {}).get('shadow', {}).get('lower_shadow_body_high_hit')) and not upper_shadow_filter_long:
         try:
+            shadow_reference_key = get_shadow_reference_key('long', reversal_long_tf, reversal_long_state)
+            if is_shadow_reference_used(shadow_reference_key):
+                logging.info(f"跳过已使用过的影线反转多参考K: {shadow_reference_key}")
+                trade_state['last_processed_bar_15m'] = signal_bar_15m
+                return
             # 真正下单时，还是以当前最新成交价作为入场价
             curr_price = get_latest_price()
             # 影线反转单优先使用影线结构给出的止损位
@@ -3024,8 +3216,11 @@ def run_strategy():  # 定义策略运行的主函数，负责统筹数据获取
             if sl_price is None or pd.isna(sl_price):
                 sl_price = curr_price - atr_4h
             # entry_reason 会被写进状态、通知和 CSV，后面一看就知道是影线反转多单
-            open_order('long', curr_price, sl_price, state_4h, state_1h, state_15m, signal_bar_15m, entry_reason='shadow_reversal_long', entry_trigger_tf=reversal_long_tf)
-            logging.info(f"{reversal_long_tf} 长下影确认反转多单开仓成功")
+            mark_shadow_reference_used(shadow_reference_key)
+            if open_order('long', curr_price, sl_price, state_4h, state_1h, state_15m, signal_bar_15m, entry_reason='shadow_reversal_long', entry_trigger_tf=reversal_long_tf):
+                logging.info(f"{reversal_long_tf} 长下影确认反转多单开仓成功")
+            else:
+                logging.warning(f"{reversal_long_tf} 长下影确认反转多单开仓未成功")
         except Exception:
             logging.error(f"影线反转多单开仓失败:\n{traceback.format_exc()}")
         trade_state['last_processed_bar_15m'] = signal_bar_15m
@@ -3033,6 +3228,11 @@ def run_strategy():  # 定义策略运行的主函数，负责统筹数据获取
 
     if not reversal_conflict and reversal_short_state is not None and (short_cond_15m or reversal_short_state.get('details', {}).get('shadow', {}).get('upper_shadow_body_low_hit')) and not lower_shadow_filter_short:
         try:
+            shadow_reference_key = get_shadow_reference_key('short', reversal_short_tf, reversal_short_state)
+            if is_shadow_reference_used(shadow_reference_key):
+                logging.info(f"跳过已使用过的影线反转空参考K: {shadow_reference_key}")
+                trade_state['last_processed_bar_15m'] = signal_bar_15m
+                return
             # 真正下单时，还是以当前最新成交价作为入场价
             curr_price = get_latest_price()
             # 影线反转单优先使用影线结构给出的止损位
@@ -3041,8 +3241,11 @@ def run_strategy():  # 定义策略运行的主函数，负责统筹数据获取
             if sl_price is None or pd.isna(sl_price):
                 sl_price = curr_price + atr_4h
             # entry_reason 会被写进状态、通知和 CSV，后面一看就知道是影线反转空单
-            open_order('short', curr_price, sl_price, state_4h, state_1h, state_15m, signal_bar_15m, entry_reason='shadow_reversal_short', entry_trigger_tf=reversal_short_tf)
-            logging.info(f"{reversal_short_tf} 长上影确认反转空单开仓成功")
+            mark_shadow_reference_used(shadow_reference_key)
+            if open_order('short', curr_price, sl_price, state_4h, state_1h, state_15m, signal_bar_15m, entry_reason='shadow_reversal_short', entry_trigger_tf=reversal_short_tf):
+                logging.info(f"{reversal_short_tf} 长上影确认反转空单开仓成功")
+            else:
+                logging.warning(f"{reversal_short_tf} 长上影确认反转空单开仓未成功")
         except Exception:
             logging.error(f"影线反转空单开仓失败:\n{traceback.format_exc()}")
         trade_state['last_processed_bar_15m'] = signal_bar_15m
@@ -3057,8 +3260,10 @@ def run_strategy():  # 定义策略运行的主函数，负责统筹数据获取
         try:
             curr_price = get_latest_price()
             sl_price = curr_price - atr_4h  # 根据公式：入场价 - 1.3 * 1H_ATR，计算多单底线止损价
-            open_order('long', curr_price, sl_price, state_4h, state_1h, state_15m, signal_bar_15m, entry_reason='trend_long', entry_trigger_tf='4H+1H+15M')  # 调用开仓函数，执行做多操作
-            logging.info("多单开仓成功")
+            if open_order('long', curr_price, sl_price, state_4h, state_1h, state_15m, signal_bar_15m, entry_reason='trend_long', entry_trigger_tf='4H+1H+15M'):  # 调用开仓函数，执行做多操作
+                logging.info("多单开仓成功")
+            else:
+                logging.warning("多单开仓未成功")
         except Exception:
             logging.error(f"多单开仓失败:\n{traceback.format_exc()}")
         trade_state['last_processed_bar_15m'] = signal_bar_15m
@@ -3068,8 +3273,10 @@ def run_strategy():  # 定义策略运行的主函数，负责统筹数据获取
         try:
             curr_price = get_latest_price()
             sl_price = curr_price + atr_4h  # 根据公式：入场价 + 1.3 * 1H_ATR，计算空单底线止损价
-            open_order('short', curr_price, sl_price, state_4h, state_1h, state_15m, signal_bar_15m, entry_reason='trend_short', entry_trigger_tf='4H+1H+15M')  # 调用开仓函数，执行做空操作
-            logging.info("空单开仓成功")
+            if open_order('short', curr_price, sl_price, state_4h, state_1h, state_15m, signal_bar_15m, entry_reason='trend_short', entry_trigger_tf='4H+1H+15M'):  # 调用开仓函数，执行做空操作
+                logging.info("空单开仓成功")
+            else:
+                logging.warning("空单开仓未成功")
         except Exception:
             logging.error(f"空单开仓失败:\n{traceback.format_exc()}")
         trade_state['last_processed_bar_15m'] = signal_bar_15m
