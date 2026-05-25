@@ -10,7 +10,7 @@ pandas_ta==0.4.71b0
 该脚本是币安合约交易自动脚本（只交易ETH）
 
 策略：
-该脚本使用了MACD,EMA,BOLL，RSI,ATR，交易量作为指标，15分钟，1小时，4小时多周期共振和长影响趋势判断作为执行策略
+该脚本使用了MACD,EMA，RSI,ATR，交易量作为指标，15分钟，1小时，4小时多周期共振作为执行策略
 """
 import os  # 导入os模块，用于处理系统级操作和环境变量
 
@@ -19,7 +19,7 @@ os.environ.setdefault('NUMBA_DISABLE_JIT', '1')
 
 import ccxt  # 导入ccxt库，用于连接加密货币交易所API
 import pandas as pd  # 导入pandas库，用于数据处理和分析
-import pandas_ta as ta  # 导入pandas_ta库，用于计算技术指标（如EMA, MACD, BOLL等）
+import pandas_ta as ta  # 导入pandas_ta库，用于计算技术指标（如EMA, MACD等）
 import time  # 导入time库，用于控制循环执行的时间间隔
 import logging  # 导入logging库，用于记录程序运行日志
 import smtplib  # 导入smtplib库，用于发送邮件通知
@@ -98,7 +98,6 @@ DYNAMIC_RETRACE_MIN_RATIO = 0.15  # 再强的单子也至少保留 15% 的回撤
 DYNAMIC_RETRACE_MAX_RATIO = 0.60  # 再早期的单子也不允许超过 60% 的利润回吐
 DYNAMIC_RETRACE_STOP_STEP_ATR_RATIO = 0.15  # 新保护止损至少移动 0.15 * ATR，才值得重挂服务端止损单
 DYNAMIC_RETRACE_STOP_STEP_PRICE_RATIO = 0.0005  # 再叠加一层按价格比例的最小步长，避免微小抖动频繁更新
-SHADOW_REVERSAL_TIGHTEN_BUFFER_RATIO = 0.0003  # 影线反转只做保护时，止损与现价保留最小缓冲，避免刚更新就被立即触发
 STOP_WORKING_TYPE = 'MARK_PRICE'  # 服务端条件止损按标记价格触发，避免只看最新成交价带来的偏差
 STOP_ORDER_CANCEL_CONFIRM_RETRIES = 5  # 撤掉旧条件单后，最多确认 5 次交易所侧是否真的消失
 STOP_ORDER_CANCEL_CONFIRM_SLEEP_SECONDS = 0.2  # 每次确认旧条件单状态之间的等待时间
@@ -109,10 +108,8 @@ LIQUIDATION_SAFE_BUFFER_RATIO = 0.003  # 止损价和强平价之间至少保留
 ESTIMATED_LIQUIDATION_GUARD_RATIO = 0.8  # 用于开仓前估算强平距离，取 0.8 / 杠杆，故意保守一点
 POSITION_AMT_EPSILON = 1e-8  # 持仓数量小于该阈值视为0，避免浮点噪音误判
 EXTERNAL_CLOSE_CONFIRM_MISS_COUNT = 3  # 连续3轮查不到仓位才触发外部平仓重置，降低瞬时接口波动误判
-OSCILLATION_THRESHOLD_4H = 0.033  # 4H 布林带宽比低于 3.7% 视为震荡
-OSCILLATION_THRESHOLD_1H = 0.020  # 1H 单独收紧到 2%，避免过滤范围过大
-SHADOW_REVERSAL_LOOKBACK_BARS = 4  # 长影线反转信号允许向前追踪的已收盘K线数
-SHADOW_REVERSAL_CONFIRM_MAX_OFFSET_BARS = 3  # 长影线反转确认最多只允许引用 3 根以内的参考K，避免信号过期
+OSCILLATION_THRESHOLD_4H = 0.033  # 4H 布林带宽比低于 3.3% 视为震荡
+OSCILLATION_THRESHOLD_1H = 0.020  # 1H 布林带宽比低于 2% 视为震荡
 REQUIRE_15M_CONFIRM_FOR_1H_CLOSE = True  # 1H 平仓信号需要 15M 同向确认，避免单根 1H 转弱就直接离场
 EXTREME_EXIT_LOOKBACK_BARS_1H = 3  # 1H 极值平仓允许向前追踪的参考K数量，给“后续几根确认”留窗口
 EXCHANGE_HTTP_TIMEOUT_MS = 10000  # 单次交易所HTTP请求最多等待10秒，避免底层请求长时间挂起
@@ -145,7 +142,6 @@ trade_state = {  # 定义一个字典用于保存当前交易的状态信息
     'close_order_id': '',  # 记录最近一次平仓市价单的订单ID
     'entry_reason': '', # 记录本次开仓来源
     'entry_trigger_tf': '', # 记录本次开仓真正触发的周期，如 1H / 4H / 4H+1H+15M
-    'shadow_stop_mode': '',       # 记录是否启用了影线收紧止损，如 "4H 长上影收紧止损"
     'liquidation_price': 0.0,  # 记录当前仓位从交易所返回的真实强平价
     'stop_order_id': '',  # 记录服务端 STOP_MARKET 止损单的订单ID，便于后续撤单和替换
     'stop_order_price': 0.0,  # 记录当前服务端止损单对应的触发价格
@@ -156,8 +152,6 @@ trade_state = {  # 定义一个字典用于保存当前交易的状态信息
     'last_exit_bar_15m': '',      # 最近一次平仓所对应的15M已收盘信号K线时间（防止同根K线平仓后立即重开）
     'last_processed_bar_15m': '', # 最近一次已处理过的15M已收盘信号K线时间（核心去重字段，防止同一根K线重复执行策略逻辑）
     'max_seen_bar_15m': '',       # 运行期间见过的最大15M信号时间，防止接口回跳旧K线后被当成新信号
-    'last_shadow_adjust_bar_15m': '',  # 最近一次因影线调整止损的15M信号时间（防止同根K线重复收紧止损）
-    'used_shadow_reference_keys': set(),  # 已使用过的影线参考K，避免同一根1H/4H影线反复开仓
     'position_miss_count': 0  # 连续几轮未在交易所查到仓位，用于避免误判“外部平仓”
 }
 
@@ -374,22 +368,15 @@ def fetch_df(symbol, timeframe, limit=100):  # 定义获取K线数据并计算�
         # 指标计算，只能通过计算来，没有提供具体指标的接口
         df['ema20'] = ta.ema(df['close'], length=20)  # 计算收盘价的20周期指数移动平均线 (EMA20)，并新增一列
         df['ema50'] = ta.ema(df['close'], length=50)  # 计算收盘价的50周期指数移动平均线 (EMA50)，并新增一列
-        
-        # BOLL (默认 20, 2)
-        #返回列明：'BBL_20_2.0_2.0', 'BBM_20_2.0_2.0', 'BBU_20_2.0_2.0', 'BBB_20_2.0_2.0','BBP_20_2.0_2.0']
-        #前3个下面有说明，重点说明后面2个：
-        # BBB_20_2.0_2.0：表示布林带的宽度，用来判断震荡幅度。计算公式：(上轨-下轨)/中轨*100
-        # BBP_20_2.0_2.0：布林带百分比，表示收盘价在布林带通道内的相对位置。计算公式(收盘价 - 下轨) / (上轨 - 下轨)，值>1价格突破上轨；值<0价格跌破了下轨；值=0.5价格正好在中轨
-        boll = ta.bbands(df['close'], length=20, std=2)  # 计算20周期、2倍标准差的布林带 (Bollinger Bands)
-        
-        df = pd.concat([df, boll], axis=1)  # 将计算出的布林带数据按列拼接到原始DataFrame中
-        # BOLL 列名根据 pandas_ta 版本不同可能会带有多个下划线
-        # 根据你打印出的结果进行修改：
-        df.rename(columns={  # 重命名布林带的列名，使其更易读
-            'BBL_20_2.0_2.0': 'boll_dn',  # 将下轨重命名为 'boll_dn'
-            'BBM_20_2.0_2.0': 'boll_mid',  # 将中轨重命名为 'boll_mid'
-            'BBU_20_2.0_2.0': 'boll_up'  # 将上轨重命名为 'boll_up'
-        }, inplace=True)  # inplace=True 表示直接在原DataFrame上修改
+
+        # BOLL 只保留带宽震荡过滤使用，不参与开仓/平仓方向判断。
+        boll = ta.bbands(df['close'], length=20, std=2)
+        df = pd.concat([df, boll], axis=1)
+        df.rename(columns={
+            'BBL_20_2.0_2.0': 'boll_dn',
+            'BBM_20_2.0_2.0': 'boll_mid',
+            'BBU_20_2.0_2.0': 'boll_up'
+        }, inplace=True)
         
         # RSI 14
         df['rsi'] = ta.rsi(df['close'], length=14)  # 计算收盘价的14周期相对强弱指数 (RSI14)，并新增一列
@@ -1315,7 +1302,6 @@ def reset_trade_state_after_external_close(signal_bar_15m='', reason='检测到�
         f"服务端止损价: {stop_order_price_for_notify}\n"
         f"持仓数量: {trade_state.get('amount', 0)}\n"
         f"开仓原因: {trade_state.get('entry_reason', '')}\n"
-        f"影线止损模式: {trade_state.get('shadow_stop_mode', '')}\n"
         f"15M信号时间: {exit_signal_bar_15m}\n"
         f"说明: 已检测到交易所无仓位，可能是服务端止损成交或人工平仓。"
         f"{order_id_suffix}"
@@ -1339,7 +1325,6 @@ def reset_trade_state_after_external_close(signal_bar_15m='', reason='检测到�
         'close_cond_15m': '',
         'entry_reason': '',
         'entry_trigger_tf': '',
-        'shadow_stop_mode': '',
         'initial_balance': 0.0,
         'open_fee': 0.0,
         'open_order_id': '',
@@ -1352,7 +1337,6 @@ def reset_trade_state_after_external_close(signal_bar_15m='', reason='检测到�
         'entry_signal_bar_15m': '',
         'last_exit_bar_15m': exit_signal_bar_15m,
         'last_processed_bar_15m': post_exit_processed_bar_15m,
-        'last_shadow_adjust_bar_15m': '',
         'position_miss_count': 0
     })
     logging.warning(reason)
@@ -1435,56 +1419,6 @@ def format_mail_checks(checks, label_map=None, default_labels=None):
     return format_mail_scalar(checks)
 
 
-def format_shadow_focus_for_mail(state, side_dir):
-    """只保留影线反转真正关键的字段，避免把 body/full_range 等噪音带进邮件。"""
-    shadow = state.get('details', {}).get('shadow', {})
-    if side_dir == 'long':
-        candidate = shadow.get('lower_shadow_candidate') or {}
-        parts = [
-            f"反转多={format_mail_bool(state.get('lower_shadow_reversal_long'))}",
-            f"实体中点触达={format_mail_bool(shadow.get('lower_shadow_mid_hit'))}",
-            f"近{SHADOW_REVERSAL_CONFIRM_MAX_OFFSET_BARS}根内={format_mail_bool(shadow.get('lower_shadow_offset_ok'))}",
-            f"当前阳线={format_mail_bool(shadow.get('lower_shadow_bullish_confirm'))}",
-            f"当前非空头={format_mail_bool(not bool(normalize_mail_value(shadow.get('current_short_logic_active', False))))}"
-        ]
-    else:
-        candidate = shadow.get('upper_shadow_candidate') or {}
-        parts = [
-            f"反转空={format_mail_bool(state.get('upper_shadow_reversal_short'))}",
-            f"实体中点触达={format_mail_bool(shadow.get('upper_shadow_mid_hit'))}",
-            f"近{SHADOW_REVERSAL_CONFIRM_MAX_OFFSET_BARS}根内={format_mail_bool(shadow.get('upper_shadow_offset_ok'))}",
-            f"当前阴线={format_mail_bool(shadow.get('upper_shadow_bearish_confirm'))}",
-            f"当前非多头={format_mail_bool(not bool(normalize_mail_value(shadow.get('current_long_logic_active', False))))}"
-        ]
-
-    if candidate.get('bar_time'):
-        parts.insert(1, f"参考K={candidate.get('bar_time')}")
-    if candidate.get('offset') is not None:
-        parts.append(f"距今={candidate.get('offset')}根")
-    return '，'.join(parts)
-
-
-def format_shadow_tighten_focus_for_mail(state, side_dir):
-    """平仓时只保留影线收紧止损的核心判断。"""
-    shadow = state.get('details', {}).get('shadow', {})
-    if side_dir == 'long':
-        resistance_details = shadow.get('prev_upper_resistance') or {}
-        resistance_hit = any(bool(normalize_mail_value(v)) for v in resistance_details.values())
-        return '，'.join([
-            f"收紧多止损={format_mail_bool(state.get('upper_shadow_tighten_long'))}",
-            f"前一根长上影={format_mail_bool(shadow.get('prev_upper_shadow'))}",
-            f"前一根压力位={format_mail_bool(resistance_hit)}"
-        ])
-
-    support_details = shadow.get('prev_lower_support') or {}
-    support_hit = any(bool(normalize_mail_value(v)) for v in support_details.values())
-    return '，'.join([
-        f"收紧空止损={format_mail_bool(state.get('lower_shadow_tighten_short'))}",
-        f"前一根长下影={format_mail_bool(shadow.get('prev_lower_shadow'))}",
-        f"前一根支撑位={format_mail_bool(support_hit)}"
-    ])
-
-
 def format_entry_condition_for_mail(state, side_dir, entry_reason=''):
     """按开仓方向和开仓原因，只展示当前最相关的一组条件。"""
     if not isinstance(state, dict):
@@ -1494,7 +1428,6 @@ def format_entry_condition_for_mail(state, side_dir, entry_reason=''):
     trend_4h_label_map = {
         'gate': '门槛',
         'ema_side': 'EMA方向',
-        'boll_side': 'BOLL方向',
         'candle_side': 'K线方向',
         'structure_ok': '结构',
         'volume_expand': '放量',
@@ -1503,26 +1436,20 @@ def format_entry_condition_for_mail(state, side_dir, entry_reason=''):
         'price_progress': '价格推进'
     }
     pullback_4h_label_map = {
-        'ema_or_boll': 'EMA/BOLL',
         'c1_ema': 'EMA',
-        'c2_boll': 'BOLL',
         'c3_vol': '放量',
         'c4_rsi': 'RSI',
         'c5_rsi_drop': 'RSI回落'
     }
-    small_tf_labels = ['量能', 'RSI', 'MACD', 'EMA', 'BOLL']
+    small_tf_labels = ['量能', 'RSI', 'MACD', 'EMA']
 
     if side_dir == 'long':
-        if entry_reason == 'shadow_reversal_long' and state.get('lower_shadow_reversal_long'):
-            return f"影线反转多:{format_shadow_focus_for_mail(state, 'long')}"
         if state.get('long_trend'):
             return f"多头:{format_mail_checks(details.get('lt'), label_map=trend_4h_label_map, default_labels=small_tf_labels)}"
         if state.get('pullback_long'):
             return f"回调多:{format_mail_checks(details.get('pl'), label_map=pullback_4h_label_map, default_labels=small_tf_labels)}"
         return ""
 
-    if entry_reason == 'shadow_reversal_short' and state.get('upper_shadow_reversal_short'):
-        return f"影线反转空:{format_shadow_focus_for_mail(state, 'short')}"
     if state.get('short_trend'):
         return f"空头:{format_mail_checks(details.get('st'), label_map=trend_4h_label_map, default_labels=small_tf_labels)}"
     if state.get('pullback_short'):
@@ -1538,14 +1465,6 @@ def format_condition_snapshot_for_mail(timeframe, state):
     details = state.get('details', {})
     parts = [f"{timeframe}信号时间={state.get('signal_bar_time', '')}"]
 
-    if state.get('lower_shadow_reversal_long'):
-        parts.append(f"影线反转多:{format_shadow_focus_for_mail(state, 'long')}")
-    if state.get('upper_shadow_reversal_short'):
-        parts.append(f"影线反转空:{format_shadow_focus_for_mail(state, 'short')}")
-    if state.get('upper_shadow_tighten_long'):
-        parts.append(f"长上影收紧止损:{format_shadow_tighten_focus_for_mail(state, 'long')}")
-    if state.get('lower_shadow_tighten_short'):
-        parts.append(f"长下影收紧止损:{format_shadow_tighten_focus_for_mail(state, 'short')}")
     if state.get('close_long'):
         parts.append(f"close_long:{format_mail_checks(details.get('close_long_checks'))}")
     if state.get('close_short'):
@@ -1554,111 +1473,6 @@ def format_condition_snapshot_for_mail(timeframe, state):
     if len(parts) == 1:
         parts.append("无关键平仓条件")
     return ' | '.join(parts)
-
-
-def safe_ratio(numerator, denominator):
-    """安全除法，避免被0除"""
-    # 这里把分母最小值钉死为 1e-9，防止 full_range = 0 时出现除0报错
-    return numerator / max(denominator, 1e-9)
-
-
-def is_long_upper_shadow(row):
-    """根据用户定义判断是否为长上影线"""
-    # full_range 表示这根K线从最低到最高一共波动了多少
-    full_range = row['high'] - row['low']
-    # body 表示实体长度，只是拿来辅助观察，当前规则里不直接参与判定
-    body = abs(row['close'] - row['open'])
-    # upper_shadow = 最高价减去实体顶部，得到上影线长度
-    upper_shadow = row['high'] - max(row['open'], row['close'])
-    # 从当前K线上直接读取 ATR，用来过滤掉“波动太小”的噪音影线
-    atr = row.get('atr', float('nan'))
-    # 如果没有有效 ATR，或者这根K线没有真实波动，就直接判定不是长上影线
-    if pd.isna(full_range) or pd.isna(atr) or full_range <= 0:
-        return False, {'a1': False, 'a2': False, 'a3': False, 'upper_shadow': upper_shadow, 'body': body, 'full_range': full_range}
-    # a1：上影线至少占整根K线一半，说明上方抛压很明显
-    a1 = safe_ratio(upper_shadow, full_range) >= 0.5
-    # a2：实体顶部靠近低位，说明冲高之后被压回来了
-    #    阳线时 close 是实体顶部，用 |close - low|；阴线时 open 是实体顶部，用 |open - low|
-    if row['close'] >= row['open']:  # 阳线
-        a2 = safe_ratio(abs(row['close'] - row['low']), full_range) <= 0.35
-    else:  # 阴线
-        a2 = safe_ratio(abs(row['open'] - row['low']), full_range) <= 0.35
-    # a3：整根K线的波动不能太小，防止把细小抖动误判成强信号
-    a3 = full_range >= 0.6 * atr
-    # 三个子条件里满足两个，就认为这根K线是长上影线
-    return sum([a1, a2, a3]) >= 2, {
-        'a1': a1,
-        'a2': a2,
-        'a3': a3,
-        'upper_shadow': upper_shadow,
-        'body': body,
-        'full_range': full_range
-    }
-
-
-def is_long_lower_shadow(row):
-    """根据长上影线规则镜像判断长下影线"""
-    # full_range 表示这根K线从最低到最高一共波动了多少
-    full_range = row['high'] - row['low']
-    # body 表示实体长度，只是拿来辅助观察，当前规则里不直接参与判定
-    body = abs(row['close'] - row['open'])
-    # lower_shadow = 实体底部减去最低价，得到下影线长度
-    lower_shadow = min(row['open'], row['close']) - row['low']
-    # 从当前K线上直接读取 ATR，用来过滤掉“波动太小”的噪音影线
-    atr = row.get('atr', float('nan'))
-    # 如果没有有效 ATR，或者这根K线没有真实波动，就直接判定不是长下影线
-    if pd.isna(full_range) or pd.isna(atr) or full_range <= 0:
-        return False, {'b1': False, 'b2': False, 'b3': False, 'lower_shadow': lower_shadow, 'body': body, 'full_range': full_range}
-    # b1：下影线至少占整根K线一半，说明下方承接很明显
-    b1 = safe_ratio(lower_shadow, full_range) >= 0.5
-    # b2：实体底部靠近高位，说明下探之后又被拉回来了
-    #    阳线时 open 是实体底部，用 |high - open|；阴线时 close 是实体底部，用 |high - close|
-    if row['close'] >= row['open']:  # 阳线
-        b2 = safe_ratio(abs(row['high'] - row['open']), full_range) <= 0.35
-    else:  # 阴线
-        b2 = safe_ratio(abs(row['high'] - row['close']), full_range) <= 0.35
-    # b3：整根K线波动不能太小
-    b3 = full_range >= 0.6 * atr
-    # 三个子条件里满足两个，就认为这根K线是长下影线
-    return sum([b1, b2, b3]) >= 2, {
-        'b1': b1,
-        'b2': b2,
-        'b3': b3,
-        'lower_shadow': lower_shadow,
-        'body': body,
-        'full_range': full_range
-    }
-
-
-def is_upper_shadow_at_resistance(last, prev, prev2, tol, is_above):
-    """判断长上影线是否位于压力区"""
-    # 高点碰到或接近布林上轨，视为打到第一层压力
-    near_boll = is_above(last['high'], last['boll_up'])
-    
-    # 高点接近最近两根K线前高，也视为打到局部压力位
-    break_prev_high = tol(last['high'],max(prev['high'], prev2['high']))
-    # 只要这三类压力位命中任意一个，就把当前位置视为“压力区”
-    return any([near_boll, break_prev_high]), {
-        'near_boll_up': near_boll,
-        
-        'break_prev_high': break_prev_high
-    }
-
-
-def is_lower_shadow_at_support(last, prev, prev2, tol, is_below):
-    """判断长下影线是否位于支撑区"""
-    # 低点碰到或接近布林下轨，视为打到第一层支撑
-    near_boll = is_below(last['low'], last['boll_dn'])
-    # 低点碰到或接近 EMA50，视为打到第二层支撑
-    
-    # 低点接近最近两根K线前低，也视为打到局部支撑位
-    break_prev_low = tol(last['low'] ,min(prev['low'], prev2['low']))
-    # 只要这三类支撑位命中任意一个，就把当前位置视为“支撑区”
-    return any([near_boll, break_prev_low]), {
-        'near_boll_dn': near_boll,
-        
-        'break_prev_low': break_prev_low
-    }
 
 
 def pick_state_signal(state_4h, state_1h, key):
@@ -1671,48 +1485,6 @@ def pick_state_signal(state_4h, state_1h, key):
         return '1H', state_1h
     # 两个周期都没有这个信号，就返回空结果
     return '', None
-
-
-def get_shadow_reference_key(side, trigger_tf, state):
-    """生成影线参考K去重key，防止同一根影线被反复交易。"""
-    if not state or side not in ('long', 'short'):
-        return ''
-    if side == 'long':
-        reference_bar = state.get('shadow_lower_reference_bar', '')
-        shadow_label = 'lower'
-    else:
-        reference_bar = state.get('shadow_upper_reference_bar', '')
-        shadow_label = 'upper'
-    if not reference_bar:
-        return ''
-    return f"{side}:{trigger_tf}:{shadow_label}:{reference_bar}"
-
-
-def get_used_shadow_reference_keys():
-    """读取并规范化已使用影线参考K集合。"""
-    used_keys = trade_state.get('used_shadow_reference_keys')
-    if isinstance(used_keys, set):
-        return used_keys
-    if isinstance(used_keys, (list, tuple)):
-        normalized = set(used_keys)
-    elif used_keys:
-        normalized = {str(used_keys)}
-    else:
-        normalized = set()
-    trade_state['used_shadow_reference_keys'] = normalized
-    return normalized
-
-
-def is_shadow_reference_used(shadow_reference_key):
-    if not shadow_reference_key:
-        return False
-    return shadow_reference_key in get_used_shadow_reference_keys()
-
-
-def mark_shadow_reference_used(shadow_reference_key):
-    if shadow_reference_key:
-        get_used_shadow_reference_keys().add(shadow_reference_key)
-
 
 def clamp(value, min_value, max_value):
     """将数值限制在指定范围内"""
@@ -1834,70 +1606,6 @@ def should_refresh_dynamic_stop(side, current_stop, new_stop, atr_1h, entry_pric
     return new_stop < current_stop - min_step
 
 
-def tighten_stop_on_reversal_warning(side, reversal_tf, reversal_state, curr_price, signal_bar_15m=''):
-    """影线反转已出现但还不满足反手开仓时，只收紧保护止损，不直接平仓。"""
-    if not reversal_state:
-        return False
-
-    shadow_details = (reversal_state.get('details') or {}).get('shadow') or {}
-    if side == 'long':
-        candidate = shadow_details.get('upper_shadow_candidate') or {}
-        raw_protect_ref = candidate.get('body_low')
-        if raw_protect_ref is None or pd.isna(raw_protect_ref):
-            return False
-        capped_protect_ref = min(raw_protect_ref, curr_price * (1 - SHADOW_REVERSAL_TIGHTEN_BUFFER_RATIO))
-        new_sl = max(trade_state['stop_loss_price'], capped_protect_ref)
-        shadow_mode = f"{reversal_tf} 长上影反转预警收紧止损"
-        notify_subject = "ETH交易: 多单反转预警收紧止损"
-        notify_body = f"{reversal_tf} 长上影反转预警触发，新的多单止损价: {new_sl:.4f}"
-        close_reason = f"{reversal_tf} 长上影反转预警收紧止损"
-    else:
-        candidate = shadow_details.get('lower_shadow_candidate') or {}
-        raw_protect_ref = candidate.get('body_high')
-        if raw_protect_ref is None or pd.isna(raw_protect_ref):
-            return False
-        capped_protect_ref = max(raw_protect_ref, curr_price * (1 + SHADOW_REVERSAL_TIGHTEN_BUFFER_RATIO))
-        new_sl = min(trade_state['stop_loss_price'], capped_protect_ref)
-        shadow_mode = f"{reversal_tf} 长下影反转预警收紧止损"
-        notify_subject = "ETH交易: 空单反转预警收紧止损"
-        notify_body = f"{reversal_tf} 长下影反转预警触发，新的空单止损价: {new_sl:.4f}"
-        close_reason = f"{reversal_tf} 长下影反转预警收紧止损"
-
-    if side == 'long':
-        if new_sl <= trade_state['stop_loss_price']:
-            return False
-    elif new_sl >= trade_state['stop_loss_price']:
-        return False
-
-    if not refresh_protective_stop_order(new_sl):
-        return handle_stop_order_refresh_failure(
-            "服务端止损更新失败，连续5次后主动平仓",
-            curr_price,
-            signal_bar_15m=signal_bar_15m,
-            trigger_label="服务端止损更新失败，连续5次后主动平仓"
-        )
-
-    trade_state['stop_loss_price'] = new_sl
-    trade_state['shadow_stop_mode'] = shadow_mode
-    trade_state['last_shadow_adjust_bar_15m'] = signal_bar_15m
-    trade_state['stop_order_price'] = new_sl
-    logging.info(f"{shadow_mode}: 新止损价={new_sl:.4f}")
-    order_id_lines = format_order_id_lines(
-        open_order_id=trade_state.get('open_order_id', ''),
-        stop_order_id=trade_state.get('stop_order_id', '')
-    )
-    order_id_suffix = f"\n{order_id_lines}" if order_id_lines else ''
-    send_msg(notify_subject, f"{notify_body}{order_id_suffix}")
-
-    if side == 'long' and curr_price <= trade_state['stop_loss_price']:
-        close_position(close_reason, curr_price, signal_bar_15m=signal_bar_15m, trigger_label=close_reason)
-        return True
-    if side == 'short' and curr_price >= trade_state['stop_loss_price']:
-        close_position(close_reason, curr_price, signal_bar_15m=signal_bar_15m, trigger_label=close_reason)
-        return True
-    return False
-
-
 def log_trade_to_csv(entry_time, side, cond_4h, cond_1h, cond_15m, entry_reason, exit_time, close_reason, pnl_points, fee_cost, net_pnl_usdt, is_profit, entry_signal_bar_15m='', exit_signal_bar_15m='', exit_trigger='', holding_seconds=0, open_order_id='', close_order_id=''):
     """将交易记录写入CSV文件，按月分表"""
     # 根据平仓时间生成当月的 CSV 文件名，例如 trades_log_2024-05.csv
@@ -1912,7 +1620,7 @@ def log_trade_to_csv(entry_time, side, cond_4h, cond_1h, cond_15m, entry_reason,
             writer = csv.writer(f)
             if not file_exists:
                 # 写入表头
-                # 这里特意新增“入场原因”一列，方便后面区分趋势单和影线反转单
+                # 这里特意新增“入场原因”一列，方便后面复盘开仓来源
                 writer.writerow(TRADE_CSV_HEADERS)
             # 写入具体数据
             writer.writerow([
@@ -1941,15 +1649,13 @@ def evaluate_trend(df, timeframe, time_factor, is_4h=False, now_dt=None):  # 定
 
     last = df.iloc[last_idx]  # 获取最近一根已收盘K线
     prev = df.iloc[last_idx - 1]  # 获取倒数第二根已收盘K线
-    prev2 = df.iloc[last_idx - 2]  # 获取倒数第三根已收盘K线
-    prev3 = df.iloc[last_idx - 3]  # 再往前取一根K线，专门给“上一根影线是否在前高/前低附近”做参考
 
     # --- 容错计算 ---
     def tol(val, target):  # 定义内部辅助函数：计算是否在允许的容错范围内
-        if pd.isna(val) or pd.isna(target) or target == 0 or pd.isna(last['atr']) or pd.isna(last['boll_mid']) or last['boll_mid'] == 0:
+        if pd.isna(val) or pd.isna(target) or target == 0 or pd.isna(last['atr']) or pd.isna(last['close']) or last['close'] == 0:
             return False
         diff_rate = abs(val - target) / target  # 计算实际值与目标值的绝对偏差率
-        dynamic_threshold = 0.3 * (last['atr'] / last['boll_mid']) * time_factor  # 根据公式：0.3 * (ATR / 中轨) * 时间系数，计算动态阈值
+        dynamic_threshold = 0.3 * (last['atr'] / last['close']) * time_factor
         return diff_rate <= dynamic_threshold  # 判断偏差率是否小于等于动态阈值，返回布尔结果
 
     def is_above(val, target):  # 定义内部辅助函数：判断某值是否在目标之上（含容错）
@@ -1957,43 +1663,6 @@ def evaluate_trend(df, timeframe, time_factor, is_4h=False, now_dt=None):  # 定
 
     def is_below(val, target):  # 定义内部辅助函数：判断某值是否在目标之下（含容错）
         return val < target or tol(val, target)  # 如果严格小于目标值，或者在容错范围内，均视为在下方
-
-    def find_recent_shadow_candidate(direction):
-        """寻找最近几根已收盘K线里仍可用于影线反转的参考K。"""
-        max_offset = min(SHADOW_REVERSAL_LOOKBACK_BARS, last_idx - 2)
-        if max_offset < 1:
-            return None
-        for offset in range(1, max_offset + 1):
-            candidate = df.iloc[last_idx - offset]
-            candidate_prev = df.iloc[last_idx - offset - 1]
-            candidate_prev2 = df.iloc[last_idx - offset - 2]
-
-            if direction == 'upper':
-                is_shadow, shadow_details = is_long_upper_shadow(candidate)
-                at_key_level, level_details = is_upper_shadow_at_resistance(candidate, candidate_prev, candidate_prev2, tol, is_above)
-                stop_ref = candidate['high'] + 0.1 * candidate['atr'] if is_shadow else None
-            else:
-                is_shadow, shadow_details = is_long_lower_shadow(candidate)
-                at_key_level, level_details = is_lower_shadow_at_support(candidate, candidate_prev, candidate_prev2, tol, is_below)
-                stop_ref = candidate['low'] - 0.1 * candidate['atr'] if is_shadow else None
-
-            if not (is_shadow and at_key_level):
-                continue
-
-            body_high = max(candidate['open'], candidate['close'])
-            body_low = min(candidate['open'], candidate['close'])
-            return {
-                'offset': offset, #第几根是长影线
-                'bar_time': format_bar_time(candidate['timestamp']),
-                'body_high': body_high,
-                'body_low': body_low,
-                'body_mid': (body_high + body_low) / 2,
-                'stop_ref': stop_ref, #zh
-                'shadow_details': shadow_details,
-                'level_details': level_details
-            }
-
-        return None
 
     def find_recent_extreme_exit_reference(direction):
         """寻找最近几根 1H 极值K，以及其后是否已经出现实体确认。"""
@@ -2006,11 +1675,11 @@ def evaluate_trend(df, timeframe, time_factor, is_4h=False, now_dt=None):  # 定
             candidate = df.iloc[candidate_idx]
 
             if direction == 'short':
-                extreme_hit = candidate['close'] <= candidate['boll_dn'] or candidate['rsi'] < 30
+                extreme_hit = candidate['rsi'] < 30
                 body_threshold = max(candidate['open'], candidate['close'])
                 confirm_cmp = lambda bar_close: bar_close > body_threshold
             else:
-                extreme_hit = candidate['close'] >= candidate['boll_up'] or candidate['rsi'] > 72
+                extreme_hit = candidate['rsi'] > 72
                 body_threshold = min(candidate['open'], candidate['close'])
                 confirm_cmp = lambda bar_close: bar_close < body_threshold
 
@@ -2047,51 +1716,29 @@ def evaluate_trend(df, timeframe, time_factor, is_4h=False, now_dt=None):  # 定
         'close_short': False,    # 标记是否满足强劲空头平仓条件，初始为False
         'close_long': False,     # 标记是否满足强劲多头平仓条件，初始为False
         'is_oscillation': False, # 标记当前周期是否被识别为震荡行情
-        'signal_bar_time': format_bar_time(last['timestamp']), # 当前这次评估对应的已收盘信号K线时间
-        'long_upper_shadow': False, # 最新已收盘K线本身是否是长上影线
-        'long_lower_shadow': False, # 最新已收盘K线本身是否是长下影线
-        'upper_shadow_filter_long': False, # 是否要因为长上影线而过滤掉趋势做多
-        'lower_shadow_filter_short': False, # 是否要因为长下影线而过滤掉趋势做空
-        'upper_shadow_reversal_short': False, # 是否出现“上一根长上影 + 当前阴线确认”的开空反转信号
-        'lower_shadow_reversal_long': False, # 是否出现“上一根长下影 + 当前阳线确认”的开多反转信号
-        'upper_shadow_tighten_long': False, # 持有多单时，是否需要因为长上影线收紧止损
-        'lower_shadow_tighten_short': False, # 持有空单时，是否需要因为长下影线收紧止损
-        'shadow_short_stop_ref': None, # 影线反转开空时的参考止损价
-        'shadow_long_stop_ref': None, # 影线反转开多时的参考止损价
-        'shadow_short_trigger_tf': '', # 开空影线信号来自哪个周期：4H 或 1H
-        'shadow_long_trigger_tf': '', # 开多影线信号来自哪个周期：4H 或 1H
-        'shadow_upper_reference_bar': '', # 当前开空影线反转引用的长上影K线时间
-        'shadow_lower_reference_bar': '', # 当前开多影线反转引用的长下影K线时间
-        'upper_shadow_long_protect_ref': None, # 多单因为长上影收紧止损时的新保护位
-        'lower_shadow_short_protect_ref': None # 空单因为长下影收紧止损时的新保护位
+        'signal_bar_time': format_bar_time(last['timestamp']) # 当前这次评估对应的已收盘信号K线时间
     }
-    boll_band_width_ratio = safe_ratio(last['boll_up'] - last['boll_dn'], last['boll_dn'])
+    boll_band_width_ratio = None
+    if not pd.isna(last.get('boll_up')) and not pd.isna(last.get('boll_dn')) and last.get('boll_dn') not in (None, 0):
+        boll_band_width_ratio = (last['boll_up'] - last['boll_dn']) / last['boll_dn']
     res['boll_band_width_ratio'] = boll_band_width_ratio
     res['oscillation_threshold'] = None
 
     if is_4h:  # 如果当前评估的是4小时级别数据，执行以下特定逻辑
-        # 震荡过滤：(UP - DN) / DN < 0.04 不开仓 (这里仅计算指标，在run_strategy拦截)
         res['oscillation_threshold'] = OSCILLATION_THRESHOLD_4H
-        res['is_oscillation'] = boll_band_width_ratio < OSCILLATION_THRESHOLD_4H  # 判断布林带上下轨间距率是否小于4H阈值，若是则为震荡
-
-        # 4H 四类趋势都额外加入 RSI14 条件，c1(EMA)和c2(布林中轨)同质化高，合并为满足一个即可
-        # A. 空头转多头 -> 回调趋势还是空头 (3个条件满足2个)
+        res['is_oscillation'] = boll_band_width_ratio is not None and boll_band_width_ratio < OSCILLATION_THRESHOLD_4H
+        # 4H 四类趋势使用 EMA 作为方向门槛。
         ps_c1 = (last['open'] < min(last['ema20'], last['ema50']) and  # 条件1：当前开盘价低于EMA20和EMA50的最小值，且...
                  prev['close'] < min(prev['ema20'], prev['ema50']) and last['close'] < last['open'])  # 上一根收盘价也低于EMA极小值，且当前为阴线（收盘<开盘）
-        ps_c2 = (last['open'] < last['boll_mid'] and  # 条件2：当前开盘价低于布林中轨，且...
-                 prev['close'] < prev['boll_mid'] and last['close'] < last['open'])  # 上一根收盘价也低于布林中轨，且当前为阴线
-        ps_c_ema_boll = ps_c1 or ps_c2  # EMA和布林中轨满足一个即可
         ps_c3 = last['volume'] > prev['volume']  # 条件3：当前K线成交量大于上一根K线成交量
         ps_c4 = last['rsi'] > 40  # 条件4：最新收盘蜡烛图 RSI14 >35
         ps_c5 = last['rsi']-prev['rsi']<-4
-        res['pullback_short'] = ps_c_ema_boll and sum([ps_c3, ps_c4,ps_c5]) >= 2  # 3个条件满足至少2个，则判定为回调空头结构
+        res['pullback_short'] = ps_c1 and sum([ps_c3, ps_c4, ps_c5]) >= 2
 
         # A. 空头转多头 -> 多头趋势：方向门槛 + 质量打分
         lt_gate_ema = last['close'] > last['ema20'] and last['ema20'] >= last['ema50']
-        lt_gate_boll = last['close'] > last['boll_mid']
         lt_gate_candle = last['close'] > last['open']
-        lt_score_structure_ok = lt_gate_ema or lt_gate_boll
-        lt_gate = lt_score_structure_ok and lt_gate_candle
+        lt_gate = lt_gate_ema and lt_gate_candle
 
         lt_score_volume_expand = last['volume'] > prev['volume']
         lt_score_rsi_zone = 40 <= last['rsi'] <= 68
@@ -2111,20 +1758,15 @@ def evaluate_trend(df, timeframe, time_factor, is_4h=False, now_dt=None):  # 定
         # B. 多头转空头 -> 回调趋势还是多头 (3个条件满足2个，有容错)
         pl_c1 = (is_above(last['open'], min(last['ema20'], last['ema50'])) and  # 条件1：当前开盘价在EMA20/50最小值之上（含容错），且...
                  is_above(prev['close'], min(prev['ema20'], prev['ema50'])) and last['close'] > last['open'])  # 上一根收盘价在EMA极小值之上（含容错），且当前为阳线
-        pl_c2 = (is_above(last['open'], last['boll_mid']) and  # 条件2：当前开盘价在布林中轨之上（含容错），且...
-                 is_above(prev['close'], prev['boll_mid']) and last['close'] > last['open'])  # 上一根收盘价在布林中轨之上（含容错），且当前为阳线
-        pl_c_ema_boll = pl_c1 or pl_c2  # EMA和布林中轨满足一个即可
         pl_c3 = last['volume'] > prev['volume']  # 条件3：当前成交量大于上一根成交量
         pl_c4 = last['rsi'] < 68  # 条件4：最新收盘蜡烛图 RSI14 < 70
         pl_c5 = last['rsi']-prev['rsi']>4
-        res['pullback_long'] = pl_c_ema_boll and sum([pl_c3, pl_c4, pl_c5]) >= 2  # 满足至少2个条件，即判定为回调多头结构
+        res['pullback_long'] = pl_c1 and sum([pl_c3, pl_c4, pl_c5]) >= 2
 
         # B. 多头转空头 -> 空头趋势：方向门槛 + 质量打分
         st_gate_ema = last['close'] < last['ema20'] and last['ema20'] <= last['ema50']
-        st_gate_boll = last['close'] < last['boll_mid']
         st_gate_candle = last['close'] < last['open']
-        st_score_structure_ok = st_gate_ema or st_gate_boll
-        st_gate = st_score_structure_ok and st_gate_candle
+        st_gate = st_gate_ema and st_gate_candle
 
         st_score_rsi_val = last['rsi']-prev['rsi']<-4
         st_score_volume_expand = last['volume'] > prev['volume']
@@ -2141,37 +1783,32 @@ def evaluate_trend(df, timeframe, time_factor, is_4h=False, now_dt=None):  # 定
         st_score_threshold = 3
         res['short_trend'] = st_gate and st_score >= st_score_threshold
 
-        # 空头平仓：改为“上一根严重超卖 + 当前RSI拐头回升 + 收回布林带内”
+        # 空头平仓：上一根严重超卖 + 当前RSI拐头回升
         cs_c1 = prev['rsi'] < 32
         cs_c2 = last['rsi']-prev['rsi']>4
-        cs_c3 = last['close'] > last['boll_dn']
-        res['close_short'] = all([cs_c1, cs_c2, cs_c3])
+        res['close_short'] = all([cs_c1, cs_c2])
         close_short_checks = {
             'prev_rsi_lt_30': cs_c1,
-            'rsi_rebound': cs_c2,
-            'back_inside_boll_dn': cs_c3
+            'rsi_rebound': cs_c2
         }
 
-        # 多头平仓：改为“上一根严重超买 + 当前RSI拐头回落 + 收回布林带内”
+        # 多头平仓：上一根严重超买 + 当前RSI拐头回落
         cl_c1 = prev['rsi'] > 70
         cl_c2 = last['rsi']-prev['rsi']<-4
-        cl_c3 = last['close'] < last['boll_up']
-        res['close_long'] = all([cl_c1, cl_c2, cl_c3])
+        res['close_long'] = all([cl_c1, cl_c2])
         close_long_checks = {
             'prev_rsi_gt_75': cl_c1,
-            'rsi_pullback': cl_c2,
-            'back_inside_boll_up': cl_c3
+            'rsi_pullback': cl_c2
         }
 
         # 记录 4H 级别的具体条件判断结果
         res['details'] = {
-            'ps': {'ema_or_boll': ps_c_ema_boll, 'c1_ema': ps_c1, 'c2_boll': ps_c2, 'c3_vol': ps_c3, 'c4_rsi': ps_c4, 'c5_rsi_val': ps_c5},
+            'ps': {'c1_ema': ps_c1, 'c3_vol': ps_c3, 'c4_rsi': ps_c4, 'c5_rsi_val': ps_c5},
             'lt': {
                 'gate': lt_gate,
                 'score': lt_score,
                 'threshold': lt_score_threshold,
                 'ema_side': lt_gate_ema,
-                'boll_side': lt_gate_boll,
                 'candle_side': lt_gate_candle,
                 'rsi_val': lt_score_rsi_val,
                 'volume_expand': lt_score_volume_expand,
@@ -2179,13 +1816,12 @@ def evaluate_trend(df, timeframe, time_factor, is_4h=False, now_dt=None):  # 定
                 'macd_momentum': lt_score_macd_momentum,
                 'price_progress': lt_score_price_progress
             },
-            'pl': {'ema_or_boll': pl_c_ema_boll, 'c1_ema': pl_c1, 'c2_boll': pl_c2, 'c3_vol': pl_c3, 'c4_rsi': pl_c4, 'c5_rsi_val': pl_c5},
+            'pl': {'c1_ema': pl_c1, 'c3_vol': pl_c3, 'c4_rsi': pl_c4, 'c5_rsi_val': pl_c5},
             'st': {
                 'gate': st_gate,
                 'score': st_score,
                 'threshold': st_score_threshold,
                 'ema_side': st_gate_ema,
-                'boll_side': st_gate_boll,
                 'candle_side': st_gate_candle,
                 'rsi_val': st_score_rsi_val,
                 'volume_expand': st_score_volume_expand,
@@ -2201,62 +1837,46 @@ def evaluate_trend(df, timeframe, time_factor, is_4h=False, now_dt=None):  # 定
         # 15分钟，1小时级别逻辑  # 注释说明这是针对小级别的数据逻辑
         if timeframe == '1h':
             res['oscillation_threshold'] = OSCILLATION_THRESHOLD_1H
-            res['is_oscillation'] = boll_band_width_ratio < OSCILLATION_THRESHOLD_1H
- 
-        # 回调趋势还是空头 (满足3个条件)
+            res['is_oscillation'] = boll_band_width_ratio is not None and boll_band_width_ratio < OSCILLATION_THRESHOLD_1H
+        # 回调趋势还是空头，EMA 必须满足。
         ps_c1 = last['volume'] > prev['volume']  # 条件1：当前K线成交量相比上一根有所上升
         ps_c2 = last['rsi'] >= 35 and last['rsi']-prev['rsi']<-4  # 条件2：当前RSI大于35
         ps_c3 = (prev['close'] < min(prev['ema20'], prev['ema50']) and  # 条件3：上一根收盘价低于EMA20/50的极小值，且...
                  last['open'] < min(last['ema20'], last['ema50']) and last['close'] < last['open'])  # 当前开盘价低于EMA极小值，并且上一根是阴线
-        ps_c4 = (prev['close'] < prev['boll_mid'] and  # 条件4：上一根收盘价低于布林中轨，且...
-                 last['open'] < last['boll_mid'] and last['close'] < last['open'])  # 当前开盘价低于布林中轨，并且上一根是阴线
         ps_c5 = (last['macd'] < last['macd_signal']) and (abs(last['macd_hist']) > abs(prev['macd_hist']))
-        ps_ema_or_boll = ps_c3 or ps_c4  # EMA 与 BOLL 至少满足一个
-        res['pullback_short'] = ps_ema_or_boll and sum([ps_c1, ps_c2,ps_c5]) >= 2  # 上述4个条件满足至少3个，且 EMA/BOLL 至少命中一个
+        res['pullback_short'] = ps_c3 and sum([ps_c1, ps_c2, ps_c5]) >= 2
 
         # 多头趋势 (满足3个条件)
         lt_c1 = last['volume'] > prev['volume']  # 条件1：当前K线成交量相比上一根有所上升
         lt_c2 = 35<=last['rsi'] <= 65 and last['rsi']-prev['rsi']>4 # 条件2：当前RSI小于65
         lt_c3 = (prev['close'] > min(prev['ema20'], prev['ema50']) and  # 条件3：上一根收盘价高于EMA20/50的极小值，且...
                  last['open'] > min(last['ema20'], last['ema50']) and last['close'] > last['open'])  # 当前开盘价高于EMA极小值，并且上一根是阳线
-        lt_c4 = (prev['close'] > prev['boll_mid'] and  # 条件4：上一根收盘价高于布林中轨，且...
-                 last['open'] > last['boll_mid'] and last['close'] > last['open'])  # 当前开盘价高于布林中轨，并且上一根是阳线
         lt_c5 = (last['macd'] > last['macd_signal']) and (abs(last['macd_hist']) > abs(prev['macd_hist']))  # 条件5：MACD为金叉状态（快线>慢线），且当前MACD值比上一个大（动能向上）
-        lt_ema_or_boll = lt_c3 or lt_c4  # EMA 与 BOLL 至少满足一个
-        res['long_trend'] = lt_ema_or_boll and sum([lt_c1, lt_c2, lt_c5]) >= 2 # 上述5个条件满足至少3个，且 EMA/BOLL 至少命中一个
+        res['long_trend'] = lt_c3 and sum([lt_c1, lt_c2, lt_c5]) >= 2
 
         # 回调趋势还是多头 (满足3个条件)
         pl_c1 = last['volume'] > prev['volume']  # 条件1：当前K线成交量相比上一根有所上升
         pl_c2 = 35 <= last['rsi'] <= 65 and last['rsi']-prev['rsi']>4  # 条件2：当前RSI的值在40到65之间
         pl_c3 = (last['macd'] > last['macd_signal']) and (abs(last['macd_hist']) > abs(prev['macd_hist']))  # 条件3：MACD是金叉，且当前MACD值比上一个大
-        # pl_c4 = prev['close'] > prev['ema20'] and prev['close'] > prev['ema50']  # 条件4：上一根的收盘价在EMA20和EMA50的上方
-        # pl_c5 = prev['close'] > prev['boll_mid']  # 条件5：上一根的收盘价在布林带中轨的上方
         pl_c4 = last['open']>min(last['ema20'], last['ema50']) and prev['close']>min(prev['ema20'], prev['ema50']) and last['close'] > last['open']
-        pl_c5 = last['open']>last['boll_mid'] and  prev['close']>prev['boll_mid'] and last['close'] > last['open'] 
-
-        pl_ema_or_boll = pl_c4 or pl_c5  # EMA 与 BOLL 至少满足一个
-        res['pullback_long'] = pl_ema_or_boll and sum([pl_c1, pl_c2, pl_c3]) >= 2  # 满足至少3个条件，且 EMA/BOLL 至少命中一个
+        res['pullback_long'] = pl_c4 and sum([pl_c1, pl_c2, pl_c3]) >= 2
 
         # 空头趋势 (满足3个条件)
         st_c1 = last['volume'] > prev['volume']  # 条件1：当前K线成交量相比上一根有所上升
         st_c2 = 35 <= last['rsi'] <= 65 and last['rsi']-prev['rsi']<=-4  # 条件2：当前RSI的值在40到60之间
         st_c3 = (last['macd'] < last['macd_signal']) and (abs(last['macd_hist']) > abs(prev['macd_hist']))  # 条件3：MACD是死叉（快线<慢线），并且当前MACD值大于上一个
-        # st_c4 = prev['close'] < prev['ema20'] and prev['close'] < prev['ema50']  # 条件4：上一根的收盘价在EMA20和EMA50的下方
-        # st_c5 = prev['close'] < prev['boll_mid']  # 条件5：上一根的收盘价在布林带中轨的下方
         st_c4 = last['open']<max(last['ema20'], last['ema50']) and prev['close']< max(prev['ema20'], prev['ema50']) and last['close'] < last['open']  # 上一根收盘价在EMA极大值之下（含容错），且当前为阴线
-        st_c5 = last['open']<last['boll_mid'] and prev['close'] <prev['boll_mid'] and last['close'] < last['open']  # 上一根收盘价在布林中轨之下（含容错），且当前为阴线
-        st_ema_or_boll = st_c4 or st_c5  # EMA 与 BOLL 至少满足一个
-        res['short_trend'] = st_ema_or_boll and sum([st_c1, st_c2, st_c3]) >= 2  # 满足至少3个条件，且 EMA/BOLL 至少命中一个
+        res['short_trend'] = st_c4 and sum([st_c1, st_c2, st_c3]) >= 2
 
         if timeframe == '1h':
-            # 1H 空头平仓：最近几根先出现严重超卖/贴下轨，后续任一收盘站上参考K实体上沿，再叠加 MACD 动能衰减
+            # 1H 空头平仓：最近几根先出现严重超卖，后续任一收盘站上参考K实体上沿，再叠加 MACD 动能衰减
             short_exit_ref = find_recent_extreme_exit_reference('short')
             cs_c1 = short_exit_ref is not None
             cs_c2 = bool(short_exit_ref and short_exit_ref['confirmed'])
             cs_c3 = abs(last['macd_hist']) < abs(prev['macd_hist'])
             res['close_short'] = all([cs_c1, cs_c2, cs_c3])
             close_short_checks = {
-                'recent_touch_boll_dn_or_rsi_lt_30': cs_c1,
+                'recent_rsi_lt_30': cs_c1,
                 'close_back_above_ref_body_high': cs_c2,
                 'macd_hist_weakening': cs_c3
             }
@@ -2268,14 +1888,14 @@ def evaluate_trend(df, timeframe, time_factor, is_4h=False, now_dt=None):  # 定
                     'confirm_bar_time': short_exit_ref['confirm_bar_time'] or '无'
                 })
 
-            # 1H 多头平仓：最近几根先出现严重超买/贴上轨，后续任一收盘跌破参考K实体下沿，再叠加 MACD 动能衰减
+            # 1H 多头平仓：最近几根先出现严重超买，后续任一收盘跌破参考K实体下沿，再叠加 MACD 动能衰减
             long_exit_ref = find_recent_extreme_exit_reference('long')
             cl_c1 = long_exit_ref is not None
             cl_c2 = bool(long_exit_ref and long_exit_ref['confirmed'])
             cl_c3 = abs(last['macd_hist']) < abs(prev['macd_hist'])
             res['close_long'] = all([cl_c1, cl_c2, cl_c3])
             close_long_checks = {
-                'recent_touch_boll_up_or_rsi_gt_72': cl_c1,
+                'recent_rsi_gt_72': cl_c1,
                 'close_back_below_ref_body_low': cl_c2,
                 'macd_hist_weakening': cl_c3
             }
@@ -2290,173 +1910,29 @@ def evaluate_trend(df, timeframe, time_factor, is_4h=False, now_dt=None):  # 定
             # 15M 维持原有更灵敏的平仓条件
             cs_c1 = last['volume'] < prev['volume']  # 条件1：最新已收盘K线缩量
             cs_c2 = last['rsi'] < 30  # 条件2：最新已收盘K线RSI小于30（严重超卖）
-            cs_c3 = last['close'] <= last['boll_dn'] or tol(last['close'], last['boll_dn'])  # 条件3：最新已收盘K线收盘价接近或跌破布林带下轨
-            res['close_short'] = sum([cs_c1, cs_c2, cs_c3]) >= 2  # 满足至少2个条件，触发小级别强劲空头平仓信号
+            res['close_short'] = sum([cs_c1, cs_c2]) >= 1
             close_short_checks = {
                 'volume_shrink': cs_c1,
-                'rsi_lt_30': cs_c2,
-                'touch_or_break_boll_dn': cs_c3
+                'rsi_lt_30': cs_c2
             }
 
             # 15M 维持原有更灵敏的平仓条件
             cl_c1 = last['volume'] < prev['volume']  # 条件1：最新已收盘K线缩量
             cl_c2 = last['rsi'] > 75  # 条件2：最新已收盘K线RSI大于75（严重超买）
-            cl_c3 = last['close'] >= last['boll_up'] or tol(last['close'], last['boll_up'])  # 条件3：最新已收盘K线收盘价接近或突破布林带上轨
-            res['close_long'] = sum([cl_c1, cl_c2, cl_c3]) >= 2  # 满足至少2个条件，触发小级别强劲多头平仓信号
+            res['close_long'] = sum([cl_c1, cl_c2]) >= 1
             close_long_checks = {
                 'volume_shrink': cl_c1,
-                'rsi_gt_75': cl_c2,
-                'touch_or_break_boll_up': cl_c3
+                'rsi_gt_75': cl_c2
             }
 
         # 记录 1H / 15M 级别的具体条件判断结果
         res['details'] = {
-            'ps': [ps_c1, ps_c2, ps_c3, ps_c4],
-            'lt': [lt_c1, lt_c2, lt_c3, lt_c4, lt_c5],
-            'pl': [pl_c1, pl_c2, pl_c3, pl_c4, pl_c5],
-            'st': [st_c1, st_c2, st_c3, st_c4, st_c5],
+            'ps': [ps_c1, ps_c2, ps_c3, ps_c5],
+            'lt': [lt_c1, lt_c2, lt_c3, lt_c5],
+            'pl': [pl_c1, pl_c2, pl_c3, pl_c4],
+            'st': [st_c1, st_c2, st_c3, st_c4],
             'close_long_checks': close_long_checks,
             'close_short_checks': close_short_checks
-        }
-
-    # 先给影线细节预留一个空字典，只有在 4H / 1H 上才会真正填充内容
-    res['details']['shadow'] = {}
-    #包括了，长影线止损，长影线确认反转，判断是否是长影线，长影线是否达到支撑或者压力位置。
-    if timeframe in ('4h', '1h'):
-        # 先判断最新一根K线是不是长上影线
-        last_upper_shadow, last_upper_shadow_details = is_long_upper_shadow(last)
-        # 再判断最新一根K线是不是长下影线
-        last_lower_shadow, last_lower_shadow_details = is_long_lower_shadow(last)
-        # 上一根是否为长上影线，给“确认反转”逻辑用
-        prev_upper_shadow, prev_upper_shadow_details = is_long_upper_shadow(prev)
-        # 上一根是否为长下影线，给“确认反转”逻辑用
-        prev_lower_shadow, prev_lower_shadow_details = is_long_lower_shadow(prev)
-
-        # 判断最新一根长上影线是不是出现在压力位
-        last_upper_resistance, last_upper_resistance_details = is_upper_shadow_at_resistance(last, prev, prev2, tol, is_above)
-        # 判断最新一根长下影线是不是出现在支撑位
-        last_lower_support, last_lower_support_details = is_lower_shadow_at_support(last, prev, prev2, tol, is_below)
-        # 判断上一根长上影线是不是出现在压力位，供“下一根确认反转”使用
-        prev_upper_resistance, prev_upper_resistance_details = is_upper_shadow_at_resistance(prev, prev2, prev3, tol, is_above)
-        # 判断上一根长下影线是不是出现在支撑位，供“下一根确认反转”使用
-        prev_lower_support, prev_lower_support_details = is_lower_shadow_at_support(prev, prev2, prev3, tol, is_below)
-
-        # 把“最新一根本身是不是长影线”直接记录下来，别的地方可以直接读取
-        res['long_upper_shadow'] = last_upper_shadow
-        res['long_lower_shadow'] = last_lower_shadow
-
-        # 多单过滤器：当前这根如果是压力区长上影，而且收盘没站回强势区，就先别追多
-        res['upper_shadow_filter_long'] = (
-            last_upper_shadow and
-            last_upper_resistance and
-            (last['close'] <= max(last['ema20'], last['boll_mid']) or last['close'] < last['open'])
-        )
-        # 空单过滤器：当前这根如果是支撑区长下影，而且收盘回到偏强位置，就先别追空
-        res['lower_shadow_filter_short'] = (
-            last_lower_shadow and
-            last_lower_support and
-            (last['close'] >= min(last['ema20'], last['boll_mid']) or last['close'] > last['open'])
-        )
-
-        # 成交量是否放大只作为辅助观察，不作为硬条件，但我会记到 details 里
-        upper_reversal_volume_ok = last['volume'] > prev['volume']
-        lower_reversal_volume_ok = last['volume'] > prev['volume']
-        upper_shadow_candidate = find_recent_shadow_candidate('upper')
-        lower_shadow_candidate = find_recent_shadow_candidate('lower')
-        upper_shadow_mid_hit = upper_shadow_candidate is not None and last['close'] <= upper_shadow_candidate['body_mid']
-        upper_shadow_body_low_hit = upper_shadow_candidate is not None and last['close'] <= upper_shadow_candidate['body_low']
-        lower_shadow_mid_hit = lower_shadow_candidate is not None and last['close'] >= lower_shadow_candidate['body_mid']
-        lower_shadow_body_high_hit = lower_shadow_candidate is not None and last['close'] >= lower_shadow_candidate['body_high']
-        upper_shadow_offset_ok = upper_shadow_candidate is not None and upper_shadow_candidate.get('offset', 99) <= SHADOW_REVERSAL_CONFIRM_MAX_OFFSET_BARS
-        lower_shadow_offset_ok = lower_shadow_candidate is not None and lower_shadow_candidate.get('offset', 99) <= SHADOW_REVERSAL_CONFIRM_MAX_OFFSET_BARS
-        upper_shadow_bearish_confirm = last['close'] < last['open']
-        lower_shadow_bullish_confirm = last['close'] > last['open']
-        current_long_logic_active = res['long_trend'] or res['pullback_long']
-        current_short_logic_active = res['short_trend'] or res['pullback_short']
-
-        # 开空反转：最近 3 根内先出现压力区长上影，当前这根要重新跌到实体中点下方且本身为阴线，且当前未回到多头逻辑。
-        res['upper_shadow_reversal_short'] = (
-            upper_shadow_candidate is not None and
-            upper_shadow_offset_ok and
-            upper_shadow_mid_hit and
-            upper_shadow_bearish_confirm and
-            not current_long_logic_active
-        )
-        # 开多反转：最近 3 根内先出现支撑区长下影，当前这根要重新涨到实体中点上方且本身为阳线，且当前未回到空头逻辑。
-        res['lower_shadow_reversal_long'] = (
-            lower_shadow_candidate is not None and
-            lower_shadow_offset_ok and
-            lower_shadow_mid_hit and
-            lower_shadow_bullish_confirm and
-            not current_short_logic_active
-        )
-
-        # 多单收紧止损：上一根先出现高位长上影，这一根又没创新高，视为多头变弱
-        res['upper_shadow_tighten_long'] = (
-            prev_upper_shadow and
-            prev_upper_resistance and
-            (prev['rsi'] >= 70 or prev['close'] >= prev['boll_up'] or tol(prev['close'], prev['boll_up'])) and
-            last['high'] <= prev['high']
-        )
-        # 空单收紧止损：上一根先出现低位长下影，这一根又没创新低，视为空头变弱
-        res['lower_shadow_tighten_short'] = (
-            prev_lower_shadow and
-            prev_lower_support and
-            (prev['rsi'] <= 30 or prev['close'] <= prev['boll_dn'] or tol(prev['close'], prev['boll_dn'])) and
-            last['low'] >= prev['low']
-        )
-
-        # 如果最近几根存在可用的长上影参考K，就预先算出“反转开空”的止损参考位
-        if upper_shadow_candidate is not None:
-            res['shadow_short_stop_ref'] = upper_shadow_candidate['stop_ref']
-            res['shadow_short_trigger_tf'] = timeframe
-            res['shadow_upper_reference_bar'] = upper_shadow_candidate['bar_time']
-        # 如果最近几根存在可用的长下影参考K，就预先算出“反转开多”的止损参考位
-        if lower_shadow_candidate is not None:
-            res['shadow_long_stop_ref'] = lower_shadow_candidate['stop_ref']
-            res['shadow_long_trigger_tf'] = timeframe
-            res['shadow_lower_reference_bar'] = lower_shadow_candidate['bar_time']
-        # 多单收紧止损时，保护位 = 上一根长上影实体底部 - 0.1ATR
-        if res['upper_shadow_tighten_long']:
-            res['upper_shadow_long_protect_ref'] = min(prev['open'], prev['close']) - 0.1 * prev['atr']
-        # 空单收紧止损时，保护位 = 上一根长下影实体顶部 + 0.1ATR
-        if res['lower_shadow_tighten_short']:
-            res['lower_shadow_short_protect_ref'] = max(prev['open'], prev['close']) + 0.1 * prev['atr']
-
-        # 把所有影线子条件塞进 details，方便你后面看日志和 CSV 复盘
-        res['details']['shadow'] = {
-            'last_upper_shadow': last_upper_shadow,
-            'last_lower_shadow': last_lower_shadow,
-            'prev_upper_shadow': prev_upper_shadow,
-            'prev_lower_shadow': prev_lower_shadow,
-            'last_upper_shadow_details': last_upper_shadow_details,
-            'last_lower_shadow_details': last_lower_shadow_details,
-            'prev_upper_shadow_details': prev_upper_shadow_details,
-            'prev_lower_shadow_details': prev_lower_shadow_details,
-            'last_upper_resistance': last_upper_resistance_details,
-            'last_lower_support': last_lower_support_details,
-            'prev_upper_resistance': prev_upper_resistance_details,
-            'prev_lower_support': prev_lower_support_details,
-            'upper_shadow_candidate': upper_shadow_candidate,
-            'lower_shadow_candidate': lower_shadow_candidate,
-            'upper_reversal_volume_ok': upper_reversal_volume_ok,
-            'lower_reversal_volume_ok': lower_reversal_volume_ok,
-            'upper_shadow_mid_hit': upper_shadow_mid_hit,
-            'upper_shadow_body_low_hit': upper_shadow_body_low_hit,
-            'lower_shadow_mid_hit': lower_shadow_mid_hit,
-            'lower_shadow_body_high_hit': lower_shadow_body_high_hit,
-            'upper_shadow_offset_ok': upper_shadow_offset_ok,
-            'lower_shadow_offset_ok': lower_shadow_offset_ok,
-            'upper_shadow_bearish_confirm': upper_shadow_bearish_confirm,
-            'lower_shadow_bullish_confirm': lower_shadow_bullish_confirm,
-            'current_long_logic_active': current_long_logic_active,
-            'current_short_logic_active': current_short_logic_active,
-            'upper_shadow_filter_long': res['upper_shadow_filter_long'],
-            'lower_shadow_filter_short': res['lower_shadow_filter_short'],
-            'upper_shadow_reversal_short': res['upper_shadow_reversal_short'],
-            'lower_shadow_reversal_long': res['lower_shadow_reversal_long'],
-            'upper_shadow_tighten_long': res['upper_shadow_tighten_long'],
-            'lower_shadow_tighten_short': res['lower_shadow_tighten_short']
         }
 
     return res  # 返回包含所有趋势和信号状态的字典
@@ -2470,7 +1946,7 @@ def open_order(side, price, sl_price, state_4h, state_1h, state_15m, signal_bar_
         return False  # 如果计算出的下单数量为0（可能余额不足或出错），则直接返回，不开仓
     open_order_id = ''
 
-    # 开仓前先用“保守估算强平价”预校验长影线止损，防止止损本来就落到强平外面
+    # 开仓前先用“保守估算强平价”预校验止损，防止止损本来就落到强平外面
     estimated_safe_stop, estimated_stop_meta = ensure_stop_price_safe(price, sl_price, side, liquidation_price=None)
     if not stop_price_is_still_valid(price, estimated_safe_stop, side):
         logging.warning(
@@ -2523,7 +1999,7 @@ def open_order(side, price, sl_price, state_4h, state_1h, state_15m, signal_bar_
             order_id_suffix = f"\n{order_id_lines}" if order_id_lines else ''
             send_msg(
                 "ETH交易: ⚠️开仓后立即撤退",
-                f"原因: 真实强平价过近，长影线止损无安全空间\n方向: {side}\n"
+                f"原因: 真实强平价过近，止损无安全空间\n方向: {side}\n"
                 f"入场价: {actual_price}\n真实强平价: {actual_liquidation_price}\n修正后止损: {actual_safe_stop}"
                 f"{order_id_suffix}"
             )
@@ -2574,9 +2050,8 @@ def open_order(side, price, sl_price, state_4h, state_1h, state_15m, signal_bar_
             'close_cond_4h': '',
             'close_cond_1h': '',
             'close_cond_15m': '',
-            'entry_reason': entry_reason,  # 记录这笔单到底是趋势单还是影线反转单
+            'entry_reason': entry_reason,  # 记录这笔单的开仓来源
             'entry_trigger_tf': entry_trigger_tf_display,  # 记录真正触发本次开仓的周期
-            'shadow_stop_mode': '',  # 开仓时先清空，后面如果发生“影线收紧止损”再写入
             'initial_balance': initial_usdt,
             'open_fee': open_fee,
             'open_order_id': open_order_id,
@@ -2588,7 +2063,6 @@ def open_order(side, price, sl_price, state_4h, state_1h, state_15m, signal_bar_
             'last_stop_order_refresh_error': '',
             'entry_signal_bar_15m': signal_bar_15m,
             'last_entry_bar_15m': signal_bar_15m,
-            'last_shadow_adjust_bar_15m': '',  # 新开一笔单后，先把“最近一次影线调止损的15M时间”清空
             'position_miss_count': 0
         })
 
@@ -2671,30 +2145,18 @@ def monitor_position(state_4h, state_1h, state_15m, atr_1h, atr_4h, signal_bar_1
         trade_state['close_cond_4h'] = format_condition_snapshot_for_mail('4H', state_4h)
         trade_state['close_cond_1h'] = format_condition_snapshot_for_mail('1H', state_1h)
         trade_state['close_cond_15m'] = format_condition_snapshot_for_mail('15M', state_15m)
-        entry_allowed = not state_4h.get('is_oscillation', False) and not state_1h.get('is_oscillation', False)
-        upper_shadow_filter_long = state_4h.get('upper_shadow_filter_long') or state_1h.get('upper_shadow_filter_long')
-        lower_shadow_filter_short = state_4h.get('lower_shadow_filter_short') or state_1h.get('lower_shadow_filter_short')
-        reversal_long_tf, reversal_long_state = pick_state_signal(state_4h, state_1h, 'lower_shadow_reversal_long')
-        reversal_short_tf, reversal_short_state = pick_state_signal(state_4h, state_1h, 'upper_shadow_reversal_short')
-        reversal_conflict = reversal_long_state is not None and reversal_short_state is not None
         long_cond_4h = state_4h.get('long_trend')
         long_cond_1h = state_1h.get('long_trend') or state_1h.get('pullback_long')
         long_cond_15m = state_15m.get('long_trend')
         short_cond_4h = state_4h.get('short_trend')
         short_cond_1h = state_1h.get('short_trend') or state_1h.get('pullback_short')
         short_cond_15m = state_15m.get('short_trend')
-        trend_long_ready = entry_allowed and long_cond_4h and long_cond_1h and long_cond_15m and not upper_shadow_filter_long
-        trend_short_ready = entry_allowed and short_cond_4h and short_cond_1h and short_cond_15m and not lower_shadow_filter_short
+        trend_long_ready = long_cond_4h and long_cond_1h and long_cond_15m
+        trend_short_ready = short_cond_4h and short_cond_1h and short_cond_15m
 
         curr_price = get_latest_price()  # 提取最新的成交价格
         entry = trade_state['entry_price']  # 读取当前持仓的入场价格
         sl_price = trade_state['stop_loss_price']  # 读取当前设置的止损价格
-        # 这里只允许在新的15M信号K线上调一次影线止损，避免同一根15M重复抬止损/压止损
-        can_adjust_shadow_stop = (
-            allow_strategy_close and
-            signal_bar_15m and
-            signal_bar_15m != trade_state.get('last_shadow_adjust_bar_15m', '')
-        )
         # --- A. 多单监控 ---
         if trade_state['side'] == 'long':  # 如果当前持仓方向为做多
             # 更新最高价
@@ -2749,82 +2211,8 @@ def monitor_position(state_4h, state_1h, state_15m, atr_1h, atr_4h, signal_bar_1
                             return
                         return
 
-            # 3. 影线收紧止损、确认反转和平仓条件
+            # 3. 趋势反手和平仓条件
             if allow_strategy_close:
-                if can_adjust_shadow_stop:
-                    # 先看 4H / 1H 有没有“多单该因为长上影线收紧止损”的信号，4H 优先
-                    tighten_tf, tighten_state = pick_state_signal(state_4h, state_1h, 'upper_shadow_tighten_long')
-                    if tighten_state is not None:
-                        # protect_ref 就是新的保护价，也就是我们希望把止损抬到的位置
-                        protect_ref = tighten_state.get('upper_shadow_long_protect_ref')
-                        if protect_ref is not None and not pd.isna(protect_ref):
-                            # 多单止损只能往上抬，不能往下放宽，所以这里取 max
-                            new_sl = max(trade_state['stop_loss_price'], protect_ref)
-                            if new_sl > trade_state['stop_loss_price']:
-                                if not refresh_protective_stop_order(new_sl):
-                                    if handle_stop_order_refresh_failure(
-                                        "服务端止损更新失败，连续5次后主动平仓",
-                                        curr_price,
-                                        signal_bar_15m=signal_bar_15m,
-                                        trigger_label="服务端止损更新失败，连续5次后主动平仓"
-                                    ):
-                                        return
-                                    return
-                                # 更新全局止损价
-                                trade_state['stop_loss_price'] = new_sl
-                                # 记录这次止损是因为哪个周期的长上影线收紧的
-                                trade_state['shadow_stop_mode'] = f"{tighten_tf} 长上影收紧止损"
-                                # 记住这根15M已经处理过收紧止损，后面同一根15M不再重复执行
-                                trade_state['last_shadow_adjust_bar_15m'] = signal_bar_15m
-                                trade_state['stop_order_price'] = new_sl
-                                logging.info(f"多单收紧止损: {tighten_tf}, 新止损价={new_sl:.4f}")
-                                order_id_lines = format_order_id_lines(
-                                    open_order_id=trade_state.get('open_order_id', ''),
-                                    stop_order_id=trade_state.get('stop_order_id', '')
-                                )
-                                order_id_suffix = f"\n{order_id_lines}" if order_id_lines else ''
-                                send_msg(
-                                    "ETH交易: 多单收紧止损",
-                                    f"{tighten_tf} 长上影信号触发，新的多单止损价: {new_sl:.4f}"
-                                    f"{order_id_suffix}"
-                                )
-                                # 如果当前价格已经跌到新止损下方，就直接按“收紧止损”原因平仓
-                                if curr_price <= trade_state['stop_loss_price']:
-                                    close_position(f"{tighten_tf} 长上影收紧止损", curr_price, signal_bar_15m=signal_bar_15m, trigger_label=f"{tighten_tf} 长上影收紧止损")
-                                    return
-
-                # 如果已经满足完整的反手做空条件，直接平多并反手开空
-                if entry_allowed and not reversal_conflict and reversal_short_state is not None and short_cond_15m and not lower_shadow_filter_short:
-                    shadow_reference_key = get_shadow_reference_key('short', reversal_short_tf, reversal_short_state)
-                    if is_shadow_reference_used(shadow_reference_key):
-                        logging.info(f"跳过已使用过的影线反转空参考K，不执行多转空: {shadow_reference_key}")
-                        return
-                    if close_position(f"{reversal_short_tf} 长上影确认反转平多并开空", curr_price, signal_bar_15m=signal_bar_15m, trigger_label=f"{reversal_short_tf} 长上影确认反转平多并开空"):
-                        try:
-                            reverse_price = get_latest_price()
-                            reverse_sl = reversal_short_state.get('shadow_short_stop_ref')
-                            if reverse_sl is None or pd.isna(reverse_sl):
-                                reverse_sl = reverse_price + atr_4h
-                            mark_shadow_reference_used(shadow_reference_key)
-                            if open_order('short', reverse_price, reverse_sl, state_4h, state_1h, state_15m, signal_bar_15m, entry_reason='shadow_reversal_short', entry_trigger_tf=reversal_short_tf):
-                                logging.info(f"{reversal_short_tf} 影线反转触发，已完成多转空")
-                        except Exception:
-                            logging.error(f"多转空开仓失败:\n{traceback.format_exc()}")
-                    return
-
-                # 如果还不满足完整的开空条件，就保留原来的“先平多”风控动作
-                if reversal_short_state is not None:
-                    if tighten_stop_on_reversal_warning(
-                        'long',
-                        reversal_short_tf,
-                        reversal_short_state,
-                        curr_price,
-                        signal_bar_15m=signal_bar_15m
-                    ):
-                        return
-                    logging.info(f"{reversal_short_tf} 长上影反转预警已出现，但未满足反手开空条件，本轮仅收紧或继续持有多单")
-                    return
-
                 # 如果满足完整的趋势做空条件，也直接平多并反手开空
                 if trend_short_ready and not trend_long_ready:
                     if close_position("趋势空头条件成立，反手平多并开空", curr_price, signal_bar_15m=signal_bar_15m, trigger_label="趋势反手开空"):
@@ -2837,7 +2225,7 @@ def monitor_position(state_4h, state_1h, state_15m, atr_1h, atr_4h, signal_bar_1
                             logging.error(f"趋势多转空开仓失败:\n{traceback.format_exc()}")
                     return
 
-                # 如果影线没有触发平仓，再退回原来的 close_long 逻辑，4H / 1H 各自独立可平仓
+                # close_long 逻辑，4H / 1H 各自独立可平仓
                 if state_4h.get('close_long'):
                     logging.info(f"4H close_long 触发明细: {format_condition_snapshot_for_mail('4H', state_4h)}")
                     close_position("4H close_long 策略平仓", curr_price, signal_bar_15m=signal_bar_15m, trigger_label="4H close_long")
@@ -2907,82 +2295,8 @@ def monitor_position(state_4h, state_1h, state_15m, atr_1h, atr_4h, signal_bar_1
                             return
                         return
 
-            # 3. 影线收紧止损、确认反转和平仓条件
+            # 3. 趋势反手和平仓条件
             if allow_strategy_close:
-                if can_adjust_shadow_stop:
-                    # 先看 4H / 1H 有没有“空单该因为长下影线收紧止损”的信号，4H 优先
-                    tighten_tf, tighten_state = pick_state_signal(state_4h, state_1h, 'lower_shadow_tighten_short')
-                    if tighten_state is not None:
-                        # protect_ref 就是新的保护价，也就是我们希望把空单止损压到的位置
-                        protect_ref = tighten_state.get('lower_shadow_short_protect_ref')
-                        if protect_ref is not None and not pd.isna(protect_ref):
-                            # 空单止损只能往下压，不能重新放宽，所以这里取 min
-                            new_sl = min(trade_state['stop_loss_price'], protect_ref)
-                            if new_sl < trade_state['stop_loss_price']:
-                                if not refresh_protective_stop_order(new_sl):
-                                    if handle_stop_order_refresh_failure(
-                                        "服务端止损更新失败，连续5次后主动平仓",
-                                        curr_price,
-                                        signal_bar_15m=signal_bar_15m,
-                                        trigger_label="服务端止损更新失败，连续5次后主动平仓"
-                                    ):
-                                        return
-                                    return
-                                # 更新全局止损价
-                                trade_state['stop_loss_price'] = new_sl
-                                # 记录这次止损是因为哪个周期的长下影线收紧的
-                                trade_state['shadow_stop_mode'] = f"{tighten_tf} 长下影收紧止损"
-                                # 记住这根15M已经处理过收紧止损，后面同一根15M不再重复执行
-                                trade_state['last_shadow_adjust_bar_15m'] = signal_bar_15m
-                                trade_state['stop_order_price'] = new_sl
-                                logging.info(f"空单收紧止损: {tighten_tf}, 新止损价={new_sl:.4f}")
-                                order_id_lines = format_order_id_lines(
-                                    open_order_id=trade_state.get('open_order_id', ''),
-                                    stop_order_id=trade_state.get('stop_order_id', '')
-                                )
-                                order_id_suffix = f"\n{order_id_lines}" if order_id_lines else ''
-                                send_msg(
-                                    "ETH交易: 空单收紧止损",
-                                    f"{tighten_tf} 长下影信号触发，新的空单止损价: {new_sl:.4f}"
-                                    f"{order_id_suffix}"
-                                )
-                                # 如果当前价格已经反弹到新止损上方，就直接按“收紧止损”原因平仓
-                                if curr_price >= trade_state['stop_loss_price']:
-                                    close_position(f"{tighten_tf} 长下影收紧止损", curr_price, signal_bar_15m=signal_bar_15m, trigger_label=f"{tighten_tf} 长下影收紧止损")
-                                    return
-
-                # 如果已经满足完整的反手做多条件，直接平空并反手开多
-                if entry_allowed and not reversal_conflict and reversal_long_state is not None and long_cond_15m and not upper_shadow_filter_long:
-                    shadow_reference_key = get_shadow_reference_key('long', reversal_long_tf, reversal_long_state)
-                    if is_shadow_reference_used(shadow_reference_key):
-                        logging.info(f"跳过已使用过的影线反转多参考K，不执行空转多: {shadow_reference_key}")
-                        return
-                    if close_position(f"{reversal_long_tf} 长下影确认反转平空并开多", curr_price, signal_bar_15m=signal_bar_15m, trigger_label=f"{reversal_long_tf} 长下影确认反转平空并开多"):
-                        try:
-                            reverse_price = get_latest_price()
-                            reverse_sl = reversal_long_state.get('shadow_long_stop_ref')
-                            if reverse_sl is None or pd.isna(reverse_sl):
-                                reverse_sl = reverse_price - atr_4h
-                            mark_shadow_reference_used(shadow_reference_key)
-                            if open_order('long', reverse_price, reverse_sl, state_4h, state_1h, state_15m, signal_bar_15m, entry_reason='shadow_reversal_long', entry_trigger_tf=reversal_long_tf):
-                                logging.info(f"{reversal_long_tf} 影线反转触发，已完成空转多")
-                        except Exception:
-                            logging.error(f"空转多开仓失败:\n{traceback.format_exc()}")
-                    return
-
-                # 如果还不满足完整的开多条件，就保留原来的“先平空”风控动作
-                if reversal_long_state is not None:
-                    if tighten_stop_on_reversal_warning(
-                        'short',
-                        reversal_long_tf,
-                        reversal_long_state,
-                        curr_price,
-                        signal_bar_15m=signal_bar_15m
-                    ):
-                        return
-                    logging.info(f"{reversal_long_tf} 长下影反转预警已出现，但未满足反手开多条件，本轮仅收紧或继续持有空单")
-                    return
-
                 # 如果满足完整的趋势做多条件，也直接平空并反手开多
                 if trend_long_ready and not trend_short_ready:
                     if close_position("趋势多头条件成立，反手平空并开多", curr_price, signal_bar_15m=signal_bar_15m, trigger_label="趋势反手开多"):
@@ -2995,7 +2309,7 @@ def monitor_position(state_4h, state_1h, state_15m, atr_1h, atr_4h, signal_bar_1
                             logging.error(f"趋势空转多开仓失败:\n{traceback.format_exc()}")
                     return
 
-                # 如果影线没有触发平仓，再退回原来的 close_short 逻辑，4H / 1H 各自独立可平仓
+                # close_short 逻辑，4H / 1H 各自独立可平仓
                 if state_4h.get('close_short'):
                     logging.info(f"4H close_short 触发明细: {format_condition_snapshot_for_mail('4H', state_4h)}")
                     close_position("4H close_short 策略平仓", curr_price, signal_bar_15m=signal_bar_15m, trigger_label="4H close_short")
@@ -3141,7 +2455,6 @@ def close_position(reason, curr_price=None, signal_bar_15m='', trigger_label='')
             'close_cond_15m': '',
             'entry_reason': '',
             'entry_trigger_tf': '',
-            'shadow_stop_mode': '',
             'initial_balance': 0.0,
             'open_fee': 0.0,
             'open_order_id': '',
@@ -3154,7 +2467,6 @@ def close_position(reason, curr_price=None, signal_bar_15m='', trigger_label='')
             'entry_signal_bar_15m': '',
             'last_exit_bar_15m': exit_signal_bar_15m,
             'last_processed_bar_15m': post_exit_processed_bar_15m,
-            'last_shadow_adjust_bar_15m': '',
             'position_miss_count': 0
         })  # 平仓成功后，将全局持仓状态重置
         logging.info(
@@ -3225,89 +2537,31 @@ def run_strategy():  # 定义策略运行的主函数，负责统筹数据获取
     if not is_new_signal_bar:
         return
     # 4. 入场逻辑判断
-    # 震荡行情过滤
-    if state_4h.get('is_oscillation', False) or state_1h.get('is_oscillation', False):  # 4H 或 1H 任一震荡都先跳过开仓
+    if state_4h.get('is_oscillation', False) or state_1h.get('is_oscillation', False):
         logging.info(
             "跳过震荡行情: "
-            f"4H宽度比={state_4h.get('boll_band_width_ratio', float('nan')):.4f}, 阈值={state_4h.get('oscillation_threshold')}; "
-            f"1H宽度比={state_1h.get('boll_band_width_ratio', float('nan')):.4f}, 阈值={state_1h.get('oscillation_threshold')}"
+            f"4H宽度比={state_4h.get('boll_band_width_ratio')}, 阈值={state_4h.get('oscillation_threshold')}; "
+            f"1H宽度比={state_1h.get('boll_band_width_ratio')}, 阈值={state_1h.get('oscillation_threshold')}"
         )
         trade_state['last_processed_bar_15m'] = signal_bar_15m
-        return  # 如果是震荡行情，直接返回不开仓
+        return
+
     if signal_bar_15m == trade_state['last_entry_bar_15m'] or signal_bar_15m == trade_state['last_exit_bar_15m']:
         logging.info(f"跳过重复15M信号K线: {signal_bar_15m}")
         trade_state['last_processed_bar_15m'] = signal_bar_15m
         return
-    upper_shadow_filter_long = state_4h.get('upper_shadow_filter_long') or state_1h.get('upper_shadow_filter_long')  # 4H 或 1H 任一出现压制型长上影线，就过滤趋势做多
-    lower_shadow_filter_short = state_4h.get('lower_shadow_filter_short') or state_1h.get('lower_shadow_filter_short')  # 4H 或 1H 任一出现支撑型长下影线，就过滤趋势做空
-    reversal_long_tf, reversal_long_state = pick_state_signal(state_4h, state_1h, 'lower_shadow_reversal_long')  # 查找是否存在“长下影 + 阳线确认”的开多反转信号
-    reversal_short_tf, reversal_short_state = pick_state_signal(state_4h, state_1h, 'upper_shadow_reversal_short')  # 查找是否存在“长上影 + 阴线确认”的开空反转信号
-    reversal_conflict = reversal_long_state is not None and reversal_short_state is not None  # 如果同一轮里多空反转都出现，就视为信号冲突
 
     # --- 做多入场逻辑 ---
     long_cond_4h = state_4h.get('long_trend')  # 判断4H级别是否确认处于多头趋势
     long_cond_1h = state_1h.get('long_trend') or state_1h.get('pullback_long')  # 判断1H级别是否处于多头趋势或回调多头结构
     long_cond_15m = state_15m.get('long_trend')  # 判断15M级别是否确认处于多头趋势（入场点确认）
-    trend_long_ready = long_cond_4h and long_cond_1h and long_cond_15m and not upper_shadow_filter_long  # 原趋势做多成立，但会被长上影过滤器拦下来
+    trend_long_ready = long_cond_4h and long_cond_1h and long_cond_15m
 
     # --- 做空入场逻辑 ---
     short_cond_4h = state_4h.get('short_trend')  # 判断4H级别是否确认处于空头趋势
     short_cond_1h = state_1h.get('short_trend') or state_1h.get('pullback_short')  # 判断1H级别是否处于空头趋势或回调空头结构
     short_cond_15m = state_15m.get('short_trend')  # 判断15M级别是否确认处于空头趋势（入场点确认）
-    trend_short_ready = short_cond_4h and short_cond_1h and short_cond_15m and not lower_shadow_filter_short  # 原趋势做空成立，但会被长下影过滤器拦下来
-
-    if reversal_conflict:
-        logging.info("检测到多空影线确认反转同时出现，跳过影线反转开仓，继续等待趋势分支")
-
-    if not reversal_conflict and reversal_long_state is not None and (long_cond_15m or reversal_long_state.get('details', {}).get('shadow', {}).get('lower_shadow_body_high_hit')) and not upper_shadow_filter_long:
-        try:
-            shadow_reference_key = get_shadow_reference_key('long', reversal_long_tf, reversal_long_state)
-            if is_shadow_reference_used(shadow_reference_key):
-                logging.info(f"跳过已使用过的影线反转多参考K: {shadow_reference_key}")
-                trade_state['last_processed_bar_15m'] = signal_bar_15m
-                return
-            # 真正下单时，还是以当前最新成交价作为入场价
-            curr_price = get_latest_price()
-            # 影线反转单优先使用影线结构给出的止损位
-            sl_price = reversal_long_state.get('shadow_long_stop_ref')
-            # 如果影线止损位拿不到，就退回 ATR 止损作为兜底
-            if sl_price is None or pd.isna(sl_price):
-                sl_price = curr_price - atr_4h
-            # entry_reason 会被写进状态、通知和 CSV，后面一看就知道是影线反转多单
-            mark_shadow_reference_used(shadow_reference_key)
-            if open_order('long', curr_price, sl_price, state_4h, state_1h, state_15m, signal_bar_15m, entry_reason='shadow_reversal_long', entry_trigger_tf=reversal_long_tf):
-                logging.info(f"{reversal_long_tf} 长下影确认反转多单开仓成功")
-            else:
-                logging.warning(f"{reversal_long_tf} 长下影确认反转多单开仓未成功")
-        except Exception:
-            logging.error(f"影线反转多单开仓失败:\n{traceback.format_exc()}")
-        trade_state['last_processed_bar_15m'] = signal_bar_15m
-        return
-
-    if not reversal_conflict and reversal_short_state is not None and (short_cond_15m or reversal_short_state.get('details', {}).get('shadow', {}).get('upper_shadow_body_low_hit')) and not lower_shadow_filter_short:
-        try:
-            shadow_reference_key = get_shadow_reference_key('short', reversal_short_tf, reversal_short_state)
-            if is_shadow_reference_used(shadow_reference_key):
-                logging.info(f"跳过已使用过的影线反转空参考K: {shadow_reference_key}")
-                trade_state['last_processed_bar_15m'] = signal_bar_15m
-                return
-            # 真正下单时，还是以当前最新成交价作为入场价
-            curr_price = get_latest_price()
-            # 影线反转单优先使用影线结构给出的止损位
-            sl_price = reversal_short_state.get('shadow_short_stop_ref')
-            # 如果影线止损位拿不到，就退回 ATR 止损作为兜底
-            if sl_price is None or pd.isna(sl_price):
-                sl_price = curr_price + atr_4h
-            # entry_reason 会被写进状态、通知和 CSV，后面一看就知道是影线反转空单
-            mark_shadow_reference_used(shadow_reference_key)
-            if open_order('short', curr_price, sl_price, state_4h, state_1h, state_15m, signal_bar_15m, entry_reason='shadow_reversal_short', entry_trigger_tf=reversal_short_tf):
-                logging.info(f"{reversal_short_tf} 长上影确认反转空单开仓成功")
-            else:
-                logging.warning(f"{reversal_short_tf} 长上影确认反转空单开仓未成功")
-        except Exception:
-            logging.error(f"影线反转空单开仓失败:\n{traceback.format_exc()}")
-        trade_state['last_processed_bar_15m'] = signal_bar_15m
-        return
+    trend_short_ready = short_cond_4h and short_cond_1h and short_cond_15m
 
     if trend_long_ready and trend_short_ready:
         logging.info("趋势多空条件同时成立，当前信号冲突，跳过本轮开仓")
