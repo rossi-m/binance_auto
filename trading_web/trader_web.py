@@ -29,7 +29,7 @@ PROJECT_ROOT = os.path.dirname(WEB_DIR)
 
 LOCAL_ENV_PATH = os.path.join(PROJECT_ROOT, '.env.local')
 LOG_FILE = os.path.join(WEB_DIR, 'strategy_output.log')
-STRATEGY_SCRIPT = os.path.join(PROJECT_ROOT, 'bian_auto.py')
+STRATEGY_SCRIPT = os.path.join(PROJECT_ROOT, 'bian_new.py')
 STATS_DB_PATH = os.path.join(PROJECT_ROOT, 'trade_stats.db')
 
 # ---------- 环境变量加载 ----------
