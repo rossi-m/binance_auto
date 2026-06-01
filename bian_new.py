@@ -136,7 +136,7 @@ EMA_TREND_LENGTH = 20
 # 判断 EMA 斜率时向前比较的K线数量，用来确认均线是否持续上/下行。
 EMA_SLOPE_LOOKBACK = 3
 # 判断价格是否刚穿越 EMA 时回看的K线数量。
-EMA_CROSS_LOOKBACK = 8
+EMA_CROSS_LOOKBACK = 4
 # 判断价格站上/跌破 EMA 是否持续有效时要求连续观察的K线数量。
 EMA_PERSISTENCE_BARS = 20
 # 强K实体至少要达到 ATR 的比例，过滤实体太小的K线。
@@ -2143,25 +2143,19 @@ def find_previous_opposite_strong(df_closed, side, lookback=OPPOSITE_STRONG_LOOK
 
 
 def count_ema_crosses(df_closed):
-    recent = df_closed.tail(EMA_CROSS_LOOKBACK + 1)
+    recent = df_closed.tail(EMA_CROSS_LOOKBACK)
     up_cross = 0
     down_cross = 0
-    prev_side = None
     for _, row in recent.iterrows():
-        if not is_number(row.get('ema20')) or not is_number(row.get('close')):
+        open_val = price_to_float(row.get('open'))
+        close_val = price_to_float(row.get('close'))
+        ema20_val = price_to_float(row.get('ema20'))
+        if not is_number(open_val) or not is_number(close_val) or not is_number(ema20_val):
             continue
-        if row['close'] > row['ema20']:
-            side = 1
-        elif row['close'] < row['ema20']:
-            side = -1
-        else:
-            side = 0
-        if prev_side == -1 and side == 1:
+        if open_val < ema20_val and close_val > ema20_val:
             up_cross += 1
-        elif prev_side == 1 and side == -1:
+        elif open_val > ema20_val and close_val < ema20_val:
             down_cross += 1
-        if side != 0:
-            prev_side = side
     return up_cross, down_cross
 
 
