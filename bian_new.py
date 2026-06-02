@@ -2050,12 +2050,28 @@ def latest_large_strong(df_closed):
     return None
 
 
+def standalone_strong_candle_kind(row):
+    """单根已经是强K或大强K时，不允许再参与合成强K。"""
+    open_price, high, low, close, _, _ = candle_parts(row)
+    atr = price_to_float(row.get('atr'))
+    for direction in ('long', 'short'):
+        if is_large_strong_candle(open_price, high, low, close, atr, direction):
+            return {'kind': 'large', 'direction': direction}
+        check = strong_candle_check(open_price, high, low, close, atr, direction)
+        if check.get('ok'):
+            return {'kind': 'single', 'direction': direction}
+    return None
+
+
 def composite_strong_candle(df_closed, end_idx, bars_count, direction):
     if end_idx - bars_count + 1 < 0:
         return None
     segment = df_closed.iloc[end_idx - bars_count + 1:end_idx + 1]
     if len(segment) != bars_count:
         return None
+    for _, row in segment.iterrows():
+        if standalone_strong_candle_kind(row):
+            return None
 
     if direction == 'long':
         if not all(segment['close'] > segment['open']):
@@ -2118,10 +2134,12 @@ def latest_effective_strong(df_closed, direction):
     return None
 
 
-def historical_effective_strong(df_closed, end_idx, direction):
+def historical_effective_strong(df_closed, end_idx, direction, include_synthetic=True):
     single = simple_strong_candle(df_closed.iloc[end_idx], direction)
     if single:
         return single
+    if not include_synthetic:
+        return None
     for bars_count in range(SYNTHETIC_STRONG_MIN_BARS, SYNTHETIC_STRONG_MAX_BARS + 1):
         synthetic = composite_strong_candle(df_closed, end_idx, bars_count, direction)
         if synthetic:
@@ -2222,9 +2240,9 @@ def detect_strong_chop(df_closed):
         long_hits = 0
         short_hits = 0
         for idx in range(start_idx, end_idx):
-            if historical_effective_strong(df_closed, idx, 'long'):
+            if historical_effective_strong(df_closed, idx, 'long', include_synthetic=False):
                 long_hits += 1
-            if historical_effective_strong(df_closed, idx, 'short'):
+            if historical_effective_strong(df_closed, idx, 'short', include_synthetic=False):
                 short_hits += 1
         return long_hits, short_hits
 
