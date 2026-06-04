@@ -2035,18 +2035,36 @@ def latest_large_strong(df_closed):
     if df_closed is None or len(df_closed) == 0:
         return None
     row = df_closed.iloc[-1]
+    return large_strong_candle_from_row(row)
+
+
+def large_strong_candle_from_row(row):
     open_price, high, low, close, _, _ = candle_parts(row)
     atr = price_to_float(row.get('atr'))
     for direction in ('long', 'short'):
         if is_large_strong_candle(open_price, high, low, close, atr, direction):
             return {
+                'kind': 'large',
                 'direction': direction,
+                'open': open_price,
                 'high': high,
                 'low': low,
                 'close': close,
                 'atr': atr,
                 'bar_time': format_bar_time(row.get('timestamp'))
             }
+    return None
+
+
+def find_previous_large_strong(df_closed, direction, lookback=OPPOSITE_STRONG_LOOKBACK):
+    if df_closed is None or len(df_closed) < 2:
+        return None
+    end_idx = len(df_closed) - 2
+    start_idx = max(0, end_idx - lookback + 1)
+    for idx in range(end_idx, start_idx - 1, -1):
+        large = large_strong_candle_from_row(df_closed.iloc[idx])
+        if large and large.get('direction') == direction:
+            return large
     return None
 
 
@@ -2177,31 +2195,50 @@ def count_ema_crosses(df_closed):
     return up_cross, down_cross
 
 
-def recent_persistent_trend_break(df_closed, persistent_direction):
-    if df_closed is None or len(df_closed) < 4:
+def persistent_direction_before_index(df_closed, end_idx):
+    if df_closed is None or end_idx < EMA_PERSISTENCE_BARS:
+        return None
+    prior = df_closed.iloc[end_idx - EMA_PERSISTENCE_BARS:end_idx]
+    if len(prior) < EMA_PERSISTENCE_BARS or prior['ema20'].isna().any():
+        return None
+    if bool((prior['low'] >= prior['ema20']).all()):
+        return 'long'
+    if bool((prior['high'] <= prior['ema20']).all()):
+        return 'short'
+    return None
+
+
+def is_ema_persistence_first_break(row, persistent_direction):
+    if row is None or not is_number(row.get('ema20')):
         return False
-    recent = df_closed.tail(3)
+    if persistent_direction == 'long':
+        return is_number(row.get('low')) and row['low'] < row['ema20']
     if persistent_direction == 'short':
-        bullish = recent[recent['close'] > recent['open']]
+        return is_number(row.get('high')) and row['high'] > row['ema20']
+    return False
+
+
+def recent_persistent_trend_break(df_closed, persistent_direction, break_idx):
+    if df_closed is None or break_idx is None or break_idx + 3 >= len(df_closed):
+        return False
+    follow = df_closed.iloc[break_idx + 1:break_idx + 4]
+    if len(follow) < 3:
+        return False
+    if persistent_direction == 'short':
+        bullish = follow[follow['close'] > follow['open']]
         if len(bullish) >= 2 and bool((bullish['close'] > bullish['ema20']).any()):
             return True
-        for offset in range(3, 1, -1):
-            idx = len(df_closed) - offset
-            if idx < 0 or idx + 2 >= len(df_closed):
-                continue
+        for idx in range(break_idx + 1, break_idx + 2):
             strong = historical_effective_strong(df_closed, idx, 'long')
             if strong and strong['close'] > price_to_float(df_closed.iloc[idx]['ema20']):
                 follows = df_closed.iloc[idx + 1:idx + 3]
                 if len(follows) == 2 and bool((follows['close'] > follows['ema20']).all()):
                     return True
     else:
-        bearish = recent[recent['close'] < recent['open']]
+        bearish = follow[follow['close'] < follow['open']]
         if len(bearish) >= 2 and bool((bearish['close'] < bearish['ema20']).any()):
             return True
-        for offset in range(3, 1, -1):
-            idx = len(df_closed) - offset
-            if idx < 0 or idx + 2 >= len(df_closed):
-                continue
+        for idx in range(break_idx + 1, break_idx + 2):
             strong = historical_effective_strong(df_closed, idx, 'short')
             if strong and strong['close'] < price_to_float(df_closed.iloc[idx]['ema20']):
                 follows = df_closed.iloc[idx + 1:idx + 3]
@@ -2211,25 +2248,38 @@ def recent_persistent_trend_break(df_closed, persistent_direction):
 
 
 def recent_ema_persistence(df_closed):
-    if df_closed is None or len(df_closed) < EMA_PERSISTENCE_BARS + 3:
-        return {'direction': None, 'first_break': False, 'broken': False}
+    if df_closed is None or len(df_closed) < EMA_PERSISTENCE_BARS + 1:
+        return {'direction': None, 'first_break': False, 'broken': False, 'break_pending': False}
 
-    prior = df_closed.iloc[-EMA_PERSISTENCE_BARS - 1:-1]
+    last_idx = len(df_closed) - 1
     last = df_closed.iloc[-1]
-    if len(prior) < EMA_PERSISTENCE_BARS or prior['ema20'].isna().any():
-        return {'direction': None, 'first_break': False, 'broken': False}
+    direction = persistent_direction_before_index(df_closed, last_idx)
+    if direction:
+        first_break = is_ema_persistence_first_break(last, direction)
+        return {
+            'direction': direction,
+            'first_break': bool(first_break),
+            'broken': False,
+            'break_pending': bool(first_break)
+        }
 
-    above_20 = bool((prior['low'] >= prior['ema20']).all())
-    below_20 = bool((prior['high'] <= prior['ema20']).all())
-    if above_20:
-        first_break = is_number(last.get('ema20')) and last['low'] < last['ema20']
-        trend_broken = recent_persistent_trend_break(df_closed, 'long')
-        return {'direction': 'long', 'first_break': bool(first_break), 'broken': trend_broken}
-    if below_20:
-        first_break = is_number(last.get('ema20')) and last['high'] > last['ema20']
-        trend_broken = recent_persistent_trend_break(df_closed, 'short')
-        return {'direction': 'short', 'first_break': bool(first_break), 'broken': trend_broken}
-    return {'direction': None, 'first_break': False, 'broken': False}
+    for break_idx in range(max(EMA_PERSISTENCE_BARS, last_idx - 3), last_idx):
+        direction = persistent_direction_before_index(df_closed, break_idx)
+        if not direction or not is_ema_persistence_first_break(df_closed.iloc[break_idx], direction):
+            continue
+        bars_after_break = last_idx - break_idx
+        if 1 <= bars_after_break <= 3:
+            trend_broken = (
+                bars_after_break == 3
+                and recent_persistent_trend_break(df_closed, direction, break_idx)
+            )
+            return {
+                'direction': direction,
+                'first_break': False,
+                'broken': trend_broken,
+                'break_pending': bars_after_break < 3
+            }
+    return {'direction': None, 'first_break': False, 'broken': False, 'break_pending': False}
 
 
 def detect_strong_chop(df_closed):
@@ -2350,10 +2400,6 @@ def evaluate_adx_ema_context(df, timeframe, now_dt=None):
         'extreme_adx': extreme
     }
 
-    if chop.get('is_chop'):
-        base['status'] = 'strong_chop'
-        base['summary'] = f"{timeframe}: 强K交叉震荡 zone={chop.get('zone_low'):.4f}-{chop.get('zone_high'):.4f}"
-        return base
     if adx <= 20:
         base['status'] = 'range'
         base['summary'] = f"{timeframe}: ADX={adx:.2f} 震荡，禁止开仓"
@@ -2386,7 +2432,12 @@ def evaluate_adx_ema_context(df, timeframe, now_dt=None):
         else:
             status = 'short_flat_adx'
 
-    if direction is None and persistence.get('direction') and not persistence.get('broken'):
+    if (
+        direction is None
+        and persistence.get('direction')
+        and not persistence.get('broken')
+        and not persistence.get('break_pending')
+    ):
         direction = persistence['direction']
         status = f"ema20_{direction}_persistence"
         if direction == 'long':
@@ -2453,6 +2504,34 @@ def detect_entry_trigger(df, timeframe, side, now_dt=None):
             'blocked': True,
             'reason': f"最新{timeframe}为大强{large['direction']}线，过滤不开仓",
             'large': large
+        }
+
+    previous_large = find_previous_large_strong(df_closed, side)
+    if previous_large:
+        close = price_to_float(last.get('close'))
+        if side == 'long':
+            level = previous_large['high']
+            if close <= level:
+                return None
+            entry_level = level + tick
+            stop = previous_large['low'] - tick
+            reason = f"{timeframe}收盘突破前大强阳线高点"
+        else:
+            level = previous_large['low']
+            if close >= level:
+                return None
+            entry_level = level - tick
+            stop = previous_large['high'] + tick
+            reason = f"{timeframe}收盘跌破前大强阴线低点"
+        return {
+            'blocked': False,
+            'type': 'large_strong_break',
+            'side': side,
+            'timeframe': timeframe,
+            'entry_level': precision_price(entry_level),
+            'stop': precision_price(stop),
+            'trigger': previous_large,
+            'reason': reason
         }
 
     strong = latest_effective_strong(df_closed, side)
@@ -2843,12 +2922,6 @@ def build_trend_trigger_candidates(context):
             if not allowed:
                 logging.info(f"跳过{strategy_tf}->{trigger_tf} {side}: {deny_reason}")
                 continue
-            if strategy_tf == '15m':
-                trigger_chop = detect_strong_chop(get_closed_df(trigger_df, trigger_tf, context['now_dt']))
-                if trigger_chop.get('is_chop'):
-                    logging.info(f"跳过15m策略{side}: 5m强K交叉震荡未突破")
-                    continue
-
             trigger = detect_entry_trigger(trigger_df, trigger_tf, side, now_dt=context['now_dt'])
             if not trigger:
                 continue
@@ -2856,7 +2929,7 @@ def build_trend_trigger_candidates(context):
                 logging.info(trigger.get('reason'))
                 continue
 
-            entry_ref = price_to_float(get_closed_df(trigger_df, trigger_tf, context['now_dt']).iloc[-1]['close'])
+            entry_ref = price_to_float(trigger.get('entry_level'))
             stop = price_to_float(trigger['stop'])
             if background_state.get('details', {}).get('extreme_adx'):
                 bg_closed = get_closed_df(context['dfs'][background_tf], background_tf, context['now_dt'])
