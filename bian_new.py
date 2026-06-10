@@ -2221,29 +2221,33 @@ def is_ema_persistence_first_break(row, persistent_direction):
 def recent_persistent_trend_break(df_closed, persistent_direction, break_idx):
     if df_closed is None or break_idx is None or break_idx + 3 >= len(df_closed):
         return False
+    #获取后面连续3根k线数据
     follow = df_closed.iloc[break_idx + 1:break_idx + 4]
     if len(follow) < 3:
         return False
     if persistent_direction == 'short':
-        bullish = follow[follow['close'] > follow['open']]
-        if len(bullish) >= 2 and bool((bullish['close'] > bullish['ema20']).any()):
+        #后续3根中至少2根收盘价高于EMA20，不论K线阴阳
+        bars_above = (follow['close'] > follow['ema20']).sum()
+        if bars_above >= 2:
             return True
+        #只检查突破之后的第一根k线，判断该k线是否是有效的强多头信号或者合成强阳信号
         for idx in range(break_idx + 1, break_idx + 2):
             strong = historical_effective_strong(df_closed, idx, 'long')
+            #并且这跟强阳线的收盘价是否高于ema20
             if strong and strong['close'] > price_to_float(df_closed.iloc[idx]['ema20']):
-                follows = df_closed.iloc[idx + 1:idx + 3]
-                if len(follows) == 2 and bool((follows['close'] > follows['ema20']).all()):
-                    return True
+                #判断这根强阳线之后的2根k线是否都收盘价高于ema20
+                
+                return True
     else:
-        bearish = follow[follow['close'] < follow['open']]
-        if len(bearish) >= 2 and bool((bearish['close'] < bearish['ema20']).any()):
+        #后续3根中至少2根收盘价低于EMA20，不论K线阴阳
+        bars_below = (follow['close'] < follow['ema20']).sum()
+        if bars_below >= 2:
             return True
         for idx in range(break_idx + 1, break_idx + 2):
             strong = historical_effective_strong(df_closed, idx, 'short')
             if strong and strong['close'] < price_to_float(df_closed.iloc[idx]['ema20']):
-                follows = df_closed.iloc[idx + 1:idx + 3]
-                if len(follows) == 2 and bool((follows['close'] < follows['ema20']).all()):
-                    return True
+               
+                return True
     return False
 
 
@@ -2253,8 +2257,10 @@ def recent_ema_persistence(df_closed):
 
     last_idx = len(df_closed) - 1
     last = df_closed.iloc[-1]
+    #判断是否有20根k线在ema20上/下面
     direction = persistent_direction_before_index(df_closed, last_idx)
     if direction:
+        #判断是否第一次跌破ema20
         first_break = is_ema_persistence_first_break(last, direction)
         return {
             'direction': direction,
@@ -2263,6 +2269,7 @@ def recent_ema_persistence(df_closed):
             'break_pending': bool(first_break)
         }
 
+    #用于检测"最近几根K线内是否刚刚发生了 EMA20 持续性趋势的首次突破"。
     for break_idx in range(max(EMA_PERSISTENCE_BARS, last_idx - 3), last_idx):
         direction = persistent_direction_before_index(df_closed, break_idx)
         if not direction or not is_ema_persistence_first_break(df_closed.iloc[break_idx], direction):
@@ -2271,6 +2278,7 @@ def recent_ema_persistence(df_closed):
         if 1 <= bars_after_break <= 3:
             trend_broken = (
                 bars_after_break == 3
+                #判断持续的ema20的趋势是否改变
                 and recent_persistent_trend_break(df_closed, direction, break_idx)
             )
             return {
@@ -2375,6 +2383,7 @@ def evaluate_adx_ema_context(df, timeframe, now_dt=None):
     minus_di = price_to_float(last.get('minus_di'))
     ema20 = price_to_float(last.get('ema20'))
     ema20_ref = price_to_float(ema_ref.get('ema20'))
+    #判断最近4根k线是否上下穿ema20
     up_cross, down_cross = count_ema_crosses(df_closed)
     ema_clean = up_cross <= 1 and down_cross <= 1
     ema_up = ema20 > ema20_ref
@@ -2382,6 +2391,7 @@ def evaluate_adx_ema_context(df, timeframe, now_dt=None):
     adx_rising = adx > prev_adx
     adx_falling = adx < prev_adx
     extreme = adx > ADX_EXTREME
+    #这个过滤掉了没有价
     chop = detect_strong_chop(df_closed)
     persistence = recent_ema_persistence(df_closed) if timeframe in ('15m', '1h', '4h') else {'direction': None}
 
