@@ -2230,24 +2230,11 @@ def recent_persistent_trend_break(df_closed, persistent_direction, break_idx):
         bars_above = (follow['close'] > follow['ema20']).sum()
         if bars_above >= 2:
             return True
-        #只检查突破之后的第一根k线，判断该k线是否是有效的强多头信号或者合成强阳信号
-        for idx in range(break_idx + 1, break_idx + 2):
-            strong = historical_effective_strong(df_closed, idx, 'long')
-            #并且这跟强阳线的收盘价是否高于ema20
-            if strong and strong['close'] > price_to_float(df_closed.iloc[idx]['ema20']):
-                #判断这根强阳线之后的2根k线是否都收盘价高于ema20
-                
-                return True
     else:
         #后续3根中至少2根收盘价低于EMA20，不论K线阴阳
         bars_below = (follow['close'] < follow['ema20']).sum()
         if bars_below >= 2:
             return True
-        for idx in range(break_idx + 1, break_idx + 2):
-            strong = historical_effective_strong(df_closed, idx, 'short')
-            if strong and strong['close'] < price_to_float(df_closed.iloc[idx]['ema20']):
-               
-                return True
     return False
 
 
@@ -2278,13 +2265,14 @@ def recent_ema_persistence(df_closed):
         if 1 <= bars_after_break <= 3:
             trend_broken = (
                 bars_after_break == 3
-                #判断持续的ema20的趋势是否改变
+                #判断持续的ema20的趋势是否被打破
                 and recent_persistent_trend_break(df_closed, direction, break_idx)
             )
             return {
                 'direction': direction,
                 'first_break': False,
                 'broken': trend_broken,
+                #break_pending 是一个"中间状态"——突破已出现，但 3 根 K 线的确认窗口还没过，系统暂时不下结论。
                 'break_pending': bars_after_break < 3
             }
     return {'direction': None, 'first_break': False, 'broken': False, 'break_pending': False}
@@ -2391,7 +2379,6 @@ def evaluate_adx_ema_context(df, timeframe, now_dt=None):
     adx_rising = adx > prev_adx
     adx_falling = adx < prev_adx
     extreme = adx > ADX_EXTREME
-    #这个过滤掉了没有价
     chop = detect_strong_chop(df_closed)
     persistence = recent_ema_persistence(df_closed) if timeframe in ('15m', '1h', '4h') else {'direction': None}
 
@@ -2508,6 +2495,7 @@ def detect_entry_trigger(df, timeframe, side, now_dt=None):
 
     last = df_closed.iloc[-1]
     tick = get_price_tick(last.get('close'))
+    # 最新一根K线是否为大强K线
     large = latest_large_strong(df_closed)
     if large:
         return {
@@ -2515,7 +2503,7 @@ def detect_entry_trigger(df, timeframe, side, now_dt=None):
             'reason': f"最新{timeframe}为大强{large['direction']}线，过滤不开仓",
             'large': large
         }
-
+    # 查找最近一根大强k线
     previous_large = find_previous_large_strong(df_closed, side)
     if previous_large:
         close = price_to_float(last.get('close'))
@@ -2543,7 +2531,7 @@ def detect_entry_trigger(df, timeframe, side, now_dt=None):
             'trigger': previous_large,
             'reason': reason
         }
-
+    # 查找最近一根有效强K线
     strong = latest_effective_strong(df_closed, side)
     if strong:
         if side == 'long':
@@ -2562,7 +2550,7 @@ def detect_entry_trigger(df, timeframe, side, now_dt=None):
             'trigger': strong,
             'reason': f"{timeframe}最新{strong['kind']}强{'阳' if side == 'long' else '阴'}线"
         }
-
+    # 查找最近一根相反方向的有效强K线
     previous = find_previous_opposite_strong(df_closed, side)
     if previous is None:
         return None
@@ -2605,6 +2593,7 @@ def add_or_merge_zone(zones, zone_type, price, atr, source_idx):
     buffer = SUP_RES_ZONE_BUFFER_ATR * atr
     matched = None
     for zone in [z for z in zones if z['type'] == zone_type]:
+        #判断最地点价格是否在merge_distance范围内
         if zone_distance(zone, price) <= merge_distance:
             matched = zone
             break
@@ -2651,6 +2640,7 @@ def rebuild_zone_touches(zones, df_closed):
         zone['touches'] = 0
         zone['valid'] = True
         start_idx = max(0, int(zone.get('created_idx', 0)))
+        #从start_idx开始，确认缔造者的贡献
         for idx in range(start_idx, len(df_closed)):
             row = df_closed.iloc[idx]
             close = price_to_float(row['close'])
@@ -2718,12 +2708,19 @@ def build_support_resistance_zones(df_4h, now_dt=None):
         atr = price_to_float(df_closed.iloc[idx].get('atr'))
         if atr <= 0:
             continue
+        #判断该点是不是左/右5根k线的低点
         if is_swing_low(df_closed, idx, SUP_RES_SWING_WINDOW):
+            #如果是，则添加或合并支撑区
             add_or_merge_zone(zones, 'support', price_to_float(df_closed.iloc[idx]['low']), atr, idx)
+        #判断该点是不是左/右5根k线的高点
         if is_swing_high(df_closed, idx, SUP_RES_SWING_WINDOW):
+            #如果是，则添加或合并阻力区
             add_or_merge_zone(zones, 'resistance', price_to_float(df_closed.iloc[idx]['high']), atr, idx)
 
+    #提取有效的支撑区和阻力区
     active = rebuild_zone_touches(zones, df_closed)
+    
+    #找出最近被打破的支撑区和阻力区
     broken = recently_broken_zones(zones, df_closed)
     support = sorted([z for z in active if z['type'] == 'support'], key=lambda z: z['upper'], reverse=True)
     resistance = sorted([z for z in active if z['type'] == 'resistance'], key=lambda z: z['lower'])
@@ -2777,8 +2774,10 @@ def find_1h_sr_confirmation(df_1h, zone, side, now_dt=None):
     df_closed = get_closed_df(df_1h, '1h', now_dt=now_dt)
     if len(df_closed) < 3:
         return None
+    #最近18根K线
     recent = df_closed.tail(SR_CONFIRM_LOOKBACK_1H)
     touched = False
+    #最近18k线中有没有在支撑区域内，然后需要是阳/阴线，并且需要大于支撑区域的上线，同时需要满足wick长度条件
     for _, row in recent.iterrows():
         open_price, high, low, close, _, _ = candle_parts(row)
         body = abs(close - open_price)
@@ -2827,7 +2826,9 @@ def build_sr_rebound_candidates(context, side):
     zone_list = zones.get('support' if side == 'long' else 'resistance', [])
     candidates = []
     for zone in zone_list[:5]:
+        #查找1小时中有没有站稳支撑/阻力位置，并且k线是否突破了支撑和阻力位置，返回该k线
         confirm = find_1h_sr_confirmation(context['dfs']['1h'], zone, side, now_dt=context['now_dt'])
+        # 检查后续的k线是否突破这个阻挡/支撑区域
         if not sr_15m_entry_ready(context['dfs']['15m'], confirm, side, now_dt=context['now_dt']):
             continue
         entry_ref = price_to_float(get_closed_df(context['dfs']['15m'], '15m', context['now_dt']).iloc[-1]['close'])
@@ -2836,7 +2837,9 @@ def build_sr_rebound_candidates(context, side):
             stop = min(zone['lower'] - SUP_RES_STOP_BUFFER_ATR * atr_4h, confirm['low'] - tick)
         else:
             stop = max(zone['upper'] + SUP_RES_STOP_BUFFER_ATR * atr_4h, confirm['high'] + tick)
+        #获取止盈价格，以及对应的zone
         target, target_zone = target_from_zones_or_rr(zones, side, entry_ref, stop)
+        #判断止盈价格是否符合预期利润条件
         ok, reason = expected_profit_ok(side, entry_ref, stop, target, atr_4h)
         if not ok:
             logging.info(f"跳过SR反弹{side}: {reason}")
@@ -2870,6 +2873,7 @@ def build_sr_breakout_candidates(context, side):
     candidates = []
     if side == 'long':
         for zone in zones.get('broken_resistance', [])[:5]:
+            #4小时K线中，第一根阻力突破后面连续2根收盘价都站稳
             if recent3.iloc[0]['close'] > zone['upper'] and bool((recent3.iloc[1:]['close'] >= zone['upper']).all()):
                 entry_ref = price_to_float(recent3.iloc[-1]['close'])
                 stop = zone['upper'] - SUP_RES_STOP_BUFFER_ATR * atr_4h
@@ -2900,7 +2904,9 @@ def make_state_summary(context, timeframe, side, summary):
 
 
 def candidate_priority(candidate):
+    #4h>1h>15m
     tf_rank = {'4h': 0, '1h': 1, '15m': 2}
+    #sr_breakout>sr_rebound>trend_trigger:关键位置被突破的趋势 > 回调趋势 > 趋势触发
     module_rank = {'sr_breakout': 0, 'sr_rebound': 1, 'trend_trigger': 2}
     return (tf_rank.get(candidate.get('strategy_tf'), 9), module_rank.get(candidate.get('module'), 9))
 
@@ -2921,17 +2927,21 @@ def build_trend_trigger_candidates(context):
     candidates = []
     zones = context['zones']
     for strategy_tf in STRATEGY_TIMEFRAMES:
+        #当前时间
         local_state = context['trend_states'].get(strategy_tf)
+        #背景时间
         background_tf = STRATEGY_BACKGROUND_TF[strategy_tf]
         background_state = context['trend_states'].get(background_tf)
-        trigger_tf = STRATEGY_TRIGGER_TF[strategy_tf]
+        #触发时间
         trigger_df = context['dfs'][trigger_tf]
 
         for side in ('long', 'short'):
+            # 多周期校验背景趋势
             allowed, deny_reason = context_allows_side(local_state, background_state, side)
             if not allowed:
                 logging.info(f"跳过{strategy_tf}->{trigger_tf} {side}: {deny_reason}")
                 continue
+            # 在确认趋势条件满足后，用来寻找开仓信号
             trigger = detect_entry_trigger(trigger_df, trigger_tf, side, now_dt=context['now_dt'])
             if not trigger:
                 continue
@@ -2941,6 +2951,7 @@ def build_trend_trigger_candidates(context):
 
             entry_ref = price_to_float(trigger.get('entry_level'))
             stop = price_to_float(trigger['stop'])
+            #当adx为极端值时，缩紧止损
             if background_state.get('details', {}).get('extreme_adx'):
                 bg_closed = get_closed_df(context['dfs'][background_tf], background_tf, context['now_dt'])
                 atr = price_to_float(bg_closed.iloc[-1].get('atr')) if len(bg_closed) else 0.0
@@ -2949,8 +2960,12 @@ def build_trend_trigger_candidates(context):
                         stop = max(stop, entry_ref - EXTREME_ADX_STOP_BUFFER_ATR * atr)
                     else:
                         stop = min(stop, entry_ref + EXTREME_ADX_STOP_BUFFER_ATR * atr)
+
+
+            #查找止盈位置
             target, target_zone = target_from_zones_or_rr(zones, side, entry_ref, stop)
             trigger_atr = price_to_float(get_closed_df(trigger_df, trigger_tf, context['now_dt']).iloc[-1].get('atr'))
+            #判断止盈位置是否符合利润预期
             ok, reason = expected_profit_ok(side, entry_ref, stop, target, trigger_atr)
             if not ok:
                 logging.info(f"跳过趋势触发{strategy_tf}->{trigger_tf} {side}: {reason}")
@@ -2974,20 +2989,23 @@ def build_trend_trigger_candidates(context):
 
 
 def build_entry_candidates(context):
+    # 构建趋势触发候选信号
     candidates = build_trend_trigger_candidates(context)
     for side in ('long', 'short'):
         allowed, deny_reason = context_allows_side(context['trend_states'].get('15m'), context['trend_states'].get('1h'), side)
         if allowed:
+            # 构建SR反弹候选信号：k线到达支撑位置并且站稳，使用1小时和15m
             candidates.extend(build_sr_rebound_candidates(context, side))
         else:
             logging.info(f"跳过SR反弹{side}: {deny_reason}")
 
         allowed, deny_reason = context_allows_side(context['trend_states'].get('4h'), context['trend_states'].get('1d'), side)
         if allowed:
+            # 构建SR突破候选信号：k线突破了关键位置并且站稳，使用4小时
             candidates.extend(build_sr_breakout_candidates(context, side))
         else:
             logging.info(f"跳过SR突破{side}: {deny_reason}")
-
+    #根据权重进行排序
     candidates.sort(key=candidate_priority)
     return candidates
 
@@ -3315,6 +3333,7 @@ def run_strategy():
 
     is_new_signal_5m = bool(signal_guard_5m['is_new'])
     is_new_signal_15m = bool(signal_guard_15m.get('valid') and signal_guard_15m.get('is_new'))
+    #判断各个周期的趋势条件和4h的支撑和阻挡区间
     context = build_context(dfs, server_now_dt)
 
     if trade_state['has_position']:
@@ -3334,6 +3353,7 @@ def run_strategy():
         # 同一根 5M K 线只处理一次，避免轮询频率高导致重复开仓。
         return
 
+    # 判断是否在平仓冷却期
     if is_in_post_exit_cooldown(server_now_dt):
         logging.info("平仓后冷却中：至少等待4根5M K线后再开新仓")
         trade_state['last_processed_bar_5m'] = signal_bar_5m
@@ -3341,6 +3361,9 @@ def run_strategy():
             trade_state['last_processed_bar_15m'] = signal_bar_15m
         return
 
+    # 趋势开仓候选信号
+    # 回调候选信号
+    # 突破关键位置候选信号
     candidates = build_entry_candidates(context)
     if not candidates:
         trade_state['last_processed_bar_5m'] = signal_bar_5m
@@ -3348,6 +3371,7 @@ def run_strategy():
             trade_state['last_processed_bar_15m'] = signal_bar_15m
         return
 
+    #这里选择优先级最高的候选信号，如果优先级相同并且有多个多空冲突则跳过
     best_priority = candidate_priority(candidates[0])
     top_candidates = [candidate for candidate in candidates if candidate_priority(candidate) == best_priority]
     top_sides = {candidate['side'] for candidate in top_candidates}
@@ -3367,6 +3391,7 @@ def run_strategy():
         return
 
     curr_price = get_latest_price()
+    #判断候选信号的入场价格是否仍然有效
     entry_still_valid, entry_invalid_reason = candidate_entry_price_still_valid(candidate, curr_price)
     if not entry_still_valid:
         logging.info(entry_invalid_reason)
@@ -3374,7 +3399,7 @@ def run_strategy():
         if is_new_signal_15m:
             trade_state['last_processed_bar_15m'] = signal_bar_15m
         return
-
+    #获取候选信号的4h、1h、15m状态
     state_4h, state_1h, state_15m = states_for_candidate(context, candidate)
     entry_meta = {
         'strategy_tf': candidate.get('strategy_tf'),
