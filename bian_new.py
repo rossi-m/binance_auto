@@ -131,6 +131,49 @@ ADX_NO_TRADE_MAX = 25
 ADX_TREND_MIN = 25
 # ADX 高于该值视为极强趋势，止损缓冲会按极端趋势逻辑处理。
 ADX_EXTREME = 40
+# 按周期覆盖 ADX/DI 计算长度和趋势强度阈值。
+# 默认值保留原先全局 14/20/25/40 逻辑，未单独验证的周期统一走兜底配置。
+# 配置字段说明：
+# - length: ADX/DI 计算周期；越大越平滑，趋势确认越慢。
+# - range_max: ADX 小于等于该值时直接视为震荡，不按趋势开仓。
+# - no_trade_max: ADX 小于等于该值时视为过渡区，等待方向确认。
+# - trend_min: ADX 达到该值后，才允许进入 DI + EMA 方向判断。
+# - extreme: ADX 超过该值时视为极强趋势，用于后续止损缓冲逻辑。
+# 这些值来自 2026-06-20 的多周期联合过滤验证；1d 暂无充分回测，暂不单独配置。
+DEFAULT_ADX_CONFIG = {
+    'length': ADX_LENGTH,
+    'range_max': 20,
+    'no_trade_max': ADX_NO_TRADE_MAX,
+    'trend_min': ADX_TREND_MIN,
+    'extreme': ADX_EXTREME
+}
+ADX_BY_TIMEFRAME = {
+    # 15m 是触发周期，保持 ADX14，避免过度平滑导致入场太慢。
+    # trend_min 先用 25；后续完整交易回测里再比较 25/28。
+    '15m': {
+        'length': 14,
+        'range_max': 20,
+        'no_trade_max': 25,
+        'trend_min': 25,
+        'extreme': 45
+    },
+    # 1h 是核心背景周期，联合过滤验证支持用 ADX21 提高背景质量。
+    '1h': {
+        'length': 21,
+        'range_max': 20,
+        'no_trade_max': 35,
+        'trend_min': 35,
+        'extreme': 45
+    },
+    # 4h 作为宽背景过滤；联合验证里 25 比 35 更适合保留有效趋势段。
+    '4h': {
+        'length': 14,
+        'range_max': 20,
+        'no_trade_max': 25,
+        'trend_min': 25,
+        'extreme': 45
+    }
+}
 # 背景趋势使用的 EMA 周期，当前是 EMA20。
 EMA_TREND_LENGTH = 20
 # 判断 EMA 斜率时向前比较的K线数量，用来确认均线是否持续上/下行。
@@ -173,8 +216,12 @@ SUP_RES_SWING_WINDOW = 5
 SUP_RES_MERGE_ATR = 0.5
 # 支撑/阻力区域上下边界额外扩展的 ATR 倍数。
 SUP_RES_ZONE_BUFFER_ATR = 0.1
+# 支撑/阻力区域最大宽度，超过该 ATR 倍数后不再继续扩大区域边界。
+SUP_RES_MAX_ZONE_WIDTH_ATR = 1.0
 # 一个支撑/阻力区至少被触碰多少次才算有效区域。
 SUP_RES_VALID_TOUCHES = 2
+# 最近多少根4H内被突破/跌破的区域，会进入 broken_support/broken_resistance。
+SUP_RES_RECENT_BREAK_LOOKBACK = 6
 # 根据支撑/阻力设置止损时，止损放在区域外侧的 ATR 缓冲。
 SUP_RES_STOP_BUFFER_ATR = 0.2
 # 当前价格距离支撑/阻力小于该 ATR 倍数时，认为已经靠近关键区域。
@@ -255,6 +302,13 @@ runtime_state = {
 # ==========================================
 # 2. 功能模块
 # ==========================================
+
+def get_adx_config(timeframe):
+    """返回某个周期的 ADX 配置；未配置字段自动使用默认兜底。"""
+    config = dict(DEFAULT_ADX_CONFIG)
+    config.update(ADX_BY_TIMEFRAME.get(timeframe, {}))
+    return config
+
 
 def send_msg(subject, content):
     """发送邮件通知"""
@@ -449,14 +503,18 @@ def fetch_df(symbol, timeframe, limit=100):
 
         df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
 
-        # ADX / DI 14，用于新版背景趋势判断。
-        adx = ta.adx(df['high'], df['low'], df['close'], length=ADX_LENGTH)
+        adx_config = get_adx_config(timeframe)
+        adx_length = int(adx_config.get('length', ADX_LENGTH))
+        # ADX / DI 用于新版背景趋势判断；不同 timeframe 可以使用不同 length。
+        # 下游策略统一读取 adx/plus_di/minus_di，所以这里把 pandas_ta 的
+        # ADX_14、ADX_21 等实际列名统一重命名成固定字段。
+        adx = ta.adx(df['high'], df['low'], df['close'], length=adx_length)
         if adx is not None:
             df = pd.concat([df, adx], axis=1)
             df.rename(columns={
-                f'ADX_{ADX_LENGTH}': 'adx',
-                f'DMP_{ADX_LENGTH}': 'plus_di',
-                f'DMN_{ADX_LENGTH}': 'minus_di'
+                f'ADX_{adx_length}': 'adx',
+                f'DMP_{adx_length}': 'plus_di',
+                f'DMN_{adx_length}': 'minus_di'
             }, inplace=True)
         elapsed = time.monotonic() - start_ts
         if elapsed >= FETCH_DF_SLOW_LOG_SECONDS:
@@ -2278,66 +2336,15 @@ def recent_ema_persistence(df_closed):
     return {'direction': None, 'first_break': False, 'broken': False, 'break_pending': False}
 
 
-def detect_strong_chop(df_closed):
-    if df_closed is None or len(df_closed) < STRONG_CHOP_LOOKBACK_BARS:
-        return {'is_chop': False}
-
-    def count_strong_hits(start_idx, end_idx):
-        long_hits = 0
-        short_hits = 0
-        for idx in range(start_idx, end_idx):
-            if historical_effective_strong(df_closed, idx, 'long', include_synthetic=False):
-                long_hits += 1
-            if historical_effective_strong(df_closed, idx, 'short', include_synthetic=False):
-                short_hits += 1
-        return long_hits, short_hits
-
-    def make_result(is_chop, zone_window, long_hits, short_hits, resolved=False, breakout_side='none', zone_source='recent'):
-        return {
-            'is_chop': is_chop,
-            'resolved': resolved,
-            'zone_high': float(zone_window['high'].max()),
-            'zone_low': float(zone_window['low'].min()),
-            'long_hits': long_hits,
-            'short_hits': short_hits,
-            'breakout_side': breakout_side,
-            'zone_source': zone_source
-        }
-
-    last_idx = len(df_closed) - 1
-    last_close = float(df_closed.iloc[last_idx]['close'])
-
-    # 先用上一段强K震荡区间判断当前收盘是否突破，避免当前K的高低点把突破条件卡死。
-    if len(df_closed) > STRONG_CHOP_LOOKBACK_BARS:
-        previous_start_idx = len(df_closed) - STRONG_CHOP_LOOKBACK_BARS - 1
-        previous_end_idx = len(df_closed) - 1
-        previous = df_closed.iloc[previous_start_idx:previous_end_idx]
-        long_hits, short_hits = count_strong_hits(previous_start_idx, previous_end_idx)
-        if long_hits > 0 and short_hits > 0:
-            zone_high = float(previous['high'].max())
-            zone_low = float(previous['low'].min())
-            if last_close > zone_high:
-                return make_result(
-                    False, previous, long_hits, short_hits,
-                    resolved=True, breakout_side='up', zone_source='previous'
-                )
-            if last_close < zone_low:
-                return make_result(
-                    False, previous, long_hits, short_hits,
-                    resolved=True, breakout_side='down', zone_source='previous'
-                )
-            return make_result(True, previous, long_hits, short_hits, zone_source='previous')
-
-    recent = df_closed.tail(STRONG_CHOP_LOOKBACK_BARS)
-    start_idx = len(df_closed) - len(recent)
-    long_hits, short_hits = count_strong_hits(start_idx, len(df_closed))
-    if long_hits <= 0 or short_hits <= 0:
-        return {'is_chop': False}
-    return make_result(True, recent, long_hits, short_hits, zone_source='recent')
-
-
 def evaluate_adx_ema_context(df, timeframe, now_dt=None):
     df_closed = get_closed_df(df, timeframe, now_dt=now_dt)
+    # 每个周期用自己的 ADX length 和阈值，避免 15m/1h/4h 共用同一套强度判断。
+    adx_config = get_adx_config(timeframe)
+    adx_length = int(adx_config.get('length', ADX_LENGTH))
+    adx_range_max = price_to_float(adx_config.get('range_max', 20))
+    adx_no_trade_max = price_to_float(adx_config.get('no_trade_max', ADX_NO_TRADE_MAX))
+    adx_trend_min = price_to_float(adx_config.get('trend_min', ADX_TREND_MIN))
+    adx_extreme = price_to_float(adx_config.get('extreme', ADX_EXTREME))
     base = {
         'timeframe': timeframe,
         'signal_bar_time': '',
@@ -2355,7 +2362,7 @@ def evaluate_adx_ema_context(df, timeframe, now_dt=None):
         'summary': '',
         'details': {}
     }
-    min_len = max(ADX_LENGTH + 2, EMA_TREND_LENGTH + EMA_SLOPE_LOOKBACK + 2, EMA_CROSS_LOOKBACK + 2)
+    min_len = max(adx_length + 2, EMA_TREND_LENGTH + EMA_SLOPE_LOOKBACK + 2, EMA_CROSS_LOOKBACK + 2)
     if len(df_closed) < min_len:
         base['summary'] = f"{timeframe}: 数据不足"
         return base
@@ -2378,11 +2385,16 @@ def evaluate_adx_ema_context(df, timeframe, now_dt=None):
     ema_down = ema20 < ema20_ref
     adx_rising = adx > prev_adx
     adx_falling = adx < prev_adx
-    extreme = adx > ADX_EXTREME
-    chop = detect_strong_chop(df_closed)
+    extreme = adx > adx_extreme
     persistence = recent_ema_persistence(df_closed) if timeframe in ('15m', '1h', '4h') else {'direction': None}
 
+    # details 会写入日志/CSV/状态摘要，保留实际使用的 ADX 配置便于复盘。
     base['details'] = {
+        'adx_length': adx_length,
+        'adx_range_max': adx_range_max,
+        'adx_no_trade_max': adx_no_trade_max,
+        'adx_trend_min': adx_trend_min,
+        'adx_extreme': adx_extreme,
         'adx': adx,
         'prev_adx': prev_adx,
         'plus_di': plus_di,
@@ -2393,17 +2405,38 @@ def evaluate_adx_ema_context(df, timeframe, now_dt=None):
         'down_cross': down_cross,
         'ema_clean': ema_clean,
         'ema_persistence': persistence,
-        'strong_chop': chop,
         'extreme_adx': extreme
     }
 
-    if adx <= 20:
-        base['status'] = 'range'
-        base['summary'] = f"{timeframe}: ADX={adx:.2f} 震荡，禁止开仓"
+    if (
+        persistence.get('direction')
+        and not persistence.get('broken')
+        and not persistence.get('break_pending')
+    ):
+        direction = persistence['direction']
+        status = f"ema20_{direction}_persistence"
+        base['direction'] = direction
+        base['status'] = status
+        base['can_open_long'] = direction == 'long'
+        base['can_open_short'] = direction == 'short'
+        base['long_trend'] = direction == 'long'
+        base['short_trend'] = direction == 'short'
+        base['is_oscillation'] = False
+        base['summary'] = (
+            f"{timeframe}: status={status}, dir={direction}, EMA20连续背景优先, "
+            f"ADX{adx_length}={adx:.2f}, +DI={plus_di:.2f}, -DI={minus_di:.2f}, "
+            f"EMA clean={ema_clean}, cross={up_cross}/{down_cross}, extreme={extreme}"
+        )
         return base
-    if adx <= ADX_NO_TRADE_MAX:
+
+    # 先按 ADX 强度分层：震荡 -> 过渡 -> 趋势判断。
+    if adx <= adx_range_max:
+        base['status'] = 'range'
+        base['summary'] = f"{timeframe}: ADX{adx_length}={adx:.2f} 震荡，禁止开仓"
+        return base
+    if adx <= adx_no_trade_max or adx < adx_trend_min:
         base['status'] = 'transition'
-        base['summary'] = f"{timeframe}: ADX={adx:.2f} 过渡，等待方向确认"
+        base['summary'] = f"{timeframe}: ADX{adx_length}={adx:.2f} 过渡，等待方向确认"
         return base
 
     direction = None
@@ -2429,19 +2462,6 @@ def evaluate_adx_ema_context(df, timeframe, now_dt=None):
         else:
             status = 'short_flat_adx'
 
-    if (
-        direction is None
-        and persistence.get('direction')
-        and not persistence.get('broken')
-        and not persistence.get('break_pending')
-    ):
-        direction = persistence['direction']
-        status = f"ema20_{direction}_persistence"
-        if direction == 'long':
-            can_open_long = True
-        else:
-            can_open_short = True
-
     base['direction'] = direction
     base['status'] = status
     base['can_open_long'] = can_open_long
@@ -2452,7 +2472,7 @@ def evaluate_adx_ema_context(df, timeframe, now_dt=None):
     base['pullback_short'] = direction == 'short' and status in ('short_weakening', 'short_flat_adx')
     base['is_oscillation'] = direction is None
     base['summary'] = (
-        f"{timeframe}: status={status}, dir={direction}, ADX={adx:.2f}, "
+        f"{timeframe}: status={status}, dir={direction}, ADX{adx_length}={adx:.2f}, "
         f"+DI={plus_di:.2f}, -DI={minus_di:.2f}, EMA clean={ema_clean}, "
         f"cross={up_cross}/{down_cross}, extreme={extreme}"
     )
@@ -2469,7 +2489,7 @@ def context_allows_side(local_state, background_state, side):
         return False, f"{local_state.get('timeframe')} 本级别方向相反"
     if background_state.get('direction') == opposite:
         return False, f"{background_state.get('timeframe')} 背景趋势相反"
-    if background_state.get('status') in ('range', 'transition', 'strong_chop', 'unclear', 'no_data'):
+    if background_state.get('status') in ('range', 'transition', 'unclear', 'no_data'):
         return False, f"{background_state.get('timeframe')} 背景趋势不允许开仓: {background_state.get('status')}"
 
     local_open_key = 'can_open_long' if side == 'long' else 'can_open_short'
@@ -2490,7 +2510,8 @@ def context_allows_side(local_state, background_state, side):
 
 def detect_entry_trigger(df, timeframe, side, now_dt=None):
     df_closed = get_closed_df(df, timeframe, now_dt=now_dt)
-    if len(df_closed) < max(ADX_LENGTH + 3, SYNTHETIC_STRONG_MAX_BARS + 2):
+    adx_length = int(get_adx_config(timeframe).get('length', ADX_LENGTH))
+    if len(df_closed) < max(adx_length + 3, SYNTHETIC_STRONG_MAX_BARS + 2):
         return None
 
     last = df_closed.iloc[-1]
@@ -2591,6 +2612,7 @@ def zone_distance(zone, price):
 def add_or_merge_zone(zones, zone_type, price, atr, source_idx):
     merge_distance = SUP_RES_MERGE_ATR * atr
     buffer = SUP_RES_ZONE_BUFFER_ATR * atr
+    max_width = SUP_RES_MAX_ZONE_WIDTH_ATR * atr
     matched = None
     for zone in [z for z in zones if z['type'] == zone_type]:
         #判断最地点价格是否在merge_distance范围内
@@ -2598,10 +2620,16 @@ def add_or_merge_zone(zones, zone_type, price, atr, source_idx):
             matched = zone
             break
     if matched:
-        matched['lower'] = min(matched['lower'], price) - buffer
-        matched['upper'] = max(matched['upper'], price) + buffer
+        next_lower = min(matched['lower'], price) - buffer
+        next_upper = max(matched['upper'], price) + buffer
+        # 多次合并会让区域越来越宽；超过最大宽度时保留原边界，只记录新的来源。
+        if next_upper - next_lower <= max_width:
+            matched['lower'] = next_lower
+            matched['upper'] = next_upper
+            matched['created_idx'] = source_idx
+        else:
+            matched['last_source_idx'] = source_idx
         matched['touches'] = 0
-        matched['created_idx'] = source_idx
         matched['valid'] = True
         return matched
 
@@ -2639,6 +2667,7 @@ def rebuild_zone_touches(zones, df_closed):
         zone = dict(zone)
         zone['touches'] = 0
         zone['valid'] = True
+        zone['status'] = 'active'
         start_idx = max(0, int(zone.get('created_idx', 0)))
         #从start_idx开始，确认缔造者的贡献
         for idx in range(start_idx, len(df_closed)):
@@ -2661,8 +2690,55 @@ def rebuild_zone_touches(zones, df_closed):
     return active
 
 
+def enrich_broken_zone(zone, df_closed, invalid_idx, touches):
+    zone = dict(zone)
+    row = df_closed.iloc[invalid_idx]
+    close = price_to_float(row.get('close'))
+    atr = price_to_float(row.get('atr'))
+    if zone['type'] == 'support':
+        boundary = zone['lower']
+        break_strength_atr = (boundary - close) / atr if atr > 0 else 0.0
+        # 跌破支撑后，收盘继续压在 lower 下方视为站稳跌破。
+        hold_count = int((df_closed.iloc[invalid_idx:]['close'] < zone['lower']).sum())
+        # 跌破后反抽回原支撑区域，后续可作为支撑变阻力的回踩候选。
+        retest_count = int((
+            (df_closed.iloc[invalid_idx + 1:]['high'] >= zone['lower'])
+            & (df_closed.iloc[invalid_idx + 1:]['close'] <= zone['upper'])
+        ).sum())
+    else:
+        boundary = zone['upper']
+        break_strength_atr = (close - boundary) / atr if atr > 0 else 0.0
+        # 突破阻力后，收盘继续站在 upper 上方视为站稳突破。
+        hold_count = int((df_closed.iloc[invalid_idx:]['close'] > zone['upper']).sum())
+        # 突破后回踩原阻力区域，后续可作为阻力变支撑的回踩候选。
+        retest_count = int((
+            (df_closed.iloc[invalid_idx + 1:]['low'] <= zone['upper'])
+            & (df_closed.iloc[invalid_idx + 1:]['close'] >= zone['lower'])
+        ).sum())
+
+    # 这些字段用于复盘和后续候选排序；当前交易逻辑仍兼容旧字段。
+    zone['touches'] = touches
+    zone['valid'] = False
+    zone['invalidated_idx'] = invalid_idx
+    zone['break_idx'] = invalid_idx
+    zone['break_time'] = format_bar_time(row.get('timestamp'))
+    zone['break_price'] = close
+    zone['break_strength_atr'] = break_strength_atr
+    zone['bars_after_break'] = len(df_closed) - invalid_idx - 1
+    zone['hold_count'] = hold_count
+    zone['retest_count'] = retest_count
+    zone['retest_candidate'] = retest_count > 0
+    return zone
+
+
 def recently_broken_zones(zones, df_closed):
-    broken = {'broken_support': [], 'broken_resistance': []}
+    broken = {
+        'broken_support': [],
+        'broken_resistance': [],
+        'broken_old_support': [],
+        'broken_old_resistance': [],
+        'retest_candidate': []
+    }
     for raw_zone in zones:
         zone = dict(raw_zone)
         touches = 0
@@ -2685,14 +2761,18 @@ def recently_broken_zones(zones, df_closed):
                     touches += 1
         if touches < SUP_RES_VALID_TOUCHES or invalid_idx is None:
             continue
-        if invalid_idx < len(df_closed) - 3:
-            continue
-        zone['touches'] = touches
-        zone['invalidated_idx'] = invalid_idx
+
+        zone = enrich_broken_zone(zone, df_closed, invalid_idx, touches)
+        recent_break = invalid_idx >= len(df_closed) - SUP_RES_RECENT_BREAK_LOOKBACK
+        zone['status'] = 'broken_recent' if recent_break else 'broken_old'
+        if zone.get('retest_candidate'):
+            broken['retest_candidate'].append(dict(zone, status='retest_candidate'))
+
         if zone['type'] == 'support':
-            broken['broken_support'].append(zone)
+            target = 'broken_support' if recent_break else 'broken_old_support'
         else:
-            broken['broken_resistance'].append(zone)
+            target = 'broken_resistance' if recent_break else 'broken_old_resistance'
+        broken[target].append(zone)
     return broken
 
 
@@ -2701,7 +2781,15 @@ def build_support_resistance_zones(df_4h, now_dt=None):
     if len(df_closed) > SUP_RES_LOOKBACK_4H:
         df_closed = df_closed.tail(SUP_RES_LOOKBACK_4H).reset_index(drop=True)
     if len(df_closed) < SUP_RES_SWING_WINDOW * 2 + 20:
-        return {'support': [], 'resistance': []}
+        return {
+            'support': [],
+            'resistance': [],
+            'broken_support': [],
+            'broken_resistance': [],
+            'broken_old_support': [],
+            'broken_old_resistance': [],
+            'retest_candidate': []
+        }
 
     zones = []
     for idx in range(SUP_RES_SWING_WINDOW, len(df_closed) - SUP_RES_SWING_WINDOW):
@@ -2724,11 +2812,21 @@ def build_support_resistance_zones(df_4h, now_dt=None):
     broken = recently_broken_zones(zones, df_closed)
     support = sorted([z for z in active if z['type'] == 'support'], key=lambda z: z['upper'], reverse=True)
     resistance = sorted([z for z in active if z['type'] == 'resistance'], key=lambda z: z['lower'])
+    broken_support = sorted(broken['broken_support'], key=lambda z: z.get('invalidated_idx', -1), reverse=True)
+    broken_resistance = sorted(broken['broken_resistance'], key=lambda z: z.get('invalidated_idx', -1), reverse=True)
+    broken_old_support = sorted(broken['broken_old_support'], key=lambda z: z.get('invalidated_idx', -1), reverse=True)
+    broken_old_resistance = sorted(broken['broken_old_resistance'], key=lambda z: z.get('invalidated_idx', -1), reverse=True)
+    retest_candidate = sorted(broken['retest_candidate'], key=lambda z: z.get('invalidated_idx', -1), reverse=True)
     return {
         'support': support,
         'resistance': resistance,
-        'broken_support': broken['broken_support'],
-        'broken_resistance': broken['broken_resistance']
+        # 兼容原策略字段：只放最近 SUP_RES_RECENT_BREAK_LOOKBACK 根4H内突破/跌破的区域。
+        'broken_support': broken_support,
+        'broken_resistance': broken_resistance,
+        # 额外状态字段：旧突破区域和回踩候选，用于复盘和后续策略优化。
+        'broken_old_support': broken_old_support,
+        'broken_old_resistance': broken_old_resistance,
+        'retest_candidate': retest_candidate
     }
 
 
