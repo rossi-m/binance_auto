@@ -2025,6 +2025,8 @@ def candle_parts(row):
     return open_price, high, low, close, candle_range, body
 
 
+
+# 强势K线检查
 def strong_candle_check(open_price, high, low, close, atr, direction, body_override=None):
     if not is_number(atr) or atr <= 0:
         return {'ok': False, 'reason': 'bad_atr'}
@@ -2032,18 +2034,23 @@ def strong_candle_check(open_price, high, low, close, atr, direction, body_overr
     if candle_range <= 0:
         return {'ok': False, 'reason': 'zero_range'}
 
+    # 实体
     raw_body = close - open_price if direction == 'long' else open_price - close
     body = body_override if body_override is not None else raw_body
     if direction == 'long':
         direction_ok = close > open_price
+        # 收盘价在整个k线的27%以上
         close_zone_ok = close >= high - candle_range * STRONG_CLOSE_ZONE_RATIO
     else:
         direction_ok = close < open_price
         close_zone_ok = close <= low + candle_range * STRONG_CLOSE_ZONE_RATIO
-
+    # 实体大于atr*0.55，过滤掉小实体的k线
     body_atr_ok = body >= STRONG_BODY_ATR_RATIO * atr
+    
+    # 实体占整个k线60%以上
     body_range_ratio = body / candle_range
     body_range_ok = body_range_ratio >= STRONG_BODY_RANGE_RATIO
+
     ok = direction_ok and body_atr_ok and close_zone_ok and body_range_ok
     return {
         'ok': ok,
@@ -2479,22 +2486,62 @@ def evaluate_adx_ema_context(df, timeframe, now_dt=None):
     return base
 
 
+def side_label(side):
+    return '多' if side == 'long' else '空' if side == 'short' else str(side)
+
+
+def format_context_metric(value):
+    if value in (None, ''):
+        return '-'
+    try:
+        return f"{float(value):.2f}"
+    except Exception:
+        return str(value)
+
+
+def format_context_state(state):
+    if not state:
+        return 'missing'
+    details = state.get('details') or {}
+    adx_length = details.get('adx_length')
+    adx_name = f"ADX{adx_length}" if adx_length else 'ADX'
+    return (
+        f"{state.get('timeframe', '?')} status={state.get('status')}, "
+        f"dir={state.get('direction')}, "
+        f"允许开多={bool(state.get('can_open_long'))}, "
+        f"允许开空={bool(state.get('can_open_short'))}, "
+        f"{adx_name}={format_context_metric(details.get('adx'))}, "
+        f"+DI={format_context_metric(details.get('plus_di'))}, "
+        f"-DI={format_context_metric(details.get('minus_di'))}, "
+        f"EMAclean={details.get('ema_clean')}, "
+        f"cross={details.get('up_cross', '-')}/{details.get('down_cross', '-')}"
+    )
+
+
+def context_deny_reason(side, reason, local_state, background_state):
+    return (
+        f"{side_label(side)}方向过滤: {reason}; "
+        f"local[{format_context_state(local_state)}]; "
+        f"bg[{format_context_state(background_state)}]"
+    )
+
+
 def context_allows_side(local_state, background_state, side):
     if not local_state or not background_state:
-        return False, '缺少趋势状态'
+        return False, context_deny_reason(side, '缺少趋势状态', local_state, background_state)
     opposite = 'short' if side == 'long' else 'long'
     if local_state.get('is_oscillation'):
-        return False, f"{local_state.get('timeframe')} 本级别震荡/趋势不明"
+        return False, context_deny_reason(side, f"{local_state.get('timeframe')} 本级别震荡/趋势不明", local_state, background_state)
     if local_state.get('direction') == opposite:
-        return False, f"{local_state.get('timeframe')} 本级别方向相反"
+        return False, context_deny_reason(side, f"{local_state.get('timeframe')} 本级别方向相反", local_state, background_state)
     if background_state.get('direction') == opposite:
-        return False, f"{background_state.get('timeframe')} 背景趋势相反"
+        return False, context_deny_reason(side, f"{background_state.get('timeframe')} 背景趋势相反", local_state, background_state)
     if background_state.get('status') in ('range', 'transition', 'unclear', 'no_data'):
-        return False, f"{background_state.get('timeframe')} 背景趋势不允许开仓: {background_state.get('status')}"
+        return False, context_deny_reason(side, f"{background_state.get('timeframe')} 背景趋势不允许开仓: {background_state.get('status')}", local_state, background_state)
 
     local_open_key = 'can_open_long' if side == 'long' else 'can_open_short'
     if not local_state.get(local_open_key) and local_state.get('direction') != side:
-        return False, f"{local_state.get('timeframe')} 本级别未给出{side}方向"
+        return False, context_deny_reason(side, f"{local_state.get('timeframe')} 本级别未给出{side_label(side)}方向", local_state, background_state)
 
     bg_same_side = background_state.get('direction') == side
     bg_open_key = 'can_open_long' if side == 'long' else 'can_open_short'
@@ -2504,7 +2551,7 @@ def context_allows_side(local_state, background_state, side):
         f'ema20_{side}_persistence'
     )
     if not bg_same_side or (not background_state.get(bg_open_key) and not bg_soft_allow):
-        return False, f"{background_state.get('timeframe')} 背景未确认{side}"
+        return False, context_deny_reason(side, f"{background_state.get('timeframe')} 背景未确认{side_label(side)}方向", local_state, background_state)
     return True, 'ok'
 
 
@@ -2515,8 +2562,10 @@ def detect_entry_trigger(df, timeframe, side, now_dt=None):
         return None
 
     last = df_closed.iloc[-1]
+    close = price_to_float(last.get('close'))
+    atr = price_to_float(last.get('atr'))
     tick = get_price_tick(last.get('close'))
-    # 最新一根K线是否为大强K线
+    # 最新一根 K线是否为大强K线
     large = latest_large_strong(df_closed)
     if large:
         return {
@@ -2524,35 +2573,49 @@ def detect_entry_trigger(df, timeframe, side, now_dt=None):
             'reason': f"最新{timeframe}为大强{large['direction']}线，过滤不开仓",
             'large': large
         }
-    # 查找最近一根大强k线
+    # 往前找一根同方向的大强K线，等价格突破它的高/低点时入场，找的不是最新的
     previous_large = find_previous_large_strong(df_closed, side)
     if previous_large:
-        close = price_to_float(last.get('close'))
         if side == 'long':
             level = previous_large['high']
-            if close <= level:
-                return None
+            broke_previous_large = close > level
             entry_level = level + tick
-            stop = previous_large['low'] - tick
+            structure_stop = previous_large['low'] - tick
+            atr_stop = entry_level - ENTRY_ATR_STOP_MULTIPLIER * atr if atr > 0 else structure_stop
+            stop = max(structure_stop, atr_stop)
             reason = f"{timeframe}收盘突破前大强阳线高点"
         else:
             level = previous_large['low']
-            if close >= level:
-                return None
+            broke_previous_large = close < level
             entry_level = level - tick
-            stop = previous_large['high'] + tick
+            structure_stop = previous_large['high'] + tick
+            atr_stop = entry_level + ENTRY_ATR_STOP_MULTIPLIER * atr if atr > 0 else structure_stop
+            stop = min(structure_stop, atr_stop)
             reason = f"{timeframe}收盘跌破前大强阴线低点"
-        return {
-            'blocked': False,
-            'type': 'large_strong_break',
-            'side': side,
-            'timeframe': timeframe,
-            'entry_level': precision_price(entry_level),
-            'stop': precision_price(stop),
-            'trigger': previous_large,
-            'reason': reason
-        }
-    # 查找最近一根有效强K线
+        if broke_previous_large:
+            logging.info(
+                f"detect_entry_trigger命中 large_strong_break: "
+                f"timeframe={timeframe}, side={side}, level={level}, close={close}, "
+                f"structure_stop={structure_stop}, atr_stop={atr_stop}, final_stop={stop}"
+            )
+            return {
+                'blocked': False,
+                'type': 'large_strong_break',
+                'side': side,
+                'timeframe': timeframe,
+                'entry_level': precision_price(entry_level),
+                'stop': precision_price(stop),
+                'trigger': previous_large,
+                'reason': reason,
+                'structure_stop': precision_price(structure_stop),
+                'atr_stop': precision_price(atr_stop),
+                'stop_model': 'structure_with_atr_cap'
+            }
+        logging.info(
+            f"detect_entry_trigger跳过 large_strong_break 但继续检查后续分支: "
+            f"timeframe={timeframe}, side={side}, level={level}, close={close}"
+        )
+    # 查找最后一根收盘k线是否是有效强K线,包含了合成强k
     strong = latest_effective_strong(df_closed, side)
     if strong:
         if side == 'long':
@@ -2561,6 +2624,11 @@ def detect_entry_trigger(df, timeframe, side, now_dt=None):
         else:
             entry_level = strong['low'] - tick
             stop = strong['high'] + tick
+        logging.info(
+            f"detect_entry_trigger命中 strong_candle: "
+            f"timeframe={timeframe}, side={side}, kind={strong.get('kind')}, "
+            f"entry={entry_level}, stop={stop}"
+        )
         return {
             'blocked': False,
             'type': 'strong_candle',
@@ -2571,12 +2639,10 @@ def detect_entry_trigger(df, timeframe, side, now_dt=None):
             'trigger': strong,
             'reason': f"{timeframe}最新{strong['kind']}强{'阳' if side == 'long' else '阴'}线"
         }
-    # 查找最近一根相反方向的有效强K线
+    # 查找最近一根相反方向的有效强K线,不包含很撑强k
     previous = find_previous_opposite_strong(df_closed, side)
     if previous is None:
         return None
-    atr = price_to_float(last.get('atr'))
-    close = price_to_float(last.get('close'))
     high = price_to_float(last.get('high'))
     low = price_to_float(last.get('low'))
     if side == 'long':
@@ -2591,6 +2657,10 @@ def detect_entry_trigger(df, timeframe, side, now_dt=None):
         entry_level = level - tick
     if not broke:
         return None
+    logging.info(
+        f"detect_entry_trigger命中 opposite_strong_break: "
+        f"timeframe={timeframe}, side={side}, level={level}, close={close}, entry={entry_level}, stop={stop}"
+    )
     return {
         'blocked': False,
         'type': 'opposite_strong_break',
@@ -3094,6 +3164,7 @@ def build_trend_trigger_candidates(context):
         background_tf = STRATEGY_BACKGROUND_TF[strategy_tf]
         background_state = context['trend_states'].get(background_tf)
         #触发时间
+        trigger_tf = STRATEGY_TRIGGER_TF[strategy_tf]
         trigger_df = context['dfs'][trigger_tf]
 
         for side in ('long', 'short'):
@@ -3153,6 +3224,7 @@ def build_entry_candidates(context):
     # 构建趋势触发候选信号
     candidates = build_trend_trigger_candidates(context)
     for side in ('long', 'short'):
+        #多周期校验趋势信号
         allowed, deny_reason = context_allows_side(context['trend_states'].get('15m'), context['trend_states'].get('1h'), side)
         if allowed:
             # 构建SR反弹候选信号：k线到达支撑位置并且站稳，使用1小时和15m
