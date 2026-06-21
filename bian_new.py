@@ -141,11 +141,11 @@ ADX_EXTREME = 40
 # - extreme: ADX 超过该值时视为极强趋势，用于后续止损缓冲逻辑。
 # 这些值来自 2026-06-20 的多周期联合过滤验证；1d 暂无充分回测，暂不单独配置。
 DEFAULT_ADX_CONFIG = {
-    'length': ADX_LENGTH,
-    'range_max': 20,
-    'no_trade_max': ADX_NO_TRADE_MAX,
-    'trend_min': ADX_TREND_MIN,
-    'extreme': ADX_EXTREME
+    'length': ADX_LENGTH, #14
+    'range_max': 20, 
+    'no_trade_max': ADX_NO_TRADE_MAX, #25
+    'trend_min': ADX_TREND_MIN, #25
+    'extreme': ADX_EXTREME #40
 }
 ADX_BY_TIMEFRAME = {
     # 15m 是触发周期，保持 ADX14，避免过度平滑导致入场太慢。
@@ -2691,83 +2691,135 @@ def rebuild_zone_touches(zones, df_closed):
 
 
 def enrich_broken_zone(zone, df_closed, invalid_idx, touches):
+    """
+    为已被突破/跌破的支撑/阻力区间补充突破质量指标。
+
+    参数:
+        zone:           原始区间 dict（会被浅拷贝，不修改原对象）
+        df_closed:      已收盘的 4H K线 DataFrame
+        invalid_idx:    突破/跌破发生的那根 K 线索引（收盘价首次越过区间边界）
+        touches:        突破前该区间被触碰的次数（越多说明区间越重要）
+
+    补充的字段:
+        touches             - 被触碰次数（区间有效性权重）
+        valid               - 固定 False，表示该区间已失效
+        invalidated_idx     - 突破发生的 K 线索引
+        break_idx           - 同上（兼容别名）
+        break_time          - 突破发生的时间（格式化字符串）
+        break_price         - 突破时的收盘价
+        break_strength_atr  - 突破力度（突破距离 / ATR，越大越强）
+        bars_after_break    - 突破后经过了多少根 K 线
+        hold_count          - 突破后站稳次数（收盘持续在突破方向的数量）
+        retest_count        - 回踩次数（价格回到原区间内的次数）
+        retest_candidate    - 是否为回踩候选（retest_count > 0）
+    """
     zone = dict(zone)
     row = df_closed.iloc[invalid_idx]
     close = price_to_float(row.get('close'))
     atr = price_to_float(row.get('atr'))
+
     if zone['type'] == 'support':
+        # 支撑区：下沿为突破边界，收盘跌破 lower 即视为跌破
         boundary = zone['lower']
+        # 突破力度 = (下沿 - 收盘价) / ATR，值越大说明跌得越深、突破越强
         break_strength_atr = (boundary - close) / atr if atr > 0 else 0.0
-        # 跌破支撑后，收盘继续压在 lower 下方视为站稳跌破。
+        # 站稳跌破次数：跌破后收盘价继续压在 lower 下方的根数
         hold_count = int((df_closed.iloc[invalid_idx:]['close'] < zone['lower']).sum())
-        # 跌破后反抽回原支撑区域，后续可作为支撑变阻力的回踩候选。
+        # 回踩次数：跌破后价格反抽回原支撑区域内（高点触碰下沿、收盘仍在区间内）
         retest_count = int((
             (df_closed.iloc[invalid_idx + 1:]['high'] >= zone['lower'])
             & (df_closed.iloc[invalid_idx + 1:]['close'] <= zone['upper'])
         ).sum())
     else:
+        # 阻力区：上沿为突破边界，收盘突破 upper 即视为突破
         boundary = zone['upper']
+        # 突破力度 = (收盘价 - 上沿) / ATR，值越大说明涨得越高、突破越强
         break_strength_atr = (close - boundary) / atr if atr > 0 else 0.0
-        # 突破阻力后，收盘继续站在 upper 上方视为站稳突破。
+        # 站稳突破次数：突破后收盘价继续站在 upper 上方的根数
         hold_count = int((df_closed.iloc[invalid_idx:]['close'] > zone['upper']).sum())
-        # 突破后回踩原阻力区域，后续可作为阻力变支撑的回踩候选。
+        # 回踩次数：突破后价格回踩原阻力区域内（低点触碰上沿、收盘仍在区间内）
         retest_count = int((
             (df_closed.iloc[invalid_idx + 1:]['low'] <= zone['upper'])
             & (df_closed.iloc[invalid_idx + 1:]['close'] >= zone['lower'])
         ).sum())
 
-    # 这些字段用于复盘和后续候选排序；当前交易逻辑仍兼容旧字段。
-    zone['touches'] = touches
-    zone['valid'] = False
-    zone['invalidated_idx'] = invalid_idx
-    zone['break_idx'] = invalid_idx
-    zone['break_time'] = format_bar_time(row.get('timestamp'))
-    zone['break_price'] = close
-    zone['break_strength_atr'] = break_strength_atr
-    zone['bars_after_break'] = len(df_closed) - invalid_idx - 1
-    zone['hold_count'] = hold_count
-    zone['retest_count'] = retest_count
-    zone['retest_candidate'] = retest_count > 0
+    zone['touches'] = touches                       # 突破前被触碰次数（区间重要性权重）
+    zone['valid'] = False                           # 区间已失效，不再作为活跃支撑/阻力
+    zone['invalidated_idx'] = invalid_idx           # 突破发生的 K 线索引
+    zone['break_idx'] = invalid_idx                 # 同上，兼容别名
+    zone['break_time'] = format_bar_time(row.get('timestamp'))  # 突破时间
+    zone['break_price'] = close                     # 突破时的收盘价
+    zone['break_strength_atr'] = break_strength_atr # 突破力度（ATR 倍数）
+    zone['bars_after_break'] = len(df_closed) - invalid_idx - 1  # 突破后经过的 K 线根数
+    zone['hold_count'] = hold_count                 # 站稳次数（收盘维持在突破方向）
+    zone['retest_count'] = retest_count             # 回踩原区间的次数
+    zone['retest_candidate'] = retest_count > 0     # 是否有回踩行为（用于支撑阻力互换策略）
     return zone
 
 
 def recently_broken_zones(zones, df_closed):
+    """
+    从所有原始支撑/阻力区间中，筛选出已被突破（阻力）或跌破（支撑）的区间，
+    并按突破时间远近和是否有回踩行为进行分类。
+
+    筛选条件（两个缺一不可）：
+        1. touches >= SUP_RES_VALID_TOUCHES  —— 区间被触碰足够多次，证明是有效区间
+        2. invalid_idx is not None           —— 确实被收盘价突破/跌破了
+
+    分类结果：
+        broken_support        - 近期被跌破的支撑区（支撑变阻力候选）
+        broken_resistance     - 近期被突破的阻力区（阻力变支撑候选）
+        broken_old_support    - 较早被跌破的支撑区（超出近期窗口，用于复盘）
+        broken_old_resistance - 较早被突破的阻力区（超出近期窗口，用于复盘）
+        retest_candidate      - 突破后价格回踩到原区间内的区域（互换确认候选）
+    """
     broken = {
-        'broken_support': [],
-        'broken_resistance': [],
-        'broken_old_support': [],
-        'broken_old_resistance': [],
-        'retest_candidate': []
+        'broken_support': [],        # 近期跌破的支撑区
+        'broken_resistance': [],     # 近期突破的阻力区
+        'broken_old_support': [],    # 早期跌破的支撑区
+        'broken_old_resistance': [], # 早期突破的阻力区
+        'retest_candidate': []       # 有回踩行为的区间（与上面分类可重叠）
     }
     for raw_zone in zones:
         zone = dict(raw_zone)
-        touches = 0
-        invalid_idx = None
+        touches = 0           # 突破前该区间被触碰的次数
+        invalid_idx = None    # 突破/跌破发生的 K 线索引
+        # 从区间创建时刻开始向后遍历，逐根检查是否被突破
         start_idx = max(0, int(zone.get('created_idx', 0)))
         for idx in range(start_idx, len(df_closed)):
             row = df_closed.iloc[idx]
             close = price_to_float(row['close'])
             if zone['type'] == 'support':
+                # 收盘价跌破支撑区下沿 → 确认跌破，记录索引并停止遍历
                 if close < zone['lower']:
                     invalid_idx = idx
                     break
+                # 低点触碰区间（low <= upper）且收盘仍在区间内 → 计一次有效触碰
                 if row['low'] <= zone['upper'] and close >= zone['lower']:
                     touches += 1
             else:
+                # 收盘价突破阻力区上沿 → 确认突破，记录索引并停止遍历
                 if close > zone['upper']:
                     invalid_idx = idx
                     break
+                # 高点触碰区间（high >= lower）且收盘仍在区间内 → 计一次有效触碰
                 if row['high'] >= zone['lower'] and close <= zone['upper']:
                     touches += 1
+
+        # 触碰次数不足 或 从未被突破 → 该区间不符合"已突破的有效区间"条件，跳过
         if touches < SUP_RES_VALID_TOUCHES or invalid_idx is None:
             continue
 
+        # 补充突破质量指标：突破力度、站稳次数、回踩次数等
         zone = enrich_broken_zone(zone, df_closed, invalid_idx, touches)
+        # 判断突破是否发生在近期窗口内（最近 SUP_RES_RECENT_BREAK_LOOKBACK 根 K 线）
         recent_break = invalid_idx >= len(df_closed) - SUP_RES_RECENT_BREAK_LOOKBACK
         zone['status'] = 'broken_recent' if recent_break else 'broken_old'
+        # 如果有回踩行为，额外加入 retest_candidate 列表（用于支撑阻力互换确认策略）
         if zone.get('retest_candidate'):
             broken['retest_candidate'].append(dict(zone, status='retest_candidate'))
 
+        # 按区间类型和突破时间远近，分别归入对应列表
         if zone['type'] == 'support':
             target = 'broken_support' if recent_break else 'broken_old_support'
         else:
@@ -2782,12 +2834,19 @@ def build_support_resistance_zones(df_4h, now_dt=None):
         df_closed = df_closed.tail(SUP_RES_LOOKBACK_4H).reset_index(drop=True)
     if len(df_closed) < SUP_RES_SWING_WINDOW * 2 + 20:
         return {
+            # 当前仍有效的支撑区（价格尚未跌破）
             'support': [],
+            # 当前仍有效的阻力区（价格尚未突破）
             'resistance': [],
+            # 近期被跌破的支撑区（支撑变阻力候选）
             'broken_support': [],
+            # 近期被突破的阻力区（阻力变支撑候选）
             'broken_resistance': [],
+            # 较早被跌破的支撑区（超出近期窗口，用于复盘），不是最近6根被跌破的
             'broken_old_support': [],
+            # 较早被突破的阻力区（超出近期窗口，用于复盘），不是最近6根被跌破的
             'broken_old_resistance': [],
+            # 突破/跌破后价格又回踩到原区间内的区域（支撑阻力互换确认候选）
             'retest_candidate': []
         }
 
@@ -2818,14 +2877,18 @@ def build_support_resistance_zones(df_4h, now_dt=None):
     broken_old_resistance = sorted(broken['broken_old_resistance'], key=lambda z: z.get('invalidated_idx', -1), reverse=True)
     retest_candidate = sorted(broken['retest_candidate'], key=lambda z: z.get('invalidated_idx', -1), reverse=True)
     return {
+        # 当前仍有效的支撑区（按 upper 降序，离价格近的排前面）
         'support': support,
+        # 当前仍有效的阻力区（按 lower 升序，离价格近的排前面）
         'resistance': resistance,
-        # 兼容原策略字段：只放最近 SUP_RES_RECENT_BREAK_LOOKBACK 根4H内突破/跌破的区域。
+        # 近期被跌破的支撑区（按跌破时间倒序，用于支撑变阻力策略）
         'broken_support': broken_support,
+        # 近期被突破的阻力区（按突破时间倒序，用于阻力变支撑策略）
         'broken_resistance': broken_resistance,
-        # 额外状态字段：旧突破区域和回踩候选，用于复盘和后续策略优化。
+        # 较早被跌破/突破的区域（超出近期窗口，用于复盘和后续策略优化）
         'broken_old_support': broken_old_support,
         'broken_old_resistance': broken_old_resistance,
+        # 突破后价格回踩到原区间内的区域（支撑阻力互换确认候选）
         'retest_candidate': retest_candidate
     }
 
