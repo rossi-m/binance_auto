@@ -200,8 +200,8 @@ OPPOSITE_STRONG_LOOKBACK = 24
 STRONG_CHOP_LOOKBACK_BARS = 4
 # 初始止损距离使用 ATR 的倍数，决定入场后第一版保护止损有多宽。
 ENTRY_ATR_STOP_MULTIPLIER = 1.0
-# 极强趋势下止损额外缓冲的 ATR 倍数，避免止损离强平价或关键位太近。
-EXTREME_ADX_STOP_BUFFER_ATR = 0.1
+# 极强趋势下把原始止损距离缩到该比例，0.5 表示止损距离减半。
+EXTREME_ADX_STOP_RISK_RATIO = 0.5
 # 普通趋势下止损额外缓冲的 ATR 倍数。
 NORMAL_STOP_BUFFER_ATR = 0.2
 # 预期利润至少要达到 ATR 的这个比例，否则认为空间太小不值得进场。
@@ -2578,43 +2578,36 @@ def detect_entry_trigger(df, timeframe, side, now_dt=None):
     if previous_large:
         if side == 'long':
             level = previous_large['high']
-            broke_previous_large = close > level
             entry_level = level + tick
             structure_stop = previous_large['low'] - tick
             atr_stop = entry_level - ENTRY_ATR_STOP_MULTIPLIER * atr if atr > 0 else structure_stop
             stop = max(structure_stop, atr_stop)
-            reason = f"{timeframe}收盘突破前大强阳线高点"
+            reason = f"{timeframe}前大强阳线高点触发位"
         else:
             level = previous_large['low']
-            broke_previous_large = close < level
             entry_level = level - tick
             structure_stop = previous_large['high'] + tick
             atr_stop = entry_level + ENTRY_ATR_STOP_MULTIPLIER * atr if atr > 0 else structure_stop
             stop = min(structure_stop, atr_stop)
-            reason = f"{timeframe}收盘跌破前大强阴线低点"
-        if broke_previous_large:
-            logging.info(
-                f"detect_entry_trigger命中 large_strong_break: "
-                f"timeframe={timeframe}, side={side}, level={level}, close={close}, "
-                f"structure_stop={structure_stop}, atr_stop={atr_stop}, final_stop={stop}"
-            )
-            return {
-                'blocked': False,
-                'type': 'large_strong_break',
-                'side': side,
-                'timeframe': timeframe,
-                'entry_level': precision_price(entry_level),
-                'stop': precision_price(stop),
-                'trigger': previous_large,
-                'reason': reason,
-                'structure_stop': precision_price(structure_stop),
-                'atr_stop': precision_price(atr_stop),
-                'stop_model': 'structure_with_atr_cap'
-            }
+            reason = f"{timeframe}前大强阴线低点触发位"
         logging.info(
-            f"detect_entry_trigger跳过 large_strong_break 但继续检查后续分支: "
-            f"timeframe={timeframe}, side={side}, level={level}, close={close}"
+            f"detect_entry_trigger生成 large_strong_break: "
+            f"timeframe={timeframe}, side={side}, level={level}, close={close}, "
+            f"entry={entry_level}, structure_stop={structure_stop}, atr_stop={atr_stop}, final_stop={stop}"
         )
+        return {
+            'blocked': False,
+            'type': 'large_strong_break',
+            'side': side,
+            'timeframe': timeframe,
+            'entry_level': precision_price(entry_level),
+            'stop': precision_price(stop),
+            'trigger': previous_large,
+            'reason': reason,
+            'structure_stop': precision_price(structure_stop),
+            'atr_stop': precision_price(atr_stop),
+            'stop_model': 'structure_with_atr_cap'
+        }
     # 查找最后一根收盘k线是否是有效强K线,包含了合成强k
     strong = latest_effective_strong(df_closed, side)
     if strong:
@@ -2639,7 +2632,7 @@ def detect_entry_trigger(df, timeframe, side, now_dt=None):
             'trigger': strong,
             'reason': f"{timeframe}最新{strong['kind']}强{'阳' if side == 'long' else '阴'}线"
         }
-    # 查找最近一根相反方向的有效强K线,不包含很撑强k
+    # 查找最近一根相反方向的有效强K线,不包含合成强k
     previous = find_previous_opposite_strong(df_closed, side)
     if previous is None:
         return None
@@ -2647,19 +2640,16 @@ def detect_entry_trigger(df, timeframe, side, now_dt=None):
     low = price_to_float(last.get('low'))
     if side == 'long':
         level = previous['high']
-        broke = close > level and high > level
         stop = close - ENTRY_ATR_STOP_MULTIPLIER * atr
         entry_level = level + tick
     else:
         level = previous['low']
-        broke = close < level and low < level
         stop = close + ENTRY_ATR_STOP_MULTIPLIER * atr
         entry_level = level - tick
-    if not broke:
-        return None
     logging.info(
-        f"detect_entry_trigger命中 opposite_strong_break: "
-        f"timeframe={timeframe}, side={side}, level={level}, close={close}, entry={entry_level}, stop={stop}"
+        f"detect_entry_trigger生成 opposite_strong_break: "
+        f"timeframe={timeframe}, side={side}, level={level}, close={close}, "
+        f"high={high}, low={low}, entry={entry_level}, stop={stop}"
     )
     return {
         'blocked': False,
@@ -2669,7 +2659,7 @@ def detect_entry_trigger(df, timeframe, side, now_dt=None):
         'entry_level': precision_price(entry_level),
         'stop': precision_price(stop),
         'trigger': previous,
-        'reason': f"{timeframe}收盘突破前强{'阴' if side == 'long' else '阳'}线关键位"
+        'reason': f"{timeframe}前强{'阴' if side == 'long' else '阳'}线关键位触发位"
     }
 
 
@@ -3183,15 +3173,14 @@ def build_trend_trigger_candidates(context):
 
             entry_ref = price_to_float(trigger.get('entry_level'))
             stop = price_to_float(trigger['stop'])
-            #当adx为极端值时，缩紧止损
+            # 当 ADX 为极端值时，按原始止损距离收紧，而不是固定压到很窄的 ATR 距离。
             if background_state.get('details', {}).get('extreme_adx'):
-                bg_closed = get_closed_df(context['dfs'][background_tf], background_tf, context['now_dt'])
-                atr = price_to_float(bg_closed.iloc[-1].get('atr')) if len(bg_closed) else 0.0
-                if atr > 0:
+                risk_distance = abs(entry_ref - stop)
+                if risk_distance > 0:
                     if side == 'long':
-                        stop = max(stop, entry_ref - EXTREME_ADX_STOP_BUFFER_ATR * atr)
+                        stop = max(stop, entry_ref - EXTREME_ADX_STOP_RISK_RATIO * risk_distance)
                     else:
-                        stop = min(stop, entry_ref + EXTREME_ADX_STOP_BUFFER_ATR * atr)
+                        stop = min(stop, entry_ref + EXTREME_ADX_STOP_RISK_RATIO * risk_distance)
 
 
             #查找止盈位置
@@ -3622,7 +3611,6 @@ def run_strategy():
         if is_new_signal_15m:
             trade_state['last_processed_bar_15m'] = signal_bar_15m
         return
-
     curr_price = get_latest_price()
     #判断候选信号的入场价格是否仍然有效
     entry_still_valid, entry_invalid_reason = candidate_entry_price_still_valid(candidate, curr_price)
