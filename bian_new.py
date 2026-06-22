@@ -783,6 +783,7 @@ def ensure_stop_price_safe(entry_price, stop_price, side, liquidation_price=None
         liq = estimate_liquidation_price(entry_price, side)
         source = 'estimated'
 
+    #止损价格和强平价格保持的距离
     safe_buffer = entry_price * LIQUIDATION_SAFE_BUFFER_RATIO
     adjusted_stop = float(stop_price)
     if side == 'long':
@@ -1609,6 +1610,8 @@ def open_order(side, price, sl_price, state_4h, state_1h, state_15m, signal_bar_
 
     # 开仓前先用“保守估算强平价”预校验止损，防止止损本来就落到强平外面
     estimated_safe_stop, estimated_stop_meta = ensure_stop_price_safe(price, sl_price, side, liquidation_price=None)
+
+    # 验证止损价格是否有效
     if not stop_price_is_still_valid(price, estimated_safe_stop, side):
         logging.warning(
             f"拒绝开仓：预估强平价过近，止损无效 side={side}, "
@@ -2997,23 +3000,29 @@ def find_1h_sr_confirmation(df_1h, zone, side, now_dt=None):
         return None
     #最近18根K线
     recent = df_closed.tail(SR_CONFIRM_LOOKBACK_1H)
+    touched_until = []
     touched = False
-    #最近18k线中有没有在支撑区域内，然后需要是阳/阴线，并且需要大于支撑区域的上线，同时需要满足wick长度条件
-    for _, row in recent.iterrows():
+    for _, touch_row in recent.iterrows():
+        _, touch_high, touch_low, touch_close, _, _ = candle_parts(touch_row)
+        if side == 'long':
+            touched = touched or (touch_low <= zone['upper'] and touch_close >= zone['lower'])
+        else:
+            touched = touched or (touch_high >= zone['lower'] and touch_close <= zone['upper'])
+        touched_until.append(touched)
+
+    # 最近18根K线内，从新到旧查找最近一次站稳确认。
+    for pos in range(len(recent) - 1, -1, -1):
+        row = recent.iloc[pos]
         open_price, high, low, close, _, _ = candle_parts(row)
         body = abs(close - open_price)
         if side == 'long':
-            if low <= zone['upper'] and close >= zone['lower']:
-                touched = True
             lower_wick = min(open_price, close) - low
-            confirm = touched and close > open_price and close > zone['upper'] and lower_wick <= body * 0.5
+            confirm = touched_until[pos] and close > open_price and close > zone['upper'] and lower_wick <= body * 0.5
             if confirm:
                 return {'high': high, 'low': low, 'timestamp': row.get('timestamp'), 'bar_time': format_bar_time(row.get('timestamp')), 'zone': zone}
         else:
-            if high >= zone['lower'] and close <= zone['upper']:
-                touched = True
             upper_wick = high - max(open_price, close)
-            confirm = touched and close < open_price and close < zone['lower'] and upper_wick <= body * 0.5
+            confirm = touched_until[pos] and close < open_price and close < zone['lower'] and upper_wick <= body * 0.5
             if confirm:
                 return {'high': high, 'low': low, 'timestamp': row.get('timestamp'), 'bar_time': format_bar_time(row.get('timestamp')), 'zone': zone}
     return None
@@ -3371,55 +3380,83 @@ def close_partial_position(reason, ratio=0.5, curr_price=None, signal_bar_15m=''
 
 
 def apply_new_exit_rules(context, signal_bar_15m=''):
+    """
+    持有时每轮调用的动态出场规则，按优先级依次检查：
+
+    1. 大强线止盈收紧  — 出场周期出现大强K线，把止损推到大强线边界
+    2. 反向强K止盈     — 出场周期出现反向强K，立刻收紧止盈到该K线边界
+    3. 第一目标位半仓   — 价格到达预设目标，先平 50%，剩余止损推到成本/目标附近
+    4. 阻力/支撑区止盈  — 价格靠近前方关键阻力/支撑区，缩紧止损保护利润
+    """
     if not trade_state.get('has_position'):
         return
     side = trade_state.get('side')
     curr_price = get_latest_price()
+
+    # 确定出场周期：优先用入场时记录的 exit_tf，否则按策略周期查默认映射
     exit_tf = trade_state.get('entry_exit_tf') or STRATEGY_EXIT_TF.get(trade_state.get('entry_strategy_tf'), '15m')
     df_exit = context['dfs'].get(exit_tf)
+
+    # ====== 规则 1 & 2: 基于出场周期的硬性止盈信号 ======
     if df_exit is not None:
         df_exit_closed = get_closed_df(df_exit, exit_tf, context['now_dt'])
+
+        # 规则 1: 出场周期出现大强线 → 止损收到大强线边界
+        #   - 同向大强线：止损收到大强线低点（做多）或高点（做空），防止回撤
+        #   - 反向大强线：取大强线边界和 ATR 缓冲价的更保险值
         large = latest_large_strong(df_exit_closed)
         if large:
             if side == 'long':
+                # 同向大强阳线 → 稳健收紧到 low；反向大强阴线 → 取 low 和 ATR缓冲 中较高者
                 proposed = large['low'] if large['direction'] == 'long' else max(large['low'], curr_price - 0.3 * large['atr'])
             else:
+                # 同向大强阴线 → 稳健收紧到 high；反向大强阳线 → 取 high 和 ATR缓冲 中较低者
                 proposed = large['high'] if large['direction'] == 'short' else min(large['high'], curr_price + 0.3 * large['atr'])
             update_stop_if_tighter(side, proposed, f"{exit_tf}出现大强线，缩紧平仓价", curr_price, signal_bar_15m=signal_bar_15m)
-            return
+            return  # 大强线是最高优先级，命中后不再继续检查
 
+        # 规则 2: 出场周期出现反向强K → 收紧止盈到该强K线边界
         opposite = 'short' if side == 'long' else 'long'
         strong_opposite = latest_effective_strong(df_exit_closed, opposite)
         if strong_opposite:
+            # 做多遇到反向强阴线 → 止损推到阴线 low；做空遇到反向强阳线 → 止损推到阳线 high
             proposed = strong_opposite['low'] if side == 'long' else strong_opposite['high']
             update_stop_if_tighter(side, proposed, f"{exit_tf}出现反向强K，缩紧止盈", curr_price, signal_bar_15m=signal_bar_15m)
 
+    # ====== 规则 3: 第一目标位半仓止盈 ======
     target = price_to_float(trade_state.get('entry_sr_target'))
     entry = price_to_float(trade_state.get('entry_price'))
     risk = price_to_float(trade_state.get('entry_initial_risk'))
+    # 如果入场时没有设置目标价，用 2R 盈亏比兜底
     if target <= 0 and entry > 0 and risk > 0:
         target = entry + 2 * risk if side == 'long' else entry - 2 * risk
     if target > 0:
         if side == 'long' and curr_price >= target:
+            # 半仓止盈，剩余仓位止损推到成本附近（取 entry 和 target-0.25R 中较高者）
             if close_partial_position("达到第一目标位，平仓50%并推保护止损", curr_price=curr_price, signal_bar_15m=signal_bar_15m):
                 return
             update_stop_if_tighter(side, max(entry, target - 0.25 * risk), "达到第一目标位，剩余仓位止损推至成本/目标附近", curr_price, signal_bar_15m=signal_bar_15m)
         elif side == 'short' and curr_price <= target:
+            # 半仓止盈，剩余仓位止损推到成本附近（取 entry 和 target+0.25R 中较低者）
             if close_partial_position("达到第一目标位，平仓50%并推保护止损", curr_price=curr_price, signal_bar_15m=signal_bar_15m):
                 return
             update_stop_if_tighter(side, min(entry, target + 0.25 * risk), "达到第一目标位，剩余仓位止损推至成本/目标附近", curr_price, signal_bar_15m=signal_bar_15m)
 
+    # ====== 规则 4: 靠近有效阻力/支撑区，缩紧止盈 ======
     df_4h_closed = get_closed_df(context['dfs']['4h'], '4h', context['now_dt'])
     if len(df_4h_closed) == 0:
         return
     atr_4h = price_to_float(df_4h_closed.iloc[-1].get('atr'))
+    # 靠近区间的判定缓冲区（基于 ATR 的比例）
     near_buffer = SUP_RES_NEAR_ATR * atr_4h
     zones = context.get('zones', {})
     if side == 'long':
+        # 向前方（上方）找最近的有效阻力区，价格接近时收紧止盈
         resistance = nearest_opposite_zone(zones, side, curr_price - near_buffer)
         if resistance and curr_price >= resistance['lower'] - near_buffer:
             update_stop_if_tighter(side, max(trade_state['stop_loss_price'], resistance['lower'] - 0.1 * atr_4h), "靠近有效阻力区，缩紧止盈", curr_price, signal_bar_15m=signal_bar_15m)
     else:
+        # 向前方（下方）找最近的有效支撑区，价格接近时收紧止盈
         support = nearest_opposite_zone(zones, side, curr_price + near_buffer)
         if support and curr_price <= support['upper'] + near_buffer:
             update_stop_if_tighter(side, min(trade_state['stop_loss_price'], support['upper'] + 0.1 * atr_4h), "靠近有效支撑区，缩紧止盈", curr_price, signal_bar_15m=signal_bar_15m)
