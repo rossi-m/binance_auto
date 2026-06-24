@@ -208,6 +208,13 @@ NORMAL_STOP_BUFFER_ATR = 0.2
 MIN_EXPECTED_PROFIT_ATR = 0.25
 # 预期利润至少要覆盖手续费的倍数，防止收益空间被手续费吃掉。
 MIN_EXPECTED_PROFIT_FEE_MULTIPLIER = 3.0
+# 最高浮盈达到多少 ATR 后，至少保留多少比例的最高浮盈。
+PROFIT_ATR_LOCK_TIERS = (
+    (4.0, 0.90),
+    (3.0, 0.70),
+    (2.0, 0.50),
+    (1.0, 0.30),
+)
 # 平仓后冷却时间，防止刚出场又在同一段短周期波动里立刻重开。
 POST_EXIT_COOLDOWN_SECONDS = 4 * TIMEFRAME_SECONDS['5m']
 # 识别4H支撑/阻力摆动高低点时，左右各观察的K线窗口。
@@ -259,7 +266,6 @@ trade_state = {
     'entry_exit_tf': '', # 记录持仓后用于平仓/缩紧止盈的周期
     'entry_sr_target': 0.0, # 支撑阻力模块给出的第一目标位
     'entry_initial_risk': 0.0, # 入场价到初始止损的距离，用于1:2备用目标
-    'partial_taken': False, # 是否已经执行过第一目标半仓止盈
     'last_exit_time': '', # 最近一次平仓时间，用于5分钟触发策略的冷却
     'liquidation_price': 0.0,  # 记录当前仓位从交易所返回的真实强平价
     'stop_order_id': '',  # 记录服务端 STOP_MARKET 止损单的订单ID，便于后续撤单和替换
@@ -1452,7 +1458,6 @@ def reset_trade_state_after_external_close(signal_bar_15m='', reason='检测到�
         'entry_exit_tf': '',
         'entry_sr_target': 0.0,
         'entry_initial_risk': 0.0,
-        'partial_taken': False,
         'last_exit_time': detected_time,
         'initial_balance': 0.0,
         'open_fee': 0.0,
@@ -1721,7 +1726,6 @@ def open_order(side, price, sl_price, state_4h, state_1h, state_15m, signal_bar_
             'entry_exit_tf': entry_meta.get('exit_tf', ''),
             'entry_sr_target': float(entry_meta.get('sr_target', 0.0) or 0.0),
             'entry_initial_risk': abs(float(actual_price) - float(actual_safe_stop)),
-            'partial_taken': False,
             'initial_balance': initial_usdt,
             'open_fee': open_fee,
             'open_order_id': open_order_id,
@@ -1901,7 +1905,6 @@ def close_position(reason, curr_price=None, signal_bar_15m='', trigger_label='')
             'entry_exit_tf': '',
             'entry_sr_target': 0.0,
             'entry_initial_risk': 0.0,
-            'partial_taken': False,
             'last_exit_time': exit_time,
             'initial_balance': 0.0,
             'open_fee': 0.0,
@@ -3263,15 +3266,16 @@ def is_in_post_exit_cooldown(now_dt):
 
 def update_stop_if_tighter(side, new_stop, reason, curr_price, signal_bar_15m=''):
     current_stop = price_to_float(trade_state.get('stop_loss_price'))
+    new_stop = precision_price(new_stop)
+    tick = get_price_tick(curr_price)
     if new_stop <= 0:
         return False
     if side == 'long':
-        if new_stop <= current_stop or new_stop >= curr_price:
+        if new_stop <= current_stop or new_stop > curr_price - tick:
             return False
     else:
-        if (current_stop > 0 and new_stop >= current_stop) or new_stop <= curr_price:
+        if (current_stop > 0 and new_stop >= current_stop) or new_stop < curr_price + tick:
             return False
-    new_stop = precision_price(new_stop)
     if refresh_protective_stop_order(new_stop):
         trade_state['stop_loss_price'] = new_stop
         logging.info(f"{reason}: 已收紧服务端止损到 {new_stop}")
@@ -3280,103 +3284,39 @@ def update_stop_if_tighter(side, new_stop, reason, curr_price, signal_bar_15m=''
     return False
 
 
-def close_partial_position(reason, ratio=0.5, curr_price=None, signal_bar_15m=''):
-    """第一目标位半仓止盈，并将剩余仓位止损推到成本附近。"""
-    if trade_state.get('partial_taken') or not trade_state.get('has_position'):
-        return False
-    side = trade_state.get('side')
-    total_amount = price_to_float(trade_state.get('amount'))
-    if total_amount <= 0:
-        return False
-    if curr_price is None:
-        curr_price = get_latest_price()
+def strong_candle_stop_for_position(side, candle, tick):
+    if not candle:
+        return None
+    if side == 'long':
+        return price_to_float(candle.get('low')) - tick
+    return price_to_float(candle.get('high')) + tick
 
-    close_amount = total_amount * ratio
-    try:
-        close_amount = float(exchange.amount_to_precision(SYMBOL, close_amount))
-    except Exception:
-        close_amount = float(close_amount)
-    if close_amount <= 0 or close_amount >= total_amount:
-        return False
 
-    close_side = 'sell' if side == 'long' else 'buy'
-    try:
-        cancel_protective_stop_order(silent=True)
-        order = exchange.create_market_order(SYMBOL, close_side, close_amount)
-        actual_close_price = order.get('average', curr_price) or curr_price
-        taker_fee_rate = get_trading_fee_rate()
-        partial_fee = float(actual_close_price) * close_amount * taker_fee_rate
-        updated_open_fee = price_to_float(trade_state.get('open_fee')) + partial_fee
-        remaining_amount_raw = max(total_amount - close_amount, 0.0)
-        remaining_amount = remaining_amount_raw
-        try:
-            remaining_amount = float(exchange.amount_to_precision(SYMBOL, remaining_amount))
-        except Exception:
-            remaining_amount = float(remaining_amount)
+def profit_atr_lock_stop_for_position(side, entry, highest, lowest, atr):
+    if entry <= 0 or atr <= 0:
+        return None
+    max_profit = highest - entry if side == 'long' else entry - lowest
+    if max_profit <= 0:
+        return None
+    profit_atr = max_profit / atr
+    retain_ratio = None
+    for threshold, ratio in PROFIT_ATR_LOCK_TIERS:
+        if profit_atr >= threshold:
+            retain_ratio = ratio
+            break
+    if retain_ratio is None:
+        return None
 
-        position_after_partial = get_position_risk(side=side)
-        if position_after_partial and not position_after_partial.get('fetch_failed'):
-            exchange_remaining = abs(price_to_float(position_after_partial.get('position_amt')))
-            if exchange_remaining > POSITION_AMT_EPSILON:
-                remaining_amount = exchange_remaining
-        elif position_after_partial is None and remaining_amount <= POSITION_AMT_EPSILON:
-            trade_state['amount'] = 0
-            trade_state['open_fee'] = updated_open_fee
-            trade_state['partial_taken'] = True
-            reset_trade_state_after_external_close(
-                signal_bar_15m=signal_bar_15m,
-                reason="半仓止盈后交易所已无剩余有效仓位",
-                external_context={'external_close_order_id': extract_order_id(order)}
-            )
-            return True
-        elif remaining_amount <= POSITION_AMT_EPSILON and remaining_amount_raw > POSITION_AMT_EPSILON:
-            logging.warning(
-                f"半仓后剩余数量被交易所精度压成0，改用原始剩余数量: "
-                f"raw={remaining_amount_raw}, close_amount={close_amount}, total={total_amount}"
-            )
-            remaining_amount = remaining_amount_raw
-
-        if remaining_amount <= POSITION_AMT_EPSILON:
-            trade_state['amount'] = 0
-            trade_state['open_fee'] = updated_open_fee
-            trade_state['partial_taken'] = True
-            reset_trade_state_after_external_close(
-                signal_bar_15m=signal_bar_15m,
-                reason="半仓止盈后剩余数量低于有效持仓阈值",
-                external_context={'external_close_order_id': extract_order_id(order)}
-            )
-            return True
-        trade_state['amount'] = remaining_amount
-        trade_state['open_fee'] = updated_open_fee
-        trade_state['partial_taken'] = True
-
-        entry = price_to_float(trade_state.get('entry_price'))
-        breakeven_stop = entry
-        if side == 'long':
-            breakeven_stop = min(entry, curr_price - get_price_tick(curr_price))
-        else:
-            breakeven_stop = max(entry, curr_price + get_price_tick(curr_price))
-        breakeven_stop = precision_price(breakeven_stop)
-        if stop_price_is_still_valid(curr_price, breakeven_stop, side) and refresh_protective_stop_order(breakeven_stop):
-            trade_state['stop_loss_price'] = breakeven_stop
-        else:
-            refresh_protective_stop_order(trade_state['stop_loss_price'])
-
-        send_msg(
-            "ETH交易: 第一目标半仓止盈",
-            f"原因: {reason}\n方向: {side}\n平仓数量: {close_amount}\n剩余数量: {remaining_amount}\n"
-            f"平仓价: {actual_close_price}\n剩余止损: {trade_state.get('stop_loss_price')}\n15M信号时间: {signal_bar_15m}"
-        )
-        logging.info(
-            f"半仓止盈完成: reason={reason}, close_amount={close_amount}, "
-            f"remaining={remaining_amount}, stop={trade_state.get('stop_loss_price')}"
-        )
-        return True
-    except Exception as e:
-        logging.error(f"半仓止盈失败: {e}")
-        logging.error(traceback.format_exc())
-        refresh_protective_stop_order(trade_state.get('stop_loss_price'))
-        return False
+    if side == 'long':
+        stop = entry + max_profit * retain_ratio
+    else:
+        stop = entry - max_profit * retain_ratio
+    return {
+        'stop': stop,
+        'profit_atr': profit_atr,
+        'retain_ratio': retain_ratio,
+        'max_profit': max_profit,
+    }
 
 
 def apply_new_exit_rules(context, signal_bar_15m=''):
@@ -3392,74 +3332,91 @@ def apply_new_exit_rules(context, signal_bar_15m=''):
         return
     side = trade_state.get('side')
     curr_price = get_latest_price()
+    tick = get_price_tick(curr_price)
+    stop_candidates = []
 
-    # 确定出场周期：优先用入场时记录的 exit_tf，否则按策略周期查默认映射
+    def add_stop_candidate(stop, reason):
+        stop = price_to_float(stop)
+        if stop > 0:
+            stop_candidates.append((stop, reason))
+
     exit_tf = trade_state.get('entry_exit_tf') or STRATEGY_EXIT_TF.get(trade_state.get('entry_strategy_tf'), '15m')
     df_exit = context['dfs'].get(exit_tf)
-
-    # ====== 规则 1 & 2: 基于出场周期的硬性止盈信号 ======
+    exit_atr = 0.0
     if df_exit is not None:
         df_exit_closed = get_closed_df(df_exit, exit_tf, context['now_dt'])
-
-        # 规则 1: 出场周期出现大强线 → 止损收到大强线边界
-        #   - 同向大强线：止损收到大强线低点（做多）或高点（做空），防止回撤
-        #   - 反向大强线：取大强线边界和 ATR 缓冲价的更保险值
+        if len(df_exit_closed) > 0:
+            exit_atr = price_to_float(df_exit_closed.iloc[-1].get('atr'))
         large = latest_large_strong(df_exit_closed)
         if large:
-            if side == 'long':
-                # 同向大强阳线 → 稳健收紧到 low；反向大强阴线 → 取 low 和 ATR缓冲 中较高者
-                proposed = large['low'] if large['direction'] == 'long' else max(large['low'], curr_price - 0.3 * large['atr'])
-            else:
-                # 同向大强阴线 → 稳健收紧到 high；反向大强阳线 → 取 high 和 ATR缓冲 中较低者
-                proposed = large['high'] if large['direction'] == 'short' else min(large['high'], curr_price + 0.3 * large['atr'])
-            update_stop_if_tighter(side, proposed, f"{exit_tf}出现大强线，缩紧平仓价", curr_price, signal_bar_15m=signal_bar_15m)
-            return  # 大强线是最高优先级，命中后不再继续检查
+            add_stop_candidate(
+                strong_candle_stop_for_position(side, large, tick),
+                f"{exit_tf}出现大强{large.get('direction')}线，按强K结构收紧止损"
+            )
+
+        same_strong = latest_effective_strong(df_exit_closed, side)
+        if same_strong:
+            add_stop_candidate(
+                strong_candle_stop_for_position(side, same_strong, tick),
+                f"{exit_tf}出现同向{same_strong.get('kind')}强K，按强K结构收紧止损"
+            )
 
         # 规则 2: 出场周期出现反向强K → 收紧止盈到该强K线边界
         opposite = 'short' if side == 'long' else 'long'
         strong_opposite = latest_effective_strong(df_exit_closed, opposite)
         if strong_opposite:
-            # 做多遇到反向强阴线 → 止损推到阴线 low；做空遇到反向强阳线 → 止损推到阳线 high
-            proposed = strong_opposite['low'] if side == 'long' else strong_opposite['high']
-            update_stop_if_tighter(side, proposed, f"{exit_tf}出现反向强K，缩紧止盈", curr_price, signal_bar_15m=signal_bar_15m)
+            add_stop_candidate(
+                strong_candle_stop_for_position(side, strong_opposite, tick),
+                f"{exit_tf}出现反向{strong_opposite.get('kind')}强K，按强K结构收紧止损"
+            )
+
+    entry = price_to_float(trade_state.get('entry_price'))
+    highest = price_to_float(trade_state.get('highest_price'))
+    lowest = price_to_float(trade_state.get('lowest_price'))
+    profit_lock = profit_atr_lock_stop_for_position(side, entry, highest, lowest, exit_atr)
+    if profit_lock:
+        add_stop_candidate(
+            profit_lock['stop'],
+            (
+                f"最高浮盈达到{profit_lock['profit_atr']:.2f}ATR，"
+                f"至少保留{profit_lock['retain_ratio']:.0%}利润"
+            )
+        )
 
     # ====== 规则 3: 第一目标位半仓止盈 ======
     target = price_to_float(trade_state.get('entry_sr_target'))
-    entry = price_to_float(trade_state.get('entry_price'))
     risk = price_to_float(trade_state.get('entry_initial_risk'))
     # 如果入场时没有设置目标价，用 2R 盈亏比兜底
     if target <= 0 and entry > 0 and risk > 0:
         target = entry + 2 * risk if side == 'long' else entry - 2 * risk
     if target > 0:
         if side == 'long' and curr_price >= target:
-            # 半仓止盈，剩余仓位止损推到成本附近（取 entry 和 target-0.25R 中较高者）
-            if close_partial_position("达到第一目标位，平仓50%并推保护止损", curr_price=curr_price, signal_bar_15m=signal_bar_15m):
-                return
-            update_stop_if_tighter(side, max(entry, target - 0.25 * risk), "达到第一目标位，剩余仓位止损推至成本/目标附近", curr_price, signal_bar_15m=signal_bar_15m)
+            add_stop_candidate(max(entry, target - 0.25 * risk), "达到第一目标位，收紧保护止损")
         elif side == 'short' and curr_price <= target:
-            # 半仓止盈，剩余仓位止损推到成本附近（取 entry 和 target+0.25R 中较低者）
-            if close_partial_position("达到第一目标位，平仓50%并推保护止损", curr_price=curr_price, signal_bar_15m=signal_bar_15m):
-                return
-            update_stop_if_tighter(side, min(entry, target + 0.25 * risk), "达到第一目标位，剩余仓位止损推至成本/目标附近", curr_price, signal_bar_15m=signal_bar_15m)
+            add_stop_candidate(min(entry, target + 0.25 * risk), "达到第一目标位，收紧保护止损")
 
     # ====== 规则 4: 靠近有效阻力/支撑区，缩紧止盈 ======
     df_4h_closed = get_closed_df(context['dfs']['4h'], '4h', context['now_dt'])
-    if len(df_4h_closed) == 0:
+    if len(df_4h_closed) > 0:
+        atr_4h = price_to_float(df_4h_closed.iloc[-1].get('atr'))
+        near_buffer = SUP_RES_NEAR_ATR * atr_4h
+        zones = context.get('zones', {})
+        if side == 'long':
+            resistance = nearest_opposite_zone(zones, side, curr_price - near_buffer)
+            if resistance and curr_price >= resistance['lower'] - near_buffer:
+                add_stop_candidate(resistance['lower'] - 0.1 * atr_4h, "靠近有效阻力区，缩紧止盈")
+        else:
+            support = nearest_opposite_zone(zones, side, curr_price + near_buffer)
+            if support and curr_price <= support['upper'] + near_buffer:
+                add_stop_candidate(support['upper'] + 0.1 * atr_4h, "靠近有效支撑区，缩紧止盈")
+
+    if not stop_candidates:
         return
-    atr_4h = price_to_float(df_4h_closed.iloc[-1].get('atr'))
-    # 靠近区间的判定缓冲区（基于 ATR 的比例）
-    near_buffer = SUP_RES_NEAR_ATR * atr_4h
-    zones = context.get('zones', {})
     if side == 'long':
-        # 向前方（上方）找最近的有效阻力区，价格接近时收紧止盈
-        resistance = nearest_opposite_zone(zones, side, curr_price - near_buffer)
-        if resistance and curr_price >= resistance['lower'] - near_buffer:
-            update_stop_if_tighter(side, max(trade_state['stop_loss_price'], resistance['lower'] - 0.1 * atr_4h), "靠近有效阻力区，缩紧止盈", curr_price, signal_bar_15m=signal_bar_15m)
+        best_stop, reason = max(stop_candidates, key=lambda item: item[0])
     else:
-        # 向前方（下方）找最近的有效支撑区，价格接近时收紧止盈
-        support = nearest_opposite_zone(zones, side, curr_price + near_buffer)
-        if support and curr_price <= support['upper'] + near_buffer:
-            update_stop_if_tighter(side, min(trade_state['stop_loss_price'], support['upper'] + 0.1 * atr_4h), "靠近有效支撑区，缩紧止盈", curr_price, signal_bar_15m=signal_bar_15m)
+        best_stop, reason = min(stop_candidates, key=lambda item: item[0])
+    update_stop_if_tighter(side, best_stop, reason, curr_price, signal_bar_15m=signal_bar_15m)
 
 
 def monitor_position_new(context, signal_bar_15m='', allow_strategy_close=False):
