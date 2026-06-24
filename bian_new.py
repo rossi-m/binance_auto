@@ -106,6 +106,7 @@ LIQUIDATION_SAFE_BUFFER_RATIO = 0.003  # 止损价和强平价之间至少保留
 ESTIMATED_LIQUIDATION_GUARD_RATIO = 0.8  # 用于开仓前估算强平距离，取 0.8 / 杠杆，故意保守一点
 POSITION_AMT_EPSILON = 1e-8  # 持仓数量小于该阈值视为0，避免浮点噪音误判
 EXTERNAL_CLOSE_CONFIRM_MISS_COUNT = 3  # 连续3轮查不到仓位才触发外部平仓重置，降低瞬时接口波动误判
+CONDITIONAL_ORDER_CLEANUP_INTERVAL_SECONDS = 60  # 无本地仓位时最多每60秒清理一次残留条件委托
 EXCHANGE_HTTP_TIMEOUT_MS = 10000  # 单次交易所HTTP请求最多等待10秒，避免底层请求长时间挂起
 FETCH_DF_TASK_TIMEOUT_SECONDS = 15  # 单个周期抓取任务最多等待15秒，超过就跳过本轮
 FETCH_DF_SLOW_LOG_SECONDS = 5  # 单次抓K线+算指标超过5秒就记慢查询日志
@@ -281,6 +282,7 @@ trade_state = {
     'max_seen_bar_15m': '',       # 运行期间见过的最大15M信号时间，防止接口回跳旧K线后被当成新信号
     'position_miss_count': 0  # 连续几轮未在交易所查到仓位，用于避免误判“外部平仓”
 }
+last_conditional_order_cleanup_monotonic = 0.0
 
 # 初始化币安合约 API
 exchange = ccxt.binance({
@@ -356,13 +358,17 @@ def extract_order_id(order):
     candidates = [
         order.get('id'),
         order.get('orderId'),
-        order.get('clientOrderId')
+        order.get('algoId'),
+        order.get('clientOrderId'),
+        order.get('clientAlgoId')
     ]
     if isinstance(info, dict):
         candidates.extend([
             info.get('orderId'),
             info.get('id'),
-            info.get('clientOrderId')
+            info.get('algoId'),
+            info.get('clientOrderId'),
+            info.get('clientAlgoId')
         ])
 
     for candidate in candidates:
@@ -400,6 +406,7 @@ def extract_order_timestamp_ms(order):
         order.get('timestamp'),
         order.get('lastTradeTimestamp'),
         info.get('updateTime'),
+        info.get('createTime'),
         info.get('workingTime'),
         info.get('time')
     ]
@@ -435,6 +442,32 @@ def extract_order_stop_price(order):
         except Exception:
             continue
     return None
+
+
+def extract_order_side_upper(order):
+    """统一提取订单方向，返回 BUY / SELL / ''。"""
+    if not isinstance(order, dict):
+        return ''
+    info = order.get('info', {})
+    if not isinstance(info, dict):
+        info = {}
+    return str(order.get('side') or info.get('side') or '').strip().upper()
+
+
+def extract_order_type_upper(order):
+    """统一提取订单类型，返回交易所大写类型。"""
+    if not isinstance(order, dict):
+        return ''
+    info = order.get('info', {})
+    if not isinstance(info, dict):
+        info = {}
+    return str(
+        order.get('type') or
+        order.get('orderType') or
+        info.get('type') or
+        info.get('orderType') or
+        ''
+    ).strip().upper()
 
 
 def format_order_id_lines(open_order_id='', close_order_id='', stop_order_id=''):
@@ -789,7 +822,6 @@ def ensure_stop_price_safe(entry_price, stop_price, side, liquidation_price=None
         liq = estimate_liquidation_price(entry_price, side)
         source = 'estimated'
 
-    #止损价格和强平价格保持的距离
     safe_buffer = entry_price * LIQUIDATION_SAFE_BUFFER_RATIO
     adjusted_stop = float(stop_price)
     if side == 'long':
@@ -860,13 +892,13 @@ def is_close_position_conditional_order(order, side=None):
     if not close_position and not reduce_only:
         return False
 
-    order_type = str(order.get('type') or info.get('type') or '').strip().upper()
+    order_type = extract_order_type_upper(order)
     if order_type not in ('STOP', 'STOP_MARKET', 'TAKE_PROFIT', 'TAKE_PROFIT_MARKET'):
         return False
 
     if side:
         expected_side = 'SELL' if side == 'long' else 'BUY'
-        order_side = str(order.get('side') or info.get('side') or '').strip().upper()
+        order_side = extract_order_side_upper(order)
         if order_side != expected_side:
             return False
 
@@ -941,6 +973,22 @@ def normalize_raw_open_order(raw_order):
     }
 
 
+def normalize_raw_algo_order(raw_order):
+    """把 Binance futures openAlgoOrders 里的条件委托包装成 CCXT-like 结构。"""
+    if not isinstance(raw_order, dict):
+        return raw_order
+    return {
+        'id': raw_order.get('algoId') or raw_order.get('clientAlgoId'),
+        'type': raw_order.get('orderType') or raw_order.get('type'),
+        'side': raw_order.get('side'),
+        'timestamp': raw_order.get('createTime') or raw_order.get('updateTime'),
+        'stopPrice': raw_order.get('triggerPrice') or raw_order.get('stopPrice'),
+        'closePosition': raw_order.get('closePosition'),
+        'reduceOnly': raw_order.get('reduceOnly'),
+        'info': raw_order
+    }
+
+
 def fetch_raw_future_open_orders():
     """直接调用币安U本位未成交单接口，补齐CCXT统一接口漏掉的条件单。"""
     method = getattr(exchange, 'fapiPrivateGetOpenOrders', None)
@@ -954,6 +1002,21 @@ def fetch_raw_future_open_orders():
     if not isinstance(raw_orders, list):
         return []
     return [normalize_raw_open_order(order) for order in raw_orders]
+
+
+def fetch_raw_future_open_algo_orders():
+    """直接调用 Binance U本位 openAlgoOrders，补齐 STOP_MARKET 条件委托。"""
+    method = getattr(exchange, 'fapiPrivateGetOpenAlgoOrders', None)
+    if method is None:
+        return []
+    try:
+        raw_orders = method({'symbol': get_exchange_symbol_id()})
+    except Exception as e:
+        logging.warning(f"原始接口查询U本位未成交algo条件单失败: {e}")
+        return None
+    if not isinstance(raw_orders, list):
+        return []
+    return [normalize_raw_algo_order(order) for order in raw_orders]
 
 
 def fetch_open_close_position_orders(side=None):
@@ -975,6 +1038,19 @@ def fetch_open_close_position_orders(side=None):
     if raw_open_orders:
         known_order_ids = {extract_order_id(order) for order in open_orders if extract_order_id(order)}
         for raw_order in raw_open_orders:
+            raw_order_id = extract_order_id(raw_order)
+            if raw_order_id and raw_order_id in known_order_ids:
+                continue
+            open_orders.append(raw_order)
+
+    raw_algo_orders = fetch_raw_future_open_algo_orders()
+    if raw_algo_orders is None:
+        if unified_fetch_failed and not open_orders:
+            return None
+        raw_algo_orders = []
+    if raw_algo_orders:
+        known_order_ids = {extract_order_id(order) for order in open_orders if extract_order_id(order)}
+        for raw_order in raw_algo_orders:
             raw_order_id = extract_order_id(raw_order)
             if raw_order_id and raw_order_id in known_order_ids:
                 continue
@@ -1026,6 +1102,18 @@ def cancel_all_open_orders_for_symbol(silent=False):
     else:
         error_messages.append("raw cancel all failed: fapiPrivateDeleteAllOpenOrders unavailable")
 
+    raw_algo_method = getattr(exchange, 'fapiPrivateDeleteAlgoOpenOrders', None)
+    if raw_algo_method is not None:
+        try:
+            raw_algo_method({'symbol': get_exchange_symbol_id()})
+            cancel_succeeded = True
+            if not silent:
+                logging.warning(f"已通过原始接口撤销 {SYMBOL} 全部未成交algo条件单")
+        except Exception as raw_algo_error:
+            error_messages.append(f"raw cancel all algo failed: {format_exception_message(raw_algo_error)}")
+    else:
+        error_messages.append("raw cancel all algo failed: fapiPrivateDeleteAlgoOpenOrders unavailable")
+
     if cancel_succeeded:
         clear_local_stop_order_state()
         return True
@@ -1034,6 +1122,144 @@ def cancel_all_open_orders_for_symbol(silent=False):
     if not silent:
         logging.warning(f"批量撤销 {SYMBOL} 未成交单失败: {trade_state['last_stop_order_refresh_error']}")
     return False
+
+
+def cancel_conditional_orders(orders, silent=False, reason='清理残留条件委托'):
+    """只撤销传入的 closePosition/reduceOnly 条件委托，不影响普通挂单。"""
+    algo_order_ids = []
+    regular_order_ids = []
+    order_ids = []
+    for order in orders or []:
+        order_id = extract_order_id(order)
+        if order_id:
+            order_ids.append(order_id)
+            info = order.get('info', {}) if isinstance(order, dict) else {}
+            if isinstance(info, dict) and info.get('algoId'):
+                algo_order_ids.append(order_id)
+            else:
+                regular_order_ids.append(order_id)
+    order_ids = list(dict.fromkeys(order_ids))
+    if not order_ids:
+        return True
+
+    cancel_failed = False
+    if algo_order_ids:
+        method = getattr(exchange, 'fapiPrivateDeleteAlgoOpenOrders', None)
+        if method is None:
+            cancel_failed = True
+            trade_state['last_stop_order_refresh_error'] = 'fapiPrivateDeleteAlgoOpenOrders unavailable'
+            if not silent:
+                logging.warning(f"{reason}: 无法批量撤销algo条件委托，接口不可用")
+        else:
+            try:
+                method({'symbol': get_exchange_symbol_id()})
+                if not silent:
+                    logging.info(f"{reason}: 已批量撤销algo条件委托 {algo_order_ids}")
+            except Exception as e:
+                cancel_failed = True
+                trade_state['last_stop_order_refresh_error'] = format_exception_message(e)
+                if not silent:
+                    logging.warning(f"{reason}: 批量撤销algo条件委托失败({algo_order_ids}): {trade_state['last_stop_order_refresh_error']}")
+
+    for order_id in list(dict.fromkeys(regular_order_ids)):
+        try:
+            exchange.cancel_order(order_id, SYMBOL)
+            if not silent:
+                logging.info(f"{reason}: 已撤销条件委托 {order_id}")
+        except Exception as e:
+            error_text = format_exception_message(e)
+            trade_state['last_stop_order_refresh_error'] = error_text
+            if is_order_already_absent_error(e):
+                if not silent:
+                    logging.warning(f"{reason}: 条件委托已不存在，按成功处理({order_id}): {error_text}")
+                continue
+            cancel_failed = True
+            if not silent:
+                logging.warning(f"{reason}: 撤销条件委托失败({order_id}): {error_text}")
+
+    return not cancel_failed
+
+
+def cancel_all_close_position_conditional_orders(silent=False, reason='无仓位清理残留条件委托'):
+    """没有交易所仓位时，清掉本交易对所有平仓类条件委托。"""
+    matched_orders = fetch_open_close_position_orders(side=None)
+    if matched_orders is None:
+        return False
+    if not matched_orders:
+        clear_local_stop_order_state()
+        return True
+
+    ok = cancel_conditional_orders(matched_orders, silent=silent, reason=reason)
+    if ok:
+        clear_local_stop_order_state()
+    return ok
+
+
+def reconcile_conditional_orders_for_position(side, silent=False):
+    """有仓位时只保留当前方向一张 STOP/STOP_MARKET，清理反方向和重复条件委托。"""
+    matched_orders = fetch_open_close_position_orders(side=None)
+    if matched_orders is None:
+        return False
+
+    expected_side = 'SELL' if side == 'long' else 'BUY'
+    same_side_stops = []
+    orders_to_cancel = []
+    for order in matched_orders:
+        order_side = extract_order_side_upper(order)
+        order_type = extract_order_type_upper(order)
+        if order_side != expected_side:
+            orders_to_cancel.append(order)
+            continue
+        if order_type in ('STOP', 'STOP_MARKET'):
+            same_side_stops.append(order)
+        else:
+            orders_to_cancel.append(order)
+
+    active_order = pick_active_protective_stop_order(
+        same_side_stops,
+        preferred_order_id=trade_state.get('stop_order_id', '')
+    )
+    active_order_id = extract_order_id(active_order) if active_order else ''
+    for order in same_side_stops:
+        if extract_order_id(order) != active_order_id:
+            orders_to_cancel.append(order)
+
+    if orders_to_cancel:
+        order_ids = [extract_order_id(order) or 'unknown' for order in orders_to_cancel]
+        if not silent:
+            logging.warning(f"清理重复/反方向条件委托: side={side}, order_ids={order_ids}")
+        if not cancel_conditional_orders(orders_to_cancel, silent=silent, reason='清理重复/反方向条件委托'):
+            return False
+
+    if active_order:
+        active_stop_price = extract_order_stop_price(active_order)
+        trade_state['stop_order_id'] = active_order_id
+        trade_state['stop_order_price'] = float(active_stop_price or 0.0)
+    else:
+        clear_local_stop_order_state()
+    return True
+
+
+def cleanup_orphan_conditional_orders_if_needed(force=False, silent=True):
+    """本地无仓位时定期清理残留条件委托；有交易所仓位则不贸然撤单。"""
+    global last_conditional_order_cleanup_monotonic
+    now = time.monotonic()
+    if not force and (now - last_conditional_order_cleanup_monotonic) < CONDITIONAL_ORDER_CLEANUP_INTERVAL_SECONDS:
+        return True
+
+    position_risk = get_position_risk()
+    if position_risk and position_risk.get('fetch_failed'):
+        logging.warning("清理残留条件委托前无法确认交易所仓位，本轮跳过，避免误撤")
+        return False
+    if position_risk is not None:
+        logging.warning(
+            f"本地无仓位但交易所仍有仓位，跳过无仓位条件委托清理: "
+            f"side={position_risk.get('side')}, amount={position_risk.get('position_amt')}"
+        )
+        return False
+
+    last_conditional_order_cleanup_monotonic = now
+    return cancel_all_close_position_conditional_orders(silent=silent)
 
 
 def pick_active_protective_stop_order(orders, preferred_order_id=''):
@@ -1184,8 +1410,10 @@ def cancel_protective_stop_order(silent=False):
     local_stop_order_id_before_sync = str(trade_state.get('stop_order_id', '') or '')
     sync_result = sync_protective_stop_order_state(side=side, silent=True) if side else None
     stop_order_ids = []
+    synced_orders = []
     if sync_result is not None:
-        stop_order_ids = [extract_order_id(order) for order in sync_result['orders'] if extract_order_id(order)]
+        synced_orders = list(sync_result['orders'])
+        stop_order_ids = [extract_order_id(order) for order in synced_orders if extract_order_id(order)]
 
     local_stop_order_id = str(trade_state.get('stop_order_id', '') or '') or local_stop_order_id_before_sync
     if local_stop_order_id and local_stop_order_id not in stop_order_ids:
@@ -1195,6 +1423,18 @@ def cancel_protective_stop_order(silent=False):
     if not stop_order_ids:
         clear_local_stop_order_state()
         return True
+
+    if synced_orders:
+        if not cancel_conditional_orders(synced_orders, silent=silent, reason='撤销旧服务端止损单'):
+            return False
+        local_only_ids = [
+            order_id for order_id in stop_order_ids
+            if order_id not in {extract_order_id(order) for order in synced_orders if extract_order_id(order)}
+        ]
+        stop_order_ids = local_only_ids
+        if not stop_order_ids:
+            clear_local_stop_order_state()
+            return True
 
     cancel_failed = False
     for stop_order_id in stop_order_ids:
@@ -1437,6 +1677,7 @@ def reset_trade_state_after_external_close(signal_bar_15m='', reason='检测到�
     )
 
     post_exit_processed_bar_15m = exit_signal_bar_15m or trade_state.get('last_processed_bar_15m', '')
+    cancel_all_close_position_conditional_orders(silent=True, reason='外部平仓后清理残留条件委托')
     trade_state.update({
         'has_position': False,
         'side': None,
@@ -1615,8 +1856,6 @@ def open_order(side, price, sl_price, state_4h, state_1h, state_15m, signal_bar_
 
     # 开仓前先用“保守估算强平价”预校验止损，防止止损本来就落到强平外面
     estimated_safe_stop, estimated_stop_meta = ensure_stop_price_safe(price, sl_price, side, liquidation_price=None)
-
-    # 验证止损价格是否有效
     if not stop_price_is_still_valid(price, estimated_safe_stop, side):
         logging.warning(
             f"拒绝开仓：预估强平价过近，止损无效 side={side}, "
@@ -1791,6 +2030,7 @@ def close_position(reason, curr_price=None, signal_bar_15m='', trigger_label='')
         order = exchange.create_market_order(SYMBOL, side, trade_state['amount'])
         close_order_id = extract_order_id(order)
         trade_state['close_order_id'] = close_order_id
+        cancel_all_close_position_conditional_orders(silent=True, reason='平仓后清理残留条件委托')
         
         # 为了获取绝对准确的净利润，平仓后再次查询账户余额
         # (稍微休眠一下等待交易所结算完成)
@@ -1884,6 +2124,7 @@ def close_position(reason, curr_price=None, signal_bar_15m='', trigger_label='')
         send_msg(f"ETH交易: 平仓通知", msg)
 
         post_exit_processed_bar_15m = exit_signal_bar_15m or trade_state.get('last_processed_bar_15m', '')
+        cancel_all_close_position_conditional_orders(silent=True, reason='平仓后再次清理残留条件委托')
         trade_state.update({
             'has_position': False,
             'side': None,
@@ -3320,14 +3561,6 @@ def profit_atr_lock_stop_for_position(side, entry, highest, lowest, atr):
 
 
 def apply_new_exit_rules(context, signal_bar_15m=''):
-    """
-    持有时每轮调用的动态出场规则，按优先级依次检查：
-
-    1. 大强线止盈收紧  — 出场周期出现大强K线，把止损推到大强线边界
-    2. 反向强K止盈     — 出场周期出现反向强K，立刻收紧止盈到该K线边界
-    3. 第一目标位半仓   — 价格到达预设目标，先平 50%，剩余止损推到成本/目标附近
-    4. 阻力/支撑区止盈  — 价格靠近前方关键阻力/支撑区，缩紧止损保护利润
-    """
     if not trade_state.get('has_position'):
         return
     side = trade_state.get('side')
@@ -3361,7 +3594,6 @@ def apply_new_exit_rules(context, signal_bar_15m=''):
                 f"{exit_tf}出现同向{same_strong.get('kind')}强K，按强K结构收紧止损"
             )
 
-        # 规则 2: 出场周期出现反向强K → 收紧止盈到该强K线边界
         opposite = 'short' if side == 'long' else 'long'
         strong_opposite = latest_effective_strong(df_exit_closed, opposite)
         if strong_opposite:
@@ -3383,19 +3615,16 @@ def apply_new_exit_rules(context, signal_bar_15m=''):
             )
         )
 
-    # ====== 规则 3: 第一目标位半仓止盈 ======
     target = price_to_float(trade_state.get('entry_sr_target'))
     risk = price_to_float(trade_state.get('entry_initial_risk'))
-    # 如果入场时没有设置目标价，用 2R 盈亏比兜底
     if target <= 0 and entry > 0 and risk > 0:
         target = entry + 2 * risk if side == 'long' else entry - 2 * risk
     if target > 0:
         if side == 'long' and curr_price >= target:
-            add_stop_candidate(max(entry, target - 0.25 * risk), "达到第一目标位，收紧保护止损")
+            add_stop_candidate(max(entry, target - 0.5 * risk), "达到第一目标位，收紧保护止损")
         elif side == 'short' and curr_price <= target:
-            add_stop_candidate(min(entry, target + 0.25 * risk), "达到第一目标位，收紧保护止损")
+            add_stop_candidate(min(entry, target + 0.5 * risk), "达到第一目标位，收紧保护止损")
 
-    # ====== 规则 4: 靠近有效阻力/支撑区，缩紧止盈 ======
     df_4h_closed = get_closed_df(context['dfs']['4h'], '4h', context['now_dt'])
     if len(df_4h_closed) > 0:
         atr_4h = price_to_float(df_4h_closed.iloc[-1].get('atr'))
@@ -3404,11 +3633,11 @@ def apply_new_exit_rules(context, signal_bar_15m=''):
         if side == 'long':
             resistance = nearest_opposite_zone(zones, side, curr_price - near_buffer)
             if resistance and curr_price >= resistance['lower'] - near_buffer:
-                add_stop_candidate(resistance['lower'] - 0.1 * atr_4h, "靠近有效阻力区，缩紧止盈")
+                add_stop_candidate(resistance['lower'] - 0.4 * atr_4h, "靠近有效阻力区，缩紧止盈")
         else:
             support = nearest_opposite_zone(zones, side, curr_price + near_buffer)
             if support and curr_price <= support['upper'] + near_buffer:
-                add_stop_candidate(support['upper'] + 0.1 * atr_4h, "靠近有效支撑区，缩紧止盈")
+                add_stop_candidate(support['upper'] + 0.4 * atr_4h, "靠近有效支撑区，缩紧止盈")
 
     if not stop_candidates:
         return
@@ -3424,6 +3653,7 @@ def monitor_position_new(context, signal_bar_15m='', allow_strategy_close=False)
     try:
         side = trade_state.get('side')
         if side not in ('long', 'short'):
+            cleanup_orphan_conditional_orders_if_needed(silent=True)
             return
 
         position_risk = get_position_risk(side=side)
@@ -3451,7 +3681,7 @@ def monitor_position_new(context, signal_bar_15m='', allow_strategy_close=False)
                 'stop_order_id_before_cancel': trade_state.get('stop_order_id', ''),
                 'stop_order_price_before_cancel': trade_state.get('stop_order_price', 0.0)
             }
-            cancel_protective_stop_order(silent=True)
+            cancel_all_close_position_conditional_orders(silent=True, reason='确认无仓位后清理残留条件委托')
             reset_trade_state_after_external_close(
                 signal_bar_15m=signal_bar_15m,
                 reason="检测到交易所实际已无仓位，可能是服务端止损或人工操作已成交，本地状态已重置",
@@ -3461,6 +3691,7 @@ def monitor_position_new(context, signal_bar_15m='', allow_strategy_close=False)
 
         trade_state['position_miss_count'] = 0
         trade_state['liquidation_price'] = position_risk.get('liquidation_price') or 0.0
+        reconcile_conditional_orders_for_position(side, silent=True)
         trade_state['close_cond_4h'] = context['trend_states'].get('4h', {}).get('summary', '')
         trade_state['close_cond_1h'] = context['trend_states'].get('1h', {}).get('summary', '')
         trade_state['close_cond_15m'] = context['trend_states'].get('15m', {}).get('summary', '')
@@ -3549,6 +3780,12 @@ def run_strategy():
 
     is_new_signal_5m = bool(signal_guard_5m['is_new'])
     is_new_signal_15m = bool(signal_guard_15m.get('valid') and signal_guard_15m.get('is_new'))
+
+    if not trade_state.get('has_position'):
+        if not cleanup_orphan_conditional_orders_if_needed(silent=True):
+            logging.warning("无本地仓位时条件委托/交易所仓位状态未清理干净，本轮跳过开仓")
+            return
+
     #判断各个周期的趋势条件和4h的支撑和阻挡区间
     context = build_context(dfs, server_now_dt)
 
@@ -3650,10 +3887,42 @@ def run_strategy():
         trade_state['last_processed_bar_15m'] = signal_bar_15m
 
 
+def cleanup_conditional_orders_once():
+    """手动清理入口：无仓位清全部平仓条件单；有仓位只保留当前方向一张止损单。"""
+    position_risk = get_position_risk()
+    if position_risk and position_risk.get('fetch_failed'):
+        logging.error(f"无法确认交易所仓位，已放弃清理条件委托: {position_risk.get('error')}")
+        return False
+    if position_risk is None:
+        ok = cancel_all_close_position_conditional_orders(silent=False, reason='手动无仓位清理残留条件委托')
+        logging.info(f"手动无仓位条件委托清理完成: ok={ok}")
+        return ok
+
+    side = position_risk.get('side')
+    trade_state['side'] = side
+    ok = reconcile_conditional_orders_for_position(side, silent=False)
+    logging.info(
+        f"手动持仓条件委托归并完成: ok={ok}, side={side}, amount={position_risk.get('position_amt')}, "
+        f"active_stop_order_id={trade_state.get('stop_order_id')}, active_stop={trade_state.get('stop_order_price')}"
+    )
+    return ok
+
+
 # ==========================================
 # 4. 程序入口
 # ==========================================
 if __name__ == '__main__':
+    if '--cleanup-conditions' in sys.argv:
+        try:
+            current_time_str = get_server_time_str()
+            print("网络连通成功！服务器时间:", current_time_str)
+            ok = cleanup_conditional_orders_once()
+            sys.exit(0 if ok else 1)
+        except Exception:
+            print(traceback.format_exc())
+            logging.error(f"手动清理条件委托失败:\n{traceback.format_exc()}")
+            sys.exit(1)
+
     try:
         current_time_str = get_server_time_str()
         print("网络连通成功！服务器时间:", current_time_str)
