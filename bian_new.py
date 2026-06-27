@@ -94,7 +94,7 @@ EMAIL_RECEIVER = os.getenv('EMAIL_RECEIVER', EMAIL_SENDER).strip()  # 默认把�
 
 # --- 交易策略参数 ---
 SYMBOL = 'ETH/USDT'  # 设置交易对为ETH/USDT
-LEVERAGE = 20  # 设置合约的杠杆倍数为20倍
+LEVERAGE = 10  # 设置合约的杠杆倍数为10倍
 MARGIN_RATE = 0.6  # 设置每次开仓使用的保证金比例，使用余额的60%
 STOP_WORKING_TYPE = 'MARK_PRICE'  # 服务端条件止损按标记价格触发，避免只看最新成交价带来的偏差
 STOP_ORDER_CANCEL_CONFIRM_RETRIES = 5  # 撤掉旧条件单后，最多确认 5 次交易所侧是否真的消失
@@ -117,7 +117,7 @@ MAX_SIGNAL_BAR_STALENESS_SECONDS = 45 * 60  # 15M信号K线最多允许落后45�
 
 # --- 新版策略参数 ---
 # 策略会参与打分和选信号的主周期；越靠前代表越高周期、权重通常越重。
-STRATEGY_TIMEFRAMES = ('4h', '1h', '15m')
+STRATEGY_TIMEFRAMES = ('4h', '1h')
 # 每个主周期对应的上级背景周期，用来判断大趋势环境。
 STRATEGY_BACKGROUND_TF = {'15m': '1h', '1h': '4h', '4h': '1d'}
 # 每个主周期对应的低级别触发周期，用来找更细的入场触发K线。
@@ -195,6 +195,12 @@ LARGE_STRONG_RANGE_ATR_RATIO = 2.25
 SYNTHETIC_STRONG_MIN_BARS = 2
 # 合成强K最多合并的K线数量，防止把太长一段震荡误判为强K。
 SYNTHETIC_STRONG_MAX_BARS = 3
+# 是否允许普通单根强K作为开仓触发。最新回测仅在反向强K突破优先时打开该分支。
+ENABLE_SINGLE_STRONG_ENTRY = True
+# 是否允许 2-3 根合成强K作为开仓触发。回测中合成强K止损偏宽，默认关闭；仍保留强K用于持仓止损收紧。
+ENABLE_SYNTHETIC_STRONG_ENTRY = False
+# 同方向强K触发和反向强K突破触发的检查顺序。大强K突破始终优先于这两个分支。
+ENTRY_TRIGGER_PRIORITY = ('opposite_strong_break', 'strong_candle')
 # 回看多少根K线检查是否出现过反向强K，用来过滤方向冲突。
 OPPOSITE_STRONG_LOOKBACK = 24
 # 检查最近几根强K是否多空来回切换，避免在剧烈震荡里开仓。
@@ -209,6 +215,8 @@ NORMAL_STOP_BUFFER_ATR = 0.2
 MIN_EXPECTED_PROFIT_ATR = 0.25
 # 预期利润至少要覆盖手续费的倍数，防止收益空间被手续费吃掉。
 MIN_EXPECTED_PROFIT_FEE_MULTIPLIER = 3.0
+# 市价入场最大追价比例，按候选预期利润空间计算，避免把大部分利润让给入场滑点。
+ENTRY_MAX_SLIPPAGE_PROFIT_RATIO = 0.15
 # 最高浮盈达到多少 ATR 后，至少保留多少比例的最高浮盈。
 PROFIT_ATR_LOCK_TIERS = (
     (4.0, 0.90),
@@ -292,7 +300,7 @@ exchange = ccxt.binance({
     'enableRateLimit': True,  # 开启内置的速率限制功能，防止请求频率过高被封IP
     'timeout': EXCHANGE_HTTP_TIMEOUT_MS,  # 给交易所HTTP请求设置硬超时，避免网络卡死时无限等待
 })
-exchange.enable_demo_trading(True)  # 开启模拟交易模式（测试网），不会产生真实交易
+# exchange.enable_demo_trading(True)  # 开启模拟交易模式（测试网），不会产生真实交易
 
 # 日志配置
 logging.basicConfig(
@@ -1914,6 +1922,27 @@ def open_order(side, price, sl_price, state_4h, state_1h, state_15m, signal_bar_
             )
             return False
 
+        target = price_to_float(entry_meta.get('sr_target'))
+        profit_check_atr = price_to_float(entry_meta.get('profit_check_atr'))
+        target_ok, target_reason = target_profit_still_valid(side, actual_price, actual_safe_stop, target, profit_check_atr)
+        if not target_ok:
+            logging.error(f"开仓后发现目标位对实际成交价无效，立即撤退: {target_reason}")
+            panic_side = 'sell' if side == 'long' else 'buy'
+            panic_close_order = exchange.create_market_order(SYMBOL, panic_side, amount)
+            panic_close_order_id = extract_order_id(panic_close_order)
+            order_id_lines = format_order_id_lines(
+                open_order_id=open_order_id,
+                close_order_id=panic_close_order_id
+            )
+            order_id_suffix = f"\n{order_id_lines}" if order_id_lines else ''
+            send_msg(
+                "ETH交易: ⚠️开仓后立即撤退",
+                f"原因: 目标位对实际成交价已无有效利润空间\n方向: {side}\n"
+                f"入场价: {actual_price}\n止损: {actual_safe_stop}\n目标位: {target}\n{target_reason}"
+                f"{order_id_suffix}"
+            )
+            return False
+
         # 计算开仓手续费 (参考 test.py 方式)
         taker_fee_rate = get_trading_fee_rate()
         open_fee = actual_price * amount * taker_fee_rate
@@ -2464,6 +2493,23 @@ def latest_effective_strong(df_closed, direction):
     return None
 
 
+def latest_entry_strong(df_closed, direction):
+    if df_closed is None or len(df_closed) == 0:
+        return None
+    end_idx = len(df_closed) - 1
+    if ENABLE_SINGLE_STRONG_ENTRY:
+        single = simple_strong_candle(df_closed.iloc[end_idx], direction)
+        if single:
+            return single
+    if not ENABLE_SYNTHETIC_STRONG_ENTRY:
+        return None
+    for bars_count in range(SYNTHETIC_STRONG_MIN_BARS, SYNTHETIC_STRONG_MAX_BARS + 1):
+        synthetic = composite_strong_candle(df_closed, end_idx, bars_count, direction)
+        if synthetic:
+            return synthetic
+    return None
+
+
 def historical_effective_strong(df_closed, end_idx, direction, include_synthetic=True):
     single = simple_strong_candle(df_closed.iloc[end_idx], direction)
     if single:
@@ -2855,9 +2901,11 @@ def detect_entry_trigger(df, timeframe, side, now_dt=None):
             'atr_stop': precision_price(atr_stop),
             'stop_model': 'structure_with_atr_cap'
         }
-    # 查找最后一根收盘k线是否是有效强K线,包含了合成强k
-    strong = latest_effective_strong(df_closed, side)
-    if strong:
+    def strong_candle_trigger():
+        # 查找最后一根收盘K线是否是允许参与开仓的有效强K线。
+        strong = latest_entry_strong(df_closed, side)
+        if not strong:
+            return None
         if side == 'long':
             entry_level = strong['high'] + tick
             stop = strong['low'] - tick
@@ -2879,35 +2927,50 @@ def detect_entry_trigger(df, timeframe, side, now_dt=None):
             'trigger': strong,
             'reason': f"{timeframe}最新{strong['kind']}强{'阳' if side == 'long' else '阴'}线"
         }
-    # 查找最近一根相反方向的有效强K线,不包含合成强k
-    previous = find_previous_opposite_strong(df_closed, side)
-    if previous is None:
-        return None
-    high = price_to_float(last.get('high'))
-    low = price_to_float(last.get('low'))
-    if side == 'long':
-        level = previous['high']
-        stop = close - ENTRY_ATR_STOP_MULTIPLIER * atr
-        entry_level = level + tick
-    else:
-        level = previous['low']
-        stop = close + ENTRY_ATR_STOP_MULTIPLIER * atr
-        entry_level = level - tick
-    logging.info(
-        f"detect_entry_trigger生成 opposite_strong_break: "
-        f"timeframe={timeframe}, side={side}, level={level}, close={close}, "
-        f"high={high}, low={low}, entry={entry_level}, stop={stop}"
-    )
-    return {
-        'blocked': False,
-        'type': 'opposite_strong_break',
-        'side': side,
-        'timeframe': timeframe,
-        'entry_level': precision_price(entry_level),
-        'stop': precision_price(stop),
-        'trigger': previous,
-        'reason': f"{timeframe}前强{'阴' if side == 'long' else '阳'}线关键位触发位"
+
+    def opposite_strong_break_trigger():
+        # 查找最近一根相反方向的有效强K线。
+        previous = find_previous_opposite_strong(df_closed, side)
+        if previous is None:
+            return None
+        high = price_to_float(last.get('high'))
+        low = price_to_float(last.get('low'))
+        if side == 'long':
+            level = previous['high']
+            stop = close - ENTRY_ATR_STOP_MULTIPLIER * atr
+            entry_level = level + tick
+        else:
+            level = previous['low']
+            stop = close + ENTRY_ATR_STOP_MULTIPLIER * atr
+            entry_level = level - tick
+        logging.info(
+            f"detect_entry_trigger生成 opposite_strong_break: "
+            f"timeframe={timeframe}, side={side}, level={level}, close={close}, "
+            f"high={high}, low={low}, entry={entry_level}, stop={stop}"
+        )
+        return {
+            'blocked': False,
+            'type': 'opposite_strong_break',
+            'side': side,
+            'timeframe': timeframe,
+            'entry_level': precision_price(entry_level),
+            'stop': precision_price(stop),
+            'trigger': previous,
+            'reason': f"{timeframe}前强{'阴' if side == 'long' else '阳'}线关键位触发位"
+        }
+
+    trigger_builders = {
+        'strong_candle': strong_candle_trigger,
+        'opposite_strong_break': opposite_strong_break_trigger,
     }
+    for trigger_name in ENTRY_TRIGGER_PRIORITY:
+        builder = trigger_builders.get(trigger_name)
+        if not builder:
+            continue
+        trigger = builder()
+        if trigger:
+            return trigger
+    return None
 
 
 def zone_distance(zone, price):
@@ -3238,6 +3301,70 @@ def expected_profit_ok(side, entry, stop, target, atr):
     return True, 'ok'
 
 
+def target_profit_still_valid(side, entry, stop, target, atr=0):
+    ok, reason = expected_profit_ok(side, entry, stop, target, atr)
+    if ok:
+        return True, 'ok'
+    return False, f"实际/当前成交价下目标位无效: entry={entry}, stop={stop}, target={target}, {reason}"
+
+
+def sr_filter_atr_from_context(context):
+    try:
+        df_4h_closed = get_closed_df(context['dfs']['4h'], '4h', now_dt=context['now_dt'])
+    except Exception:
+        return 0.0
+    if len(df_4h_closed) == 0:
+        return 0.0
+    return price_to_float(df_4h_closed.iloc[-1].get('atr'))
+
+
+def price_in_or_near_zone(price, zone, buffer):
+    return zone['lower'] - buffer <= price <= zone['upper'] + buffer
+
+
+def sr_trend_entry_block_reason(side, price, zones, atr):
+    buffer = SUP_RES_NEAR_ATR * atr if atr and atr > 0 else 0.0
+    if side == 'long':
+        for zone in zones.get('resistance', [])[:5]:
+            if price >= zone['lower'] - buffer:
+                return (
+                    f"多单靠近/进入活跃阻力区，跳过普通趋势开仓: "
+                    f"price={price}, zone={zone['lower']:.4f}-{zone['upper']:.4f}, buffer={buffer:.4f}"
+                )
+        for zone in zones.get('broken_resistance', [])[:5]:
+            if price_in_or_near_zone(price, zone, buffer):
+                return (
+                    f"多单处于近期突破阻力回踩/确认区，交给SR突破逻辑，跳过普通趋势开仓: "
+                    f"price={price}, zone={zone['lower']:.4f}-{zone['upper']:.4f}, buffer={buffer:.4f}"
+                )
+    elif side == 'short':
+        for zone in zones.get('support', [])[:5]:
+            if price <= zone['upper'] + buffer:
+                return (
+                    f"空单靠近/进入活跃支撑区，跳过普通趋势开仓: "
+                    f"price={price}, zone={zone['lower']:.4f}-{zone['upper']:.4f}, buffer={buffer:.4f}"
+                )
+        for zone in zones.get('broken_support', [])[:5]:
+            if price_in_or_near_zone(price, zone, buffer):
+                return (
+                    f"空单处于近期跌破支撑回踩/确认区，交给SR突破逻辑，跳过普通趋势开仓: "
+                    f"price={price}, zone={zone['lower']:.4f}-{zone['upper']:.4f}, buffer={buffer:.4f}"
+                )
+    return ''
+
+
+def candidate_sr_entry_zone_still_valid(candidate, context, curr_price):
+    if candidate.get('module') != 'trend_trigger':
+        return True, 'ok'
+    atr = price_to_float(candidate.get('sr_filter_atr'))
+    if atr <= 0:
+        atr = sr_filter_atr_from_context(context)
+    reason = sr_trend_entry_block_reason(candidate.get('side'), curr_price, context.get('zones', {}), atr)
+    if reason:
+        return False, reason
+    return True, 'ok'
+
+
 def find_1h_sr_confirmation(df_1h, zone, side, now_dt=None):
     df_closed = get_closed_df(df_1h, '1h', now_dt=now_dt)
     if len(df_closed) < 3:
@@ -3328,6 +3455,7 @@ def build_sr_rebound_candidates(context, side):
             'stop': precision_price(stop),
             'target': precision_price(target),
             'target_zone': target_zone,
+            'profit_check_atr': atr_4h,
             'reason': f"4H有效{'支撑' if side == 'long' else '阻力'} + 1H确认 + 15M入场",
             'confirm': confirm,
             'state_summary': f"SR {side}: zone={zone['lower']:.4f}-{zone['upper']:.4f}, confirm={confirm['bar_time']}"
@@ -3394,12 +3522,48 @@ def candidate_entry_price_still_valid(candidate, curr_price):
         return False, f"多单触发价已失效: module={candidate.get('module')}, current={curr_price}, entry_level={entry_level}"
     if side == 'short' and curr_price > entry_level:
         return False, f"空单触发价已失效: module={candidate.get('module')}, current={curr_price}, entry_level={entry_level}"
+    allowed_slippage = candidate_entry_allowed_slippage(candidate, entry_level)
+    if side == 'long' and curr_price > entry_level + allowed_slippage:
+        return False, (
+            f"多单追价超限: module={candidate.get('module')}, current={curr_price}, "
+            f"entry_level={entry_level}, allowed_slippage={allowed_slippage:.4f}"
+        )
+    if side == 'short' and curr_price < entry_level - allowed_slippage:
+        return False, (
+            f"空单追价超限: module={candidate.get('module')}, current={curr_price}, "
+            f"entry_level={entry_level}, allowed_slippage={allowed_slippage:.4f}"
+        )
     return True, 'ok'
+
+
+def candidate_entry_allowed_slippage(candidate, entry_level=None):
+    entry_level = price_to_float(entry_level if entry_level is not None else candidate.get('entry_level'))
+    target = price_to_float(candidate.get('target'))
+    side = candidate.get('side')
+    if entry_level <= 0 or target <= 0:
+        return 0.0
+
+    if side == 'long':
+        profit_distance = target - entry_level
+    else:
+        profit_distance = entry_level - target
+    if profit_distance <= 0:
+        return 0.0
+    return profit_distance * ENTRY_MAX_SLIPPAGE_PROFIT_RATIO
+
+
+def candidate_target_profit_still_valid(candidate, curr_price):
+    side = candidate.get('side')
+    stop = price_to_float(candidate.get('stop'))
+    target = price_to_float(candidate.get('target'))
+    atr = price_to_float(candidate.get('profit_check_atr'))
+    return target_profit_still_valid(side, curr_price, stop, target, atr)
 
 
 def build_trend_trigger_candidates(context):
     candidates = []
     zones = context['zones']
+    sr_filter_atr = sr_filter_atr_from_context(context)
     for strategy_tf in STRATEGY_TIMEFRAMES:
         #当前时间
         local_state = context['trend_states'].get(strategy_tf)
@@ -3426,6 +3590,10 @@ def build_trend_trigger_candidates(context):
 
             entry_ref = price_to_float(trigger.get('entry_level'))
             stop = price_to_float(trigger['stop'])
+            sr_block_reason = sr_trend_entry_block_reason(side, entry_ref, zones, sr_filter_atr)
+            if sr_block_reason:
+                logging.info(f"跳过趋势触发{strategy_tf}->{trigger_tf} {side}: {sr_block_reason}")
+                continue
             # 当 ADX 为极端值时，按原始止损距离收紧，而不是固定压到很窄的 ATR 距离。
             if background_state.get('details', {}).get('extreme_adx'):
                 risk_distance = abs(entry_ref - stop)
@@ -3455,6 +3623,8 @@ def build_trend_trigger_candidates(context):
                 'stop': precision_price(stop),
                 'target': precision_price(target),
                 'target_zone': target_zone,
+                'profit_check_atr': trigger_atr,
+                'sr_filter_atr': sr_filter_atr,
                 'reason': f"{strategy_tf}趋势 + {trigger['reason']}",
                 'state_summary': f"{strategy_tf}/{background_tf}/{trigger_tf}: {trigger['reason']}; bg={background_state.get('status')}",
                 'trigger': trigger
@@ -3851,12 +4021,27 @@ def run_strategy():
         if is_new_signal_15m:
             trade_state['last_processed_bar_15m'] = signal_bar_15m
         return
+    sr_zone_still_valid, sr_zone_invalid_reason = candidate_sr_entry_zone_still_valid(candidate, context, curr_price)
+    if not sr_zone_still_valid:
+        logging.info(sr_zone_invalid_reason)
+        trade_state['last_processed_bar_5m'] = signal_bar_5m
+        if is_new_signal_15m:
+            trade_state['last_processed_bar_15m'] = signal_bar_15m
+        return
+    target_still_valid, target_invalid_reason = candidate_target_profit_still_valid(candidate, curr_price)
+    if not target_still_valid:
+        logging.info(target_invalid_reason)
+        trade_state['last_processed_bar_5m'] = signal_bar_5m
+        if is_new_signal_15m:
+            trade_state['last_processed_bar_15m'] = signal_bar_15m
+        return
     #获取候选信号的4h、1h、15m状态
     state_4h, state_1h, state_15m = states_for_candidate(context, candidate)
     entry_meta = {
         'strategy_tf': candidate.get('strategy_tf'),
         'exit_tf': candidate.get('exit_tf'),
-        'sr_target': candidate.get('target', 0.0)
+        'sr_target': candidate.get('target', 0.0),
+        'profit_check_atr': candidate.get('profit_check_atr', 0.0)
     }
     try:
         opened = open_order(
