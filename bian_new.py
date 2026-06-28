@@ -117,7 +117,7 @@ MAIN_LOOP_SLEEP_SECONDS = 1  # 主循环正常节奏
 MAIN_LOOP_ERROR_SLEEP_SECONDS = 5  # 主循环遇到顶层异常后，先休息5秒再继续
 HEARTBEAT_INTERVAL_SECONDS = 15 * 60  # 每15分钟输出一次心跳日志，方便判断进程是否还活着
 MAX_SIGNAL_BAR_STALENESS_SECONDS = 45 * 60  # 15M信号K线最多允许落后45分钟，防止交易所/测试网返回旧K线
-DRY_RUN_OPEN_ORDER = False  # 运行时 dry-run 开关；开启后只走信号和性能路径，不实际创建开仓订单。
+DRY_RUN_OPEN_ORDER = False  # 运行时 dry-run 开关；开启后只走信号流程，不实际创建开仓订单。
 
 # --- 新版策略参数 ---
 # 策略会参与打分和选信号的主周期；越靠前代表越高周期、权重通常越重。
@@ -336,67 +336,14 @@ def elapsed_ms(start_ts):
 
 
 def add_perf(perf, key, value_ms):
-    if perf is None:
-        return
-    perf[key] = perf.get(key, 0.0) + float(value_ms)
+    # 实盘版本关闭性能采集；保留空函数以兼容既有调用链。
+    return
 
 
 def record_perf(perf, key, start_ts):
-    add_perf(perf, key, elapsed_ms(start_ts))
+    # 实盘版本关闭性能采集；保留空函数以兼容既有调用链。
+    return
 
-
-def log_run_strategy_perf(perf, run_start_ts, exit_reason):
-    perf = dict(perf or {})
-    perf['run_strategy_total'] = elapsed_ms(run_start_ts)
-    preferred_keys = (
-        'run_strategy_total',
-        'empty_position_cleanup',
-        'empty_position_cleanup_get_position_risk',
-        'empty_position_cleanup_cancel_all_close_position_orders',
-        'fetch_open_close_position_orders',
-        'fetch_open_close_position_orders_unified',
-        'fetch_open_close_position_orders_raw_open',
-        'fetch_open_close_position_orders_raw_algo',
-        'cancel_conditional_orders',
-        'lightweight_5m_gate_total',
-        'lightweight_5m_fetch_ohlcv',
-        'lightweight_5m_dataframe',
-        'lightweight_5m_validate_signal_bar',
-        'fetch_all_klines_total',
-        'fetch_df_5m_total',
-        'fetch_df_5m_reused_lightweight',
-        'fetch_df_5m_reuse_merge',
-        'fetch_df_15m_total',
-        'fetch_df_15m_cache_hit',
-        'fetch_df_1h_total',
-        'fetch_df_1h_cache_hit',
-        'fetch_df_4h_total',
-        'fetch_df_4h_cache_hit',
-        'fetch_df_1d_total',
-        'fetch_df_1d_cache_hit',
-        'validate_signal_bar',
-        'build_context',
-        'build_context_trend_states',
-        'build_context_support_resistance',
-        'build_context_support_resistance_cache_hit',
-        'monitor_position_new',
-        'monitor_position_get_position_risk',
-        'monitor_position_reconcile_conditional_orders',
-        'monitor_position_fallback_position_check',
-        'monitor_position_external_close_cleanup',
-        'monitor_position_get_latest_price',
-        'apply_new_exit_rules',
-        'apply_new_exit_rules_get_latest_price',
-        'refresh_protective_stop_order',
-        'build_entry_candidates',
-        'get_latest_price',
-        'open_order',
-    )
-    keys = [key for key in preferred_keys if key in perf]
-    known_keys = set(keys)
-    keys.extend(sorted(key for key in perf if key not in known_keys))
-    parts = [f"{key}={perf[key]:.1f}ms" for key in keys]
-    logging.info(f"性能计时 run_strategy: exit={exit_reason}, " + ", ".join(parts))
 
 def get_adx_config(timeframe):
     """返回某个周期的 ADX 配置；未配置字段自动使用默认兜底。"""
@@ -645,13 +592,7 @@ def add_strategy_indicators(df, timeframe, perf=None):
     return df
 
 
-def log_fetch_df_perf(timeframe, perf, elapsed):
-    logging.info(
-        f"性能计时 fetch_df({timeframe}): total={perf[f'fetch_df_{timeframe}_total']:.1f}ms, "
-        f"fetch_ohlcv={perf.get(f'fetch_df_{timeframe}_fetch_ohlcv', 0.0):.1f}ms, "
-        f"dataframe={perf.get(f'fetch_df_{timeframe}_dataframe', 0.0):.1f}ms, "
-        f"indicators={perf.get(f'fetch_df_{timeframe}_indicators', 0.0):.1f}ms"
-    )
+def log_fetch_df_perf(timeframe, elapsed):
     if elapsed >= FETCH_DF_SLOW_LOG_SECONDS:
         logging.warning(f"获取数据较慢 ({timeframe}): {elapsed:.2f}s")
 
@@ -659,7 +600,7 @@ def log_fetch_df_perf(timeframe, perf, elapsed):
 def fetch_df(symbol, timeframe, limit=100):
     """获取K线并计算技术指标"""
     start_ts = time.monotonic()
-    perf = {}
+    perf = None
     try:
         fetch_start = time.monotonic()
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
@@ -671,9 +612,7 @@ def fetch_df(symbol, timeframe, limit=100):
 
         df = add_strategy_indicators(df, timeframe, perf=perf)
         elapsed = time.monotonic() - start_ts
-        perf[f'fetch_df_{timeframe}_total'] = elapsed * 1000.0
-        df.attrs['perf'] = perf
-        log_fetch_df_perf(timeframe, perf, elapsed)
+        log_fetch_df_perf(timeframe, elapsed)
         return df
     except Exception as e:
         logging.error(f"获取数据失败 ({timeframe}): {e}")
@@ -723,7 +662,6 @@ def kline_cache_entry_is_current(entry, timeframe, now_dt):
 
 def fetch_df_cached(symbol, timeframe, limit=100, cache_timeframes=('15m', '1h', '4h', '1d')):
     """对背景周期复用已收盘K线级别的DataFrame，避免同一周期内重复拉全量K线。"""
-    start_ts = time.monotonic()
     if timeframe not in cache_timeframes:
         return fetch_df(symbol, timeframe, limit)
 
@@ -732,13 +670,7 @@ def fetch_df_cached(symbol, timeframe, limit=100, cache_timeframes=('15m', '1h',
     now_dt = datetime.datetime.now(EXCHANGE_TZ)
     entry = cache.get(key)
     if kline_cache_entry_is_current(entry, timeframe, now_dt):
-        elapsed = elapsed_ms(start_ts)
-        df = entry['df'].copy(deep=False)
-        df.attrs['perf'] = {
-            f'fetch_df_{timeframe}_cache_hit': elapsed,
-            f'fetch_df_{timeframe}_total': elapsed
-        }
-        return df
+        return entry['df'].copy(deep=False)
 
     df = fetch_df(symbol, timeframe, limit)
     if df is None:
@@ -750,8 +682,6 @@ def fetch_df_cached(symbol, timeframe, limit=100, cache_timeframes=('15m', '1h',
 
 def rebuild_5m_df_from_lightweight_cache(symbol, limit, lightweight_df):
     """用轻量gate刚抓到的5M raw K线更新上一轮完整5M缓存，避免同轮重复REST请求。"""
-    total_start = time.monotonic()
-    local_perf = {}
     try:
         if lightweight_df is None or len(lightweight_df) == 0:
             return None
@@ -761,23 +691,17 @@ def rebuild_5m_df_from_lightweight_cache(symbol, limit, lightweight_df):
         if not entry or entry.get('df') is None:
             return None
 
-        merge_start = time.monotonic()
         raw_columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
         cached_raw = entry['df'][raw_columns]
         lightweight_raw = lightweight_df[raw_columns]
         merged = pd.concat([cached_raw, lightweight_raw], ignore_index=True)
         merged = merged.drop_duplicates(subset=['timestamp'], keep='last')
         merged = merged.sort_values('timestamp').tail(limit).reset_index(drop=True)
-        record_perf(local_perf, 'fetch_df_5m_reuse_merge', merge_start)
 
         if len(merged) < min(limit, len(cached_raw)):
             return None
 
-        df = add_strategy_indicators(merged, '5m', perf=local_perf)
-        elapsed = elapsed_ms(total_start)
-        local_perf['fetch_df_5m_reused_lightweight'] = elapsed
-        local_perf['fetch_df_5m_total'] = elapsed
-        df.attrs['perf'] = local_perf
+        df = add_strategy_indicators(merged, '5m')
         store_kline_df_cache(symbol, '5m', limit, df)
         return df
     except Exception as e:
@@ -2117,7 +2041,6 @@ def open_order(side, price, sl_price, state_4h, state_1h, state_15m, signal_bar_
             entry_trigger_tf,
             entry_meta
         )
-        print("DRY_RUN_OPEN_ORDER_BLOCKED")
         return False
 
     amount = calculate_amount(price)
@@ -2210,7 +2133,7 @@ def open_order(side, price, sl_price, state_4h, state_1h, state_15m, signal_bar_
         # 计算开仓手续费 (参考 test.py 方式)
         taker_fee_rate = get_trading_fee_rate()
         open_fee = actual_price * amount * taker_fee_rate
-        print("openfree:",open_fee)
+        logging.info(f"开仓手续费估算: {open_fee}")
 
         # 提取各个级别的具体成立条件字符串
         def format_cond(state, side_dir):
@@ -2508,14 +2431,6 @@ def validate_signal_bar(timeframe, signal_bar, now_dt=None):
         trade_state[max_seen_key] = signal_bar
 
     return {'valid': True, 'is_new': is_new, 'reason': 'ok', 'stale_seconds': stale_seconds}
-
-
-def copy_df_perf(perf, dfs):
-    for df in dfs.values():
-        if df is None:
-            continue
-        for key, value in getattr(df, 'attrs', {}).get('perf', {}).items():
-            add_perf(perf, key, value)
 
 
 def check_empty_position_lightweight_5m_gate(perf):
@@ -4270,20 +4185,11 @@ def states_for_candidate(context, candidate):
 
 def run_strategy():
     """新版策略主循环：5M节拍扫描，15m/1h/4h按权重产生候选信号。"""
-    perf = {}
-    run_start = time.monotonic()
-    exit_reason = 'completed'
-    try:
-        exit_reason = _run_strategy_impl(perf)
-    except Exception:
-        exit_reason = 'exception'
-        raise
-    finally:
-        log_run_strategy_perf(perf, run_start, exit_reason)
+    return _run_strategy_impl(None)
 
 
 def _run_strategy_impl(perf):
-    """run_strategy主体；返回退出原因，便于统一记录性能日志。"""
+    """run_strategy主体；返回退出原因，便于统一控制流程。"""
     global trade_state
     gate_result = {}
 
@@ -4332,8 +4238,6 @@ def _run_strategy_impl(perf):
         raise
     else:
         executor.shutdown(wait=True)
-
-    copy_df_perf(perf, dfs)
 
     if any(df is None for df in dfs.values()):
         # 多周期数据必须齐全；缺一个周期就放弃本轮，避免用残缺背景做交易决策。
@@ -4526,17 +4430,16 @@ if __name__ == '__main__':
     if '--cleanup-conditions' in sys.argv:
         try:
             current_time_str = get_server_time_str()
-            print("网络连通成功！服务器时间:", current_time_str)
+            logging.info(f"网络连通成功！服务器时间: {current_time_str}")
             ok = cleanup_conditional_orders_once()
             sys.exit(0 if ok else 1)
         except Exception:
-            print(traceback.format_exc())
             logging.error(f"手动清理条件委托失败:\n{traceback.format_exc()}")
             sys.exit(1)
 
     try:
         current_time_str = get_server_time_str()
-        print("网络连通成功！服务器时间:", current_time_str)
+        logging.info(f"网络连通成功！服务器时间: {current_time_str}")
         balance_after = exchange.fetch_balance({'type': 'future'})
         final_usdt = float(balance_after['total']['USDT'])
         logging.info(f"🚀 自动化交易策略系统启动，初始金额：{final_usdt}")
@@ -4560,7 +4463,7 @@ if __name__ == '__main__':
             run_strategy()
             loop_count += 1
         except Exception as e:
-            print(traceback.format_exc())
+            logging.error(traceback.format_exc())
             logging.error(f"系统运行报错: {e}")
             logging.error("主循环将继续运行，休眠后自动进入下一轮")
             time.sleep(MAIN_LOOP_ERROR_SLEEP_SECONDS)
