@@ -2527,6 +2527,12 @@ def get_price_tick(reference_price=None):
 
 
 def candle_parts(row):
+    """
+    从 K 线数据行中提取标准 OHLCV 分量。
+    返回: (open, high, low, close, candle_range, body)
+    - candle_range: 最高价 - 最低价（整根 K 线的振幅）
+    - body: |收盘价 - 开盘价|（实体大小）
+    """
     open_price = price_to_float(row.get('open'))
     high = price_to_float(row.get('high'))
     low = price_to_float(row.get('low'))
@@ -2586,6 +2592,11 @@ def is_large_strong_candle(open_price, high, low, close, atr, direction, body_ov
 
 
 def simple_strong_candle(row, direction):
+    """
+    判断单根 K 线是否为有效强 K（单根强K，非大强、非合成）。
+    大强 K 会返回 None（大强由专门逻辑处理，不走正常强K流程）。
+    返回: dict(kind='single', direction, open, high, low, close, atr, body, large=False, bar_time, details) 或 None
+    """
     open_price, high, low, close, _, _ = candle_parts(row)
     atr = price_to_float(row.get('atr'))
     large = is_large_strong_candle(open_price, high, low, close, atr, direction)
@@ -2658,11 +2669,20 @@ def standalone_strong_candle_kind(row):
 
 
 def composite_strong_candle(df_closed, end_idx, bars_count, direction):
+    """
+    合成强 K 线：连续 bars_count 根同向小 K 线合并成一根"虚拟强 K"。
+    条件：
+        - 合并段内每根 K 线都不能是独立的强K/大强K（否则没必要合成）
+        - 做多：每根都阳线；做空：每根都阴线
+        - 合并后的 OHLC 检查 strong_candle_check 通过 且 不是大强K
+    返回: dict(kind='synthetic_N', ...) 或 None
+    """
     if end_idx - bars_count + 1 < 0:
         return None
     segment = df_closed.iloc[end_idx - bars_count + 1:end_idx + 1]
     if len(segment) != bars_count:
         return None
+    # 如果段内任何一根 K 线已经是独立强K/大强K，就不需要合成了
     for _, row in segment.iterrows():
         if standalone_strong_candle_kind(row):
             return None
@@ -2695,6 +2715,7 @@ def composite_strong_candle(df_closed, end_idx, bars_count, direction):
     if (not is_number(atr) or atr <= 0) and 'atr' in segment.columns and segment['atr'].notna().any():
         atr = price_to_float(segment['atr'].dropna().mean())
 
+    # 合成后检查：不能是大强（振幅过大），且必须通过强 K 检查
     large = is_large_strong_candle(open_price, high, low, close, atr, direction, body_override=body)
     check = strong_candle_check(open_price, high, low, close, atr, direction, body_override=body)
     if not check.get('ok') or large:
@@ -2715,6 +2736,10 @@ def composite_strong_candle(df_closed, end_idx, bars_count, direction):
 
 
 def latest_effective_strong(df_closed, direction):
+    """
+    找最新一根有效强 K（先查单根，再查合成）。
+    用于持有时判断是否需要依据强K收紧止损。
+    """
     if df_closed is None or len(df_closed) == 0:
         return None
     end_idx = len(df_closed) - 1
@@ -2746,6 +2771,10 @@ def latest_entry_strong(df_closed, direction):
 
 
 def historical_effective_strong(df_closed, end_idx, direction, include_synthetic=True):
+    """
+    判断历史某个位置是否为有效强K（可指定是否包含合成强K）。
+    用于回看历史K线（如判断震荡区间内的强K触碰历史）。
+    """
     single = simple_strong_candle(df_closed.iloc[end_idx], direction)
     if single:
         return single
@@ -2759,6 +2788,10 @@ def historical_effective_strong(df_closed, end_idx, direction, include_synthetic
 
 
 def find_previous_opposite_strong(df_closed, side, lookback=OPPOSITE_STRONG_LOOKBACK):
+    """
+    在历史 K 线中找最近一根与持仓方向相反的有效强 K。
+    用于 detect_entry_trigger 中判断是否应该突破前反向强K的关键位入场。
+    """
     if df_closed is None or len(df_closed) < 3:
         return None
     opposite = 'short' if side == 'long' else 'long'
@@ -2772,6 +2805,11 @@ def find_previous_opposite_strong(df_closed, side, lookback=OPPOSITE_STRONG_LOOK
 
 
 def count_ema_crosses(df_closed):
+    """
+    统计最近 EMA_CROSS_LOOKBACK 根 K 线内，价格穿越 EMA20 的次数。
+    分别统计上穿和下穿次数，用于判断价格是否在均线附近频繁震荡。
+    返回: {'up': 上穿次数, 'down': 下穿次数, 'total': 总穿越次数}
+    """
     recent = df_closed.tail(EMA_CROSS_LOOKBACK)
     up_cross = 0
     down_cross = 0
@@ -2789,19 +2827,31 @@ def count_ema_crosses(df_closed):
 
 
 def persistent_direction_before_index(df_closed, end_idx):
+    """
+    检查在 end_idx 之前的 EMA_PERSISTENCE_BARS(20) 根 K 线中，
+    价格是否持续站在 EMA20 上方（做多背景）或下方（做空背景）。
+    返回 'long'（持续在上方）/ 'short'（持续在下方）/ None。
+    """
     if df_closed is None or end_idx < EMA_PERSISTENCE_BARS:
         return None
     prior = df_closed.iloc[end_idx - EMA_PERSISTENCE_BARS:end_idx]
     if len(prior) < EMA_PERSISTENCE_BARS or prior['ema20'].isna().any():
         return None
+    # 20根K线的低点都在EMA20之上 → 价格持续在均线上方运行
     if bool((prior['low'] >= prior['ema20']).all()):
         return 'long'
+    # 20根K线的高点都在EMA20之下 → 价格持续在均线下方运行
     if bool((prior['high'] <= prior['ema20']).all()):
         return 'short'
     return None
 
 
 def is_ema_persistence_first_break(row, persistent_direction):
+    """
+    判断是否首次跌破/突破 EMA20 持续性趋势。
+    persistent_direction='long'（之前20根在EMA上方）：low < EMA20 即首次触碰均线下方
+    persistent_direction='short'（之前20根在EMA下方）：high > EMA20 即首次触碰均线上方
+    """
     if row is None or not is_number(row.get('ema20')):
         return False
     if persistent_direction == 'long':
@@ -2812,19 +2862,24 @@ def is_ema_persistence_first_break(row, persistent_direction):
 
 
 def recent_persistent_trend_break(df_closed, persistent_direction, break_idx):
+    """
+    判断在 break_idx 发生首次突破后，后续3根K线是否确认了趋势反转。
+    - 原本做多趋势（persistent_direction='long'）→ 后3根中 >=2 根收盘在 EMA20 下方 → 趋势确认打破
+    - 原本做空趋势（persistent_direction='short'）→ 后3根中 >=2 根收盘在 EMA20 上方 → 趋势确认打破
+    """
     if df_closed is None or break_idx is None or break_idx + 3 >= len(df_closed):
         return False
-    #获取后面连续3根k线数据
+    # 获取突破后连续3根K线数据
     follow = df_closed.iloc[break_idx + 1:break_idx + 4]
     if len(follow) < 3:
         return False
     if persistent_direction == 'short':
-        #后续3根中至少2根收盘价高于EMA20，不论K线阴阳
+        # 原本做空趋势，后续3根中至少2根收盘价高于EMA20 → 趋势确认打破
         bars_above = (follow['close'] > follow['ema20']).sum()
         if bars_above >= 2:
             return True
     else:
-        #后续3根中至少2根收盘价低于EMA20，不论K线阴阳
+        # 原本做多趋势，后续3根中至少2根收盘价低于EMA20 → 趋势确认打破
         bars_below = (follow['close'] < follow['ema20']).sum()
         if bars_below >= 2:
             return True
@@ -2832,6 +2887,17 @@ def recent_persistent_trend_break(df_closed, persistent_direction, break_idx):
 
 
 def recent_ema_persistence(df_closed):
+    """
+    检查价格是否至少在最近 EMA_PERSISTENCE_BARS(20) 根 K 线内持续站在 EMA20 上方/下方。
+    如果持续方向已确立，检查当前 K 线是否首次跌破/突破 EMA20（即"趋势首次中断"）。
+    如果趋势刚被中断不久（1~3根K线内），判断趋势是否已被打破。
+
+    返回字段:
+        direction    - 'above'（持续在EMA上方）/ 'below'（持续在EMA下方）/ None
+        first_break  - 当前K线是否首次跌破/突破（趋势刚中断的第一根）
+        broken       - 趋势是否已被确认打破（中断后3根K线确认）
+        break_pending - 趋势中断但还在观察期中（<3根K线）
+    """
     if df_closed is None or len(df_closed) < EMA_PERSISTENCE_BARS + 1:
         return {'direction': None, 'first_break': False, 'broken': False, 'break_pending': False}
 
@@ -2872,6 +2938,16 @@ def recent_ema_persistence(df_closed):
 
 
 def evaluate_adx_ema_context(df, timeframe, now_dt=None):
+    """
+    核心趋势判断函数：综合 ADX/DI + EMA20 + EMA20持久性，评估某个周期的多头/空头方向。
+
+    判断优先级：
+        1. EMA20 持久性优先：如果 20 根K线持续在EMA一侧且趋势未被打破 → 直接采用
+        2. ADX 分层：震荡(<range_max) → 过渡(<trend_min) → 趋势
+        3. 趋势组合：DI方向 + EMA斜率方向 + EMA穿越干净度 同时成立才算有效趋势
+
+    返回 dict 包含: direction, status, can_open_long, can_open_short, long_trend, short_trend, pullback, is_oscillation 等
+    """
     df_closed = get_closed_df(df, timeframe, now_dt=now_dt)
     # 每个周期用自己的 ADX length 和阈值，避免 15m/1h/4h 共用同一套强度判断。
     adx_config = get_adx_config(timeframe)
@@ -3047,6 +3123,7 @@ def format_context_state(state):
 
 
 def context_deny_reason(side, reason, local_state, background_state):
+    """格式化多周期趋势被拒绝的原因描述，用于日志和调试。"""
     return (
         f"{side_label(side)}方向过滤: {reason}; "
         f"local[{format_context_state(local_state)}]; "
@@ -3055,15 +3132,30 @@ def context_deny_reason(side, reason, local_state, background_state):
 
 
 def context_allows_side(local_state, background_state, side):
+    """
+    多周期趋势联合校验（入场前必须通过）。
+    依次检查：
+        1. 本地周期不能震荡
+        2. 本地周期方向与交易方向一致
+        3. 背景周期方向不能相反
+        4. 背景周期状态不能是 range/transition/unclear
+        5. 本地周期允许开仓
+        6. 背景周期确认同向（允许 weakening/flat_adx/ema_persistence 软通过）
+    返回: (allowed: bool, deny_reason: str)
+    """
     if not local_state or not background_state:
         return False, context_deny_reason(side, '缺少趋势状态', local_state, background_state)
     opposite = 'short' if side == 'long' else 'long'
+    # 本级别震荡 → 不开仓
     if local_state.get('is_oscillation'):
         return False, context_deny_reason(side, f"{local_state.get('timeframe')} 本级别震荡/趋势不明", local_state, background_state)
+    # 本级别方向相反 → 不开仓
     if local_state.get('direction') == opposite:
         return False, context_deny_reason(side, f"{local_state.get('timeframe')} 本级别方向相反", local_state, background_state)
+    # 背景周期方向相反 → 不开仓
     if background_state.get('direction') == opposite:
         return False, context_deny_reason(side, f"{background_state.get('timeframe')} 背景趋势相反", local_state, background_state)
+    # 背景周期不允许开仓（震荡/过渡/不清/无数据）→ 不开仓
     if background_state.get('status') in ('range', 'transition', 'unclear', 'no_data'):
         return False, context_deny_reason(side, f"{background_state.get('timeframe')} 背景趋势不允许开仓: {background_state.get('status')}", local_state, background_state)
 
@@ -3071,6 +3163,7 @@ def context_allows_side(local_state, background_state, side):
     if not local_state.get(local_open_key) and local_state.get('direction') != side:
         return False, context_deny_reason(side, f"{local_state.get('timeframe')} 本级别未给出{side_label(side)}方向", local_state, background_state)
 
+    # 背景周期：方向一致 + (明确允许开仓 或 软通过状态 weakening/flat_adx/ema_persistence)
     bg_same_side = background_state.get('direction') == side
     bg_open_key = 'can_open_long' if side == 'long' else 'can_open_short'
     bg_soft_allow = background_state.get('status') in (
@@ -3084,6 +3177,15 @@ def context_allows_side(local_state, background_state, side):
 
 
 def detect_entry_trigger(df, timeframe, side, now_dt=None):
+    """
+    入场触发检测器 — 在趋势确认后，寻找具体的 K 线形态入场信号。
+    按优先级依次检查：
+        1. 最新K线是否为大强K → 是则过滤不开仓（blocked=True）
+        2. 前大强K线突破入场（large_strong_break）→ 收盘突破前大强线关键位
+        3. 最新强K入场（strong_candle）→ 最新一根有效强K的高/低点
+        4. 反向强K突破入场（opposite_strong_break）→ 收盘突破前反向强K关键位
+    返回: dict(blocked, type, side, entry_level, stop, trigger, reason) 或 None
+    """
     df_closed = get_closed_df(df, timeframe, now_dt=now_dt)
     adx_length = int(get_adx_config(timeframe).get('length', ADX_LENGTH))
     if len(df_closed) < max(adx_length + 3, SYNTHETIC_STRONG_MAX_BARS + 2):
@@ -3868,30 +3970,47 @@ def build_trend_trigger_candidates(context):
 
 
 def build_entry_candidates(context):
+    """
+    汇总所有入场候选信号，按权重排序后返回。
+    三种候选来源：
+        1. 趋势触发候选（trend_trigger）— 基于多周期 ADX+EMA 趋势 + K线形态
+        2. SR反弹候选（sr_rebound）— 15m+1h 趋势允许时，在支撑/阻力位反弹
+        3. SR突破候选（sr_breakout）— 4h+1d 趋势允许时，突破关键价位后回踩确认
+    排序规则：高周期优先（4h > 1h > 15m），同周期内 SR突破 > SR反弹 > 趋势触发
+    """
     # 构建趋势触发候选信号
     candidates = build_trend_trigger_candidates(context)
     for side in ('long', 'short'):
-        #多周期校验趋势信号
+        # 15m+1h 多周期校验趋势 → 决定是否生成 SR反弹候选
         allowed, deny_reason = context_allows_side(context['trend_states'].get('15m'), context['trend_states'].get('1h'), side)
         if allowed:
-            # 构建SR反弹候选信号：k线到达支撑位置并且站稳，使用1小时和15m
+            # 构建SR反弹候选信号：价格到达支撑/阻力位置并站稳，使用1h和15m确认
             candidates.extend(build_sr_rebound_candidates(context, side))
         else:
             logging.info(f"跳过SR反弹{side}: {deny_reason}")
 
+        # 4h+1d 多周期校验趋势 → 决定是否生成 SR突破候选
         allowed, deny_reason = context_allows_side(context['trend_states'].get('4h'), context['trend_states'].get('1d'), side)
         if allowed:
-            # 构建SR突破候选信号：k线突破了关键位置并且站稳，使用4小时
+            # 构建SR突破候选信号：K线突破了关键位置并且站稳，使用4h
             candidates.extend(build_sr_breakout_candidates(context, side))
         else:
             logging.info(f"跳过SR突破{side}: {deny_reason}")
-    #根据权重进行排序
+    # 根据权重进行排序（高周期 + 高优先级模块优先）
     candidates.sort(key=candidate_priority)
     return candidates
 
 
 def build_context(dfs, now_dt, perf=None):
+    """
+    上下文聚合器 — 每轮交易决策前，合并所需的市场状态信息。
+    两大部分：
+        1. 各周期趋势状态（15m/1h/4h/1d 的 ADX+EMA 评估）
+        2. 4H 支撑阻力区间（含当前有效区间和被突破区间，带缓存）
+    返回: dict(dfs, now_dt, trend_states, zones)
+    """
     trend_start = time.monotonic()
+    # 对四大周期并行或依次评估趋势状态
     trend_states = {
         timeframe: evaluate_adx_ema_context(df, timeframe, now_dt=now_dt)
         for timeframe, df in dfs.items()
@@ -3899,6 +4018,7 @@ def build_context(dfs, now_dt, perf=None):
     }
     record_perf(perf, 'build_context_trend_states', trend_start)
 
+    # 构建4H支撑阻力区间，按4H K线时间戳做缓存（同根K线内复用）
     sr_start = time.monotonic()
     sr_bar_time = get_closed_bar_time(dfs['4h'], '4h', now_dt=now_dt)
     sr_cache = runtime_state.get('support_resistance_cache', {})
@@ -3917,6 +4037,10 @@ def build_context(dfs, now_dt, perf=None):
 
 
 def is_in_post_exit_cooldown(now_dt):
+    """
+    出场冷却期判断：上次平仓后需等待 POST_EXIT_COOLDOWN_SECONDS 秒，
+    防止刚平仓就立刻重新开仓（频繁交易）。
+    """
     last_exit_dt = parse_bar_time(trade_state.get('last_exit_time', ''))
     if last_exit_dt is None:
         return False
