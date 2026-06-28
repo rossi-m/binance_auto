@@ -31,6 +31,7 @@ import csv
 import datetime
 import traceback
 import sqlite3
+import copy
 
 BAR_TIME_FORMAT = '%Y-%m-%d %H:%M:%S'  # 定义统一的K线时间格式字符串，用于日志记录和CSV输出
 TIMEFRAME_SECONDS = {  # 定义各时间周期对应的秒数，用于计算K线是否已收盘
@@ -110,10 +111,13 @@ CONDITIONAL_ORDER_CLEANUP_INTERVAL_SECONDS = 60  # 无本地仓位时最多每60
 EXCHANGE_HTTP_TIMEOUT_MS = 10000  # 单次交易所HTTP请求最多等待10秒，避免底层请求长时间挂起
 FETCH_DF_TASK_TIMEOUT_SECONDS = 15  # 单个周期抓取任务最多等待15秒，超过就跳过本轮
 FETCH_DF_SLOW_LOG_SECONDS = 5  # 单次抓K线+算指标超过5秒就记慢查询日志
+LIGHTWEIGHT_5M_GATE_LIMIT = 5  # 空仓轻量gate只取最近5根5M K线，不计算指标
+EXIT_RULE_PRICE_MAX_AGE_MS = 500  # 持仓管理同一轮内复用最新价的最大年龄
 MAIN_LOOP_SLEEP_SECONDS = 1  # 主循环正常节奏
 MAIN_LOOP_ERROR_SLEEP_SECONDS = 5  # 主循环遇到顶层异常后，先休息5秒再继续
 HEARTBEAT_INTERVAL_SECONDS = 15 * 60  # 每15分钟输出一次心跳日志，方便判断进程是否还活着
 MAX_SIGNAL_BAR_STALENESS_SECONDS = 45 * 60  # 15M信号K线最多允许落后45分钟，防止交易所/测试网返回旧K线
+DRY_RUN_OPEN_ORDER = False  # 运行时 dry-run 开关；开启后只走信号和性能路径，不实际创建开仓订单。
 
 # --- 新版策略参数 ---
 # 策略会参与打分和选信号的主周期；越靠前代表越高周期、权重通常越重。
@@ -300,24 +304,99 @@ exchange = ccxt.binance({
     'enableRateLimit': True,  # 开启内置的速率限制功能，防止请求频率过高被封IP
     'timeout': EXCHANGE_HTTP_TIMEOUT_MS,  # 给交易所HTTP请求设置硬超时，避免网络卡死时无限等待
 })
-# exchange.enable_demo_trading(True)  # 开启模拟交易模式（测试网），不会产生真实交易
+exchange.enable_demo_trading(True)  # 开启模拟交易模式（测试网），不会产生真实交易
 
 # 日志配置
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
+logging.info("Binance demo trading 已启用：当前运行使用测试网/模拟交易接口")
 
 # 记录程序层面的临时运行状态，不属于某一笔交易。
 runtime_state = {
     # 上一次打印心跳日志的单调时间戳，用来控制心跳输出频率。
-    'last_heartbeat_ts': 0.0
+    'last_heartbeat_ts': 0.0,
+    # 4H 支撑阻力区只随已收盘 4H K 线变化；同一根 4H 内复用计算结果。
+    'support_resistance_cache': {
+        'bar_time': '',
+        'zones': None
+    },
+    # 背景周期K线只在对应已收盘K线变化后才需要重新抓取和计算指标。
+    'kline_df_cache': {}
 }
 
 
 # ==========================================
 # 2. 功能模块
 # ==========================================
+
+def elapsed_ms(start_ts):
+    return (time.monotonic() - start_ts) * 1000.0
+
+
+def add_perf(perf, key, value_ms):
+    if perf is None:
+        return
+    perf[key] = perf.get(key, 0.0) + float(value_ms)
+
+
+def record_perf(perf, key, start_ts):
+    add_perf(perf, key, elapsed_ms(start_ts))
+
+
+def log_run_strategy_perf(perf, run_start_ts, exit_reason):
+    perf = dict(perf or {})
+    perf['run_strategy_total'] = elapsed_ms(run_start_ts)
+    preferred_keys = (
+        'run_strategy_total',
+        'empty_position_cleanup',
+        'empty_position_cleanup_get_position_risk',
+        'empty_position_cleanup_cancel_all_close_position_orders',
+        'fetch_open_close_position_orders',
+        'fetch_open_close_position_orders_unified',
+        'fetch_open_close_position_orders_raw_open',
+        'fetch_open_close_position_orders_raw_algo',
+        'cancel_conditional_orders',
+        'lightweight_5m_gate_total',
+        'lightweight_5m_fetch_ohlcv',
+        'lightweight_5m_dataframe',
+        'lightweight_5m_validate_signal_bar',
+        'fetch_all_klines_total',
+        'fetch_df_5m_total',
+        'fetch_df_5m_reused_lightweight',
+        'fetch_df_5m_reuse_merge',
+        'fetch_df_15m_total',
+        'fetch_df_15m_cache_hit',
+        'fetch_df_1h_total',
+        'fetch_df_1h_cache_hit',
+        'fetch_df_4h_total',
+        'fetch_df_4h_cache_hit',
+        'fetch_df_1d_total',
+        'fetch_df_1d_cache_hit',
+        'validate_signal_bar',
+        'build_context',
+        'build_context_trend_states',
+        'build_context_support_resistance',
+        'build_context_support_resistance_cache_hit',
+        'monitor_position_new',
+        'monitor_position_get_position_risk',
+        'monitor_position_reconcile_conditional_orders',
+        'monitor_position_fallback_position_check',
+        'monitor_position_external_close_cleanup',
+        'monitor_position_get_latest_price',
+        'apply_new_exit_rules',
+        'apply_new_exit_rules_get_latest_price',
+        'refresh_protective_stop_order',
+        'build_entry_candidates',
+        'get_latest_price',
+        'open_order',
+    )
+    keys = [key for key in preferred_keys if key in perf]
+    known_keys = set(keys)
+    keys.extend(sorted(key for key in perf if key not in known_keys))
+    parts = [f"{key}={perf[key]:.1f}ms" for key in keys]
+    logging.info(f"性能计时 run_strategy: exit={exit_reason}, " + ", ".join(parts))
 
 def get_adx_config(timeframe):
     """返回某个周期的 ADX 配置；未配置字段自动使用默认兜底。"""
@@ -533,43 +612,194 @@ def ensure_trade_csv_schema(filename):
         return False
 
 
+def ohlcv_to_dataframe(ohlcv):
+    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    # 统一转成北京时间，后续信号去重、CSV 和日志都按同一时区比较。
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df['timestamp'] = df['timestamp'].dt.tz_localize('UTC').dt.tz_convert('Asia/Shanghai')
+    return df
+
+
+def add_strategy_indicators(df, timeframe, perf=None):
+    indicator_start = time.monotonic()
+    # 交易所只给原始K线；策略用到的趋势/波动指标在本地补齐。
+    df['ema20'] = ta.ema(df['close'], length=20)
+    df['ema50'] = ta.ema(df['close'], length=50)
+
+    df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+
+    adx_config = get_adx_config(timeframe)
+    adx_length = int(adx_config.get('length', ADX_LENGTH))
+    # ADX / DI 用于新版背景趋势判断；不同 timeframe 可以使用不同 length。
+    # 下游策略统一读取 adx/plus_di/minus_di，所以这里把 pandas_ta 的
+    # ADX_14、ADX_21 等实际列名统一重命名成固定字段。
+    adx = ta.adx(df['high'], df['low'], df['close'], length=adx_length)
+    if adx is not None:
+        df = pd.concat([df, adx], axis=1)
+        df.rename(columns={
+            f'ADX_{adx_length}': 'adx',
+            f'DMP_{adx_length}': 'plus_di',
+            f'DMN_{adx_length}': 'minus_di'
+        }, inplace=True)
+    record_perf(perf, f'fetch_df_{timeframe}_indicators', indicator_start)
+    return df
+
+
+def log_fetch_df_perf(timeframe, perf, elapsed):
+    logging.info(
+        f"性能计时 fetch_df({timeframe}): total={perf[f'fetch_df_{timeframe}_total']:.1f}ms, "
+        f"fetch_ohlcv={perf.get(f'fetch_df_{timeframe}_fetch_ohlcv', 0.0):.1f}ms, "
+        f"dataframe={perf.get(f'fetch_df_{timeframe}_dataframe', 0.0):.1f}ms, "
+        f"indicators={perf.get(f'fetch_df_{timeframe}_indicators', 0.0):.1f}ms"
+    )
+    if elapsed >= FETCH_DF_SLOW_LOG_SECONDS:
+        logging.warning(f"获取数据较慢 ({timeframe}): {elapsed:.2f}s")
+
+
 def fetch_df(symbol, timeframe, limit=100):
     """获取K线并计算技术指标"""
     start_ts = time.monotonic()
+    perf = {}
     try:
+        fetch_start = time.monotonic()
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        # 统一转成北京时间，后续信号去重、CSV 和日志都按同一时区比较。
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df['timestamp'] = df['timestamp'].dt.tz_localize('UTC').dt.tz_convert('Asia/Shanghai')
-       
-        
-        # 交易所只给原始K线；策略用到的趋势/波动指标在本地补齐。
-        df['ema20'] = ta.ema(df['close'], length=20)
-        df['ema50'] = ta.ema(df['close'], length=50)
+        record_perf(perf, f'fetch_df_{timeframe}_fetch_ohlcv', fetch_start)
 
-        df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+        dataframe_start = time.monotonic()
+        df = ohlcv_to_dataframe(ohlcv)
+        record_perf(perf, f'fetch_df_{timeframe}_dataframe', dataframe_start)
 
-        adx_config = get_adx_config(timeframe)
-        adx_length = int(adx_config.get('length', ADX_LENGTH))
-        # ADX / DI 用于新版背景趋势判断；不同 timeframe 可以使用不同 length。
-        # 下游策略统一读取 adx/plus_di/minus_di，所以这里把 pandas_ta 的
-        # ADX_14、ADX_21 等实际列名统一重命名成固定字段。
-        adx = ta.adx(df['high'], df['low'], df['close'], length=adx_length)
-        if adx is not None:
-            df = pd.concat([df, adx], axis=1)
-            df.rename(columns={
-                f'ADX_{adx_length}': 'adx',
-                f'DMP_{adx_length}': 'plus_di',
-                f'DMN_{adx_length}': 'minus_di'
-            }, inplace=True)
+        df = add_strategy_indicators(df, timeframe, perf=perf)
         elapsed = time.monotonic() - start_ts
-        if elapsed >= FETCH_DF_SLOW_LOG_SECONDS:
-            logging.warning(f"获取数据较慢 ({timeframe}): {elapsed:.2f}s")
+        perf[f'fetch_df_{timeframe}_total'] = elapsed * 1000.0
+        df.attrs['perf'] = perf
+        log_fetch_df_perf(timeframe, perf, elapsed)
         return df
     except Exception as e:
         logging.error(f"获取数据失败 ({timeframe}): {e}")
         return None
+
+
+def kline_cache_key(symbol, timeframe, limit):
+    return f"{symbol}|{timeframe}|{int(limit)}"
+
+
+def store_kline_df_cache(symbol, timeframe, limit, df, now_dt=None):
+    if df is None or len(df) == 0:
+        return
+
+    if now_dt is None:
+        now_dt = datetime.datetime.now(EXCHANGE_TZ)
+    bar_time = get_closed_bar_time(df, timeframe, now_dt=now_dt)
+    if not bar_time:
+        return
+
+    cache = runtime_state.setdefault('kline_df_cache', {})
+    cache[kline_cache_key(symbol, timeframe, limit)] = {
+        'bar_time': bar_time,
+        'df': df,
+        'updated_at_monotonic': time.monotonic()
+    }
+
+
+def kline_cache_entry_is_current(entry, timeframe, now_dt):
+    """判断缓存的最后已收盘K线是否仍是当前可用的最后已收盘K线。"""
+    if not entry or entry.get('df') is None:
+        return False
+
+    tf_seconds = TIMEFRAME_SECONDS.get(timeframe)
+    cached_bar_dt = parse_bar_time(entry.get('bar_time', ''))
+    if tf_seconds is None or cached_bar_dt is None:
+        return False
+
+    if now_dt.tzinfo is None:
+        now_dt = now_dt.replace(tzinfo=EXCHANGE_TZ)
+    else:
+        now_dt = now_dt.astimezone(EXCHANGE_TZ)
+
+    next_bar_close_dt = cached_bar_dt + datetime.timedelta(seconds=2 * tf_seconds)
+    return now_dt < next_bar_close_dt
+
+
+def fetch_df_cached(symbol, timeframe, limit=100, cache_timeframes=('15m', '1h', '4h', '1d')):
+    """对背景周期复用已收盘K线级别的DataFrame，避免同一周期内重复拉全量K线。"""
+    start_ts = time.monotonic()
+    if timeframe not in cache_timeframes:
+        return fetch_df(symbol, timeframe, limit)
+
+    cache = runtime_state.setdefault('kline_df_cache', {})
+    key = kline_cache_key(symbol, timeframe, limit)
+    now_dt = datetime.datetime.now(EXCHANGE_TZ)
+    entry = cache.get(key)
+    if kline_cache_entry_is_current(entry, timeframe, now_dt):
+        elapsed = elapsed_ms(start_ts)
+        df = entry['df'].copy(deep=False)
+        df.attrs['perf'] = {
+            f'fetch_df_{timeframe}_cache_hit': elapsed,
+            f'fetch_df_{timeframe}_total': elapsed
+        }
+        return df
+
+    df = fetch_df(symbol, timeframe, limit)
+    if df is None:
+        return None
+
+    store_kline_df_cache(symbol, timeframe, limit, df, now_dt=now_dt)
+    return df
+
+
+def rebuild_5m_df_from_lightweight_cache(symbol, limit, lightweight_df):
+    """用轻量gate刚抓到的5M raw K线更新上一轮完整5M缓存，避免同轮重复REST请求。"""
+    total_start = time.monotonic()
+    local_perf = {}
+    try:
+        if lightweight_df is None or len(lightweight_df) == 0:
+            return None
+
+        cache = runtime_state.setdefault('kline_df_cache', {})
+        entry = cache.get(kline_cache_key(symbol, '5m', limit))
+        if not entry or entry.get('df') is None:
+            return None
+
+        merge_start = time.monotonic()
+        raw_columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
+        cached_raw = entry['df'][raw_columns]
+        lightweight_raw = lightweight_df[raw_columns]
+        merged = pd.concat([cached_raw, lightweight_raw], ignore_index=True)
+        merged = merged.drop_duplicates(subset=['timestamp'], keep='last')
+        merged = merged.sort_values('timestamp').tail(limit).reset_index(drop=True)
+        record_perf(local_perf, 'fetch_df_5m_reuse_merge', merge_start)
+
+        if len(merged) < min(limit, len(cached_raw)):
+            return None
+
+        df = add_strategy_indicators(merged, '5m', perf=local_perf)
+        elapsed = elapsed_ms(total_start)
+        local_perf['fetch_df_5m_reused_lightweight'] = elapsed
+        local_perf['fetch_df_5m_total'] = elapsed
+        df.attrs['perf'] = local_perf
+        store_kline_df_cache(symbol, '5m', limit, df)
+        return df
+    except Exception as e:
+        logging.warning(f"复用轻量5M缓存失败，降级重新抓取完整5M: {e}")
+        return None
+
+
+def fetch_lightweight_5m_df(symbol, limit=LIGHTWEIGHT_5M_GATE_LIMIT):
+    """空仓gate只取5M原始K线并统一时间格式，不计算任何指标。"""
+    perf = {}
+    fetch_start = time.monotonic()
+    ohlcv = exchange.fetch_ohlcv(symbol, '5m', limit=limit)
+    record_perf(perf, 'lightweight_5m_fetch_ohlcv', fetch_start)
+    if not ohlcv:
+        return None, perf
+
+    dataframe_start = time.monotonic()
+    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df['timestamp'] = df['timestamp'].dt.tz_localize('UTC').dt.tz_convert('Asia/Shanghai')
+    record_perf(perf, 'lightweight_5m_dataframe', dataframe_start)
+    return df, perf
 
 
 def maybe_log_heartbeat():
@@ -1027,20 +1257,27 @@ def fetch_raw_future_open_algo_orders():
     return [normalize_raw_algo_order(order) for order in raw_orders]
 
 
-def fetch_open_close_position_orders(side=None):
+def fetch_open_close_position_orders(side=None, perf=None):
     """读取当前仓位方向上的全平仓条件单，便于做撤单确认和冲突排查。"""
+    total_start = time.monotonic()
     open_orders = []
     unified_fetch_failed = False
     try:
+        unified_start = time.monotonic()
         open_orders = exchange.fetch_open_orders(SYMBOL)
     except Exception as e:
         logging.warning(f"查询未成交条件单失败: {e}")
         unified_fetch_failed = True
         open_orders = []
+    finally:
+        record_perf(perf, 'fetch_open_close_position_orders_unified', unified_start)
 
+    raw_open_start = time.monotonic()
     raw_open_orders = fetch_raw_future_open_orders()
+    record_perf(perf, 'fetch_open_close_position_orders_raw_open', raw_open_start)
     if raw_open_orders is None:
         if unified_fetch_failed:
+            record_perf(perf, 'fetch_open_close_position_orders', total_start)
             return None
         raw_open_orders = []
     if raw_open_orders:
@@ -1051,9 +1288,12 @@ def fetch_open_close_position_orders(side=None):
                 continue
             open_orders.append(raw_order)
 
+    raw_algo_start = time.monotonic()
     raw_algo_orders = fetch_raw_future_open_algo_orders()
+    record_perf(perf, 'fetch_open_close_position_orders_raw_algo', raw_algo_start)
     if raw_algo_orders is None:
         if unified_fetch_failed and not open_orders:
+            record_perf(perf, 'fetch_open_close_position_orders', total_start)
             return None
         raw_algo_orders = []
     if raw_algo_orders:
@@ -1068,6 +1308,7 @@ def fetch_open_close_position_orders(side=None):
     for order in open_orders:
         if is_close_position_conditional_order(order, side=side):
             matched_orders.append(order)
+    record_perf(perf, 'fetch_open_close_position_orders', total_start)
     return matched_orders
 
 
@@ -1132,8 +1373,9 @@ def cancel_all_open_orders_for_symbol(silent=False):
     return False
 
 
-def cancel_conditional_orders(orders, silent=False, reason='清理残留条件委托'):
+def cancel_conditional_orders(orders, silent=False, reason='清理残留条件委托', perf=None):
     """只撤销传入的 closePosition/reduceOnly 条件委托，不影响普通挂单。"""
+    cancel_start = time.monotonic()
     algo_order_ids = []
     regular_order_ids = []
     order_ids = []
@@ -1148,6 +1390,7 @@ def cancel_conditional_orders(orders, silent=False, reason='清理残留条件�
                 regular_order_ids.append(order_id)
     order_ids = list(dict.fromkeys(order_ids))
     if not order_ids:
+        record_perf(perf, 'cancel_conditional_orders', cancel_start)
         return True
 
     cancel_failed = False
@@ -1185,19 +1428,20 @@ def cancel_conditional_orders(orders, silent=False, reason='清理残留条件�
             if not silent:
                 logging.warning(f"{reason}: 撤销条件委托失败({order_id}): {error_text}")
 
+    record_perf(perf, 'cancel_conditional_orders', cancel_start)
     return not cancel_failed
 
 
-def cancel_all_close_position_conditional_orders(silent=False, reason='无仓位清理残留条件委托'):
+def cancel_all_close_position_conditional_orders(silent=False, reason='无仓位清理残留条件委托', perf=None):
     """没有交易所仓位时，清掉本交易对所有平仓类条件委托。"""
-    matched_orders = fetch_open_close_position_orders(side=None)
+    matched_orders = fetch_open_close_position_orders(side=None, perf=perf)
     if matched_orders is None:
         return False
     if not matched_orders:
         clear_local_stop_order_state()
         return True
 
-    ok = cancel_conditional_orders(matched_orders, silent=silent, reason=reason)
+    ok = cancel_conditional_orders(matched_orders, silent=silent, reason=reason, perf=perf)
     if ok:
         clear_local_stop_order_state()
     return ok
@@ -1248,14 +1492,16 @@ def reconcile_conditional_orders_for_position(side, silent=False):
     return True
 
 
-def cleanup_orphan_conditional_orders_if_needed(force=False, silent=True):
+def cleanup_orphan_conditional_orders_if_needed(force=False, silent=True, perf=None):
     """本地无仓位时定期清理残留条件委托；有交易所仓位则不贸然撤单。"""
     global last_conditional_order_cleanup_monotonic
     now = time.monotonic()
     if not force and (now - last_conditional_order_cleanup_monotonic) < CONDITIONAL_ORDER_CLEANUP_INTERVAL_SECONDS:
         return True
 
+    position_risk_start = time.monotonic()
     position_risk = get_position_risk()
+    record_perf(perf, 'empty_position_cleanup_get_position_risk', position_risk_start)
     if position_risk and position_risk.get('fetch_failed'):
         logging.warning("清理残留条件委托前无法确认交易所仓位，本轮跳过，避免误撤")
         return False
@@ -1267,7 +1513,10 @@ def cleanup_orphan_conditional_orders_if_needed(force=False, silent=True):
         return False
 
     last_conditional_order_cleanup_monotonic = now
-    return cancel_all_close_position_conditional_orders(silent=silent)
+    cancel_all_start = time.monotonic()
+    ok = cancel_all_close_position_conditional_orders(silent=silent, perf=perf)
+    record_perf(perf, 'empty_position_cleanup_cancel_all_close_position_orders', cancel_all_start)
+    return ok
 
 
 def pick_active_protective_stop_order(orders, preferred_order_id=''):
@@ -1856,6 +2105,21 @@ def open_order(side, price, sl_price, state_4h, state_1h, state_15m, signal_bar_
     """执行开仓指令"""
     global trade_state
     entry_meta = entry_meta or {}
+    if DRY_RUN_OPEN_ORDER:
+        logging.warning(
+            "DRY_RUN_OPEN_ORDER: 已拦截开仓 side=%s, price=%s, stop=%s, signal_bar_15m=%s, "
+            "reason=%s, trigger_tf=%s, entry_meta=%s",
+            side,
+            price,
+            sl_price,
+            signal_bar_15m,
+            entry_reason,
+            entry_trigger_tf,
+            entry_meta
+        )
+        print("DRY_RUN_OPEN_ORDER_BLOCKED")
+        return False
+
     amount = calculate_amount(price)
     amount = float(amount)
     if amount == 0:
@@ -2244,6 +2508,62 @@ def validate_signal_bar(timeframe, signal_bar, now_dt=None):
         trade_state[max_seen_key] = signal_bar
 
     return {'valid': True, 'is_new': is_new, 'reason': 'ok', 'stale_seconds': stale_seconds}
+
+
+def copy_df_perf(perf, dfs):
+    for df in dfs.values():
+        if df is None:
+            continue
+        for key, value in getattr(df, 'attrs', {}).get('perf', {}).items():
+            add_perf(perf, key, value)
+
+
+def check_empty_position_lightweight_5m_gate(perf):
+    """空仓时先用轻量5M判断是否需要进入完整多周期扫描。"""
+    gate_start = time.monotonic()
+    try:
+        if not trade_state.get('last_processed_bar_5m') or not trade_state.get('max_seen_bar_5m'):
+            return {'action': 'full', 'reason': 'cold_start'}
+
+        server_time_start = time.monotonic()
+        server_now_dt = get_server_now_dt()
+        record_perf(perf, 'lightweight_5m_server_time', server_time_start)
+
+        try:
+            df_5m, fetch_perf = fetch_lightweight_5m_df(SYMBOL, limit=LIGHTWEIGHT_5M_GATE_LIMIT)
+            for key, value in fetch_perf.items():
+                add_perf(perf, key, value)
+        except Exception as e:
+            logging.warning(f"轻量5M gate抓取失败，降级完整流程: {e}")
+            return {'action': 'full', 'reason': 'lightweight_fetch_failed'}
+
+        if df_5m is None or len(df_5m) == 0:
+            logging.warning("轻量5M gate返回空K线，降级完整流程")
+            return {'action': 'full', 'reason': 'lightweight_empty_fetch'}
+
+        signal_bar_5m = get_closed_bar_time(df_5m, '5m', now_dt=server_now_dt)
+        validate_start = time.monotonic()
+        signal_guard_5m = validate_signal_bar('5m', signal_bar_5m, now_dt=server_now_dt)
+        record_perf(perf, 'lightweight_5m_validate_signal_bar', validate_start)
+
+        if not signal_guard_5m.get('valid'):
+            logging.warning(
+                f"轻量5M gate跳过异常信号K线: signal={signal_bar_5m}, "
+                f"reason={signal_guard_5m.get('reason')}"
+            )
+            return {'action': 'skip', 'reason': f"lightweight_invalid_{signal_guard_5m.get('reason')}"}
+
+        if not signal_guard_5m.get('is_new'):
+            return {'action': 'skip', 'reason': 'lightweight_no_new_5m'}
+
+        return {
+            'action': 'full',
+            'reason': 'lightweight_new_5m',
+            'df_5m': df_5m,
+            'server_now_dt': server_now_dt
+        }
+    finally:
+        record_perf(perf, 'lightweight_5m_gate_total', gate_start)
 
 
 def get_closed_df(df, timeframe, now_dt=None):
@@ -3655,13 +3975,30 @@ def build_entry_candidates(context):
     return candidates
 
 
-def build_context(dfs, now_dt):
+def build_context(dfs, now_dt, perf=None):
+    trend_start = time.monotonic()
     trend_states = {
         timeframe: evaluate_adx_ema_context(df, timeframe, now_dt=now_dt)
         for timeframe, df in dfs.items()
         if timeframe in ('15m', '1h', '4h', '1d')
     }
-    return {'dfs': dfs, 'now_dt': now_dt, 'trend_states': trend_states, 'zones': build_support_resistance_zones(dfs['4h'], now_dt=now_dt)}
+    record_perf(perf, 'build_context_trend_states', trend_start)
+
+    sr_start = time.monotonic()
+    sr_bar_time = get_closed_bar_time(dfs['4h'], '4h', now_dt=now_dt)
+    sr_cache = runtime_state.get('support_resistance_cache', {})
+    if sr_bar_time and sr_cache.get('bar_time') == sr_bar_time and sr_cache.get('zones') is not None:
+        zones = copy.deepcopy(sr_cache['zones'])
+        add_perf(perf, 'build_context_support_resistance_cache_hit', elapsed_ms(sr_start))
+    else:
+        zones = build_support_resistance_zones(dfs['4h'], now_dt=now_dt)
+        if sr_bar_time:
+            runtime_state['support_resistance_cache'] = {
+                'bar_time': sr_bar_time,
+                'zones': copy.deepcopy(zones)
+            }
+    record_perf(perf, 'build_context_support_resistance', sr_start)
+    return {'dfs': dfs, 'now_dt': now_dt, 'trend_states': trend_states, 'zones': zones}
 
 
 def is_in_post_exit_cooldown(now_dt):
@@ -3675,7 +4012,7 @@ def is_in_post_exit_cooldown(now_dt):
     return (now_dt - last_exit_dt).total_seconds() < POST_EXIT_COOLDOWN_SECONDS
 
 
-def update_stop_if_tighter(side, new_stop, reason, curr_price, signal_bar_15m=''):
+def update_stop_if_tighter(side, new_stop, reason, curr_price, signal_bar_15m='', perf=None):
     current_stop = price_to_float(trade_state.get('stop_loss_price'))
     new_stop = precision_price(new_stop)
     tick = get_price_tick(curr_price)
@@ -3687,7 +4024,10 @@ def update_stop_if_tighter(side, new_stop, reason, curr_price, signal_bar_15m=''
     else:
         if (current_stop > 0 and new_stop >= current_stop) or new_stop < curr_price + tick:
             return False
-    if refresh_protective_stop_order(new_stop):
+    refresh_start = time.monotonic()
+    refreshed = refresh_protective_stop_order(new_stop)
+    record_perf(perf, 'refresh_protective_stop_order', refresh_start)
+    if refreshed:
         trade_state['stop_loss_price'] = new_stop
         logging.info(f"{reason}: 已收紧服务端止损到 {new_stop}")
         return True
@@ -3730,103 +4070,115 @@ def profit_atr_lock_stop_for_position(side, entry, highest, lowest, atr):
     }
 
 
-def apply_new_exit_rules(context, signal_bar_15m=''):
+def apply_new_exit_rules(context, signal_bar_15m='', curr_price=None, price_ts=None, perf=None):
     if not trade_state.get('has_position'):
         return
+    apply_start = time.monotonic()
     side = trade_state.get('side')
-    curr_price = get_latest_price()
-    tick = get_price_tick(curr_price)
-    stop_candidates = []
-
-    def add_stop_candidate(stop, reason):
-        stop = price_to_float(stop)
-        if stop > 0:
-            stop_candidates.append((stop, reason))
-
-    exit_tf = trade_state.get('entry_exit_tf') or STRATEGY_EXIT_TF.get(trade_state.get('entry_strategy_tf'), '15m')
-    df_exit = context['dfs'].get(exit_tf)
-    exit_atr = 0.0
-    if df_exit is not None:
-        df_exit_closed = get_closed_df(df_exit, exit_tf, context['now_dt'])
-        if len(df_exit_closed) > 0:
-            exit_atr = price_to_float(df_exit_closed.iloc[-1].get('atr'))
-        large = latest_large_strong(df_exit_closed)
-        if large:
-            add_stop_candidate(
-                strong_candle_stop_for_position(side, large, tick),
-                f"{exit_tf}出现大强{large.get('direction')}线，按强K结构收紧止损"
-            )
-
-        same_strong = latest_effective_strong(df_exit_closed, side)
-        if same_strong:
-            add_stop_candidate(
-                strong_candle_stop_for_position(side, same_strong, tick),
-                f"{exit_tf}出现同向{same_strong.get('kind')}强K，按强K结构收紧止损"
-            )
-
-        opposite = 'short' if side == 'long' else 'long'
-        strong_opposite = latest_effective_strong(df_exit_closed, opposite)
-        if strong_opposite:
-            add_stop_candidate(
-                strong_candle_stop_for_position(side, strong_opposite, tick),
-                f"{exit_tf}出现反向{strong_opposite.get('kind')}强K，按强K结构收紧止损"
-            )
-
-    entry = price_to_float(trade_state.get('entry_price'))
-    highest = price_to_float(trade_state.get('highest_price'))
-    lowest = price_to_float(trade_state.get('lowest_price'))
-    profit_lock = profit_atr_lock_stop_for_position(side, entry, highest, lowest, exit_atr)
-    if profit_lock:
-        add_stop_candidate(
-            profit_lock['stop'],
-            (
-                f"最高浮盈达到{profit_lock['profit_atr']:.2f}ATR，"
-                f"至少保留{profit_lock['retain_ratio']:.0%}利润"
-            )
-        )
-
-    target = price_to_float(trade_state.get('entry_sr_target'))
-    risk = price_to_float(trade_state.get('entry_initial_risk'))
-    if target <= 0 and entry > 0 and risk > 0:
-        target = entry + 2 * risk if side == 'long' else entry - 2 * risk
-    if target > 0:
-        if side == 'long' and curr_price >= target:
-            add_stop_candidate(max(entry, target - 0.5 * risk), "达到第一目标位，收紧保护止损")
-        elif side == 'short' and curr_price <= target:
-            add_stop_candidate(min(entry, target + 0.5 * risk), "达到第一目标位，收紧保护止损")
-
-    df_4h_closed = get_closed_df(context['dfs']['4h'], '4h', context['now_dt'])
-    if len(df_4h_closed) > 0:
-        atr_4h = price_to_float(df_4h_closed.iloc[-1].get('atr'))
-        near_buffer = SUP_RES_NEAR_ATR * atr_4h
-        zones = context.get('zones', {})
-        if side == 'long':
-            resistance = nearest_opposite_zone(zones, side, curr_price - near_buffer)
-            if resistance and curr_price >= resistance['lower'] - near_buffer:
-                add_stop_candidate(resistance['lower'] - 0.4 * atr_4h, "靠近有效阻力区，缩紧止盈")
-        else:
-            support = nearest_opposite_zone(zones, side, curr_price + near_buffer)
-            if support and curr_price <= support['upper'] + near_buffer:
-                add_stop_candidate(support['upper'] + 0.4 * atr_4h, "靠近有效支撑区，缩紧止盈")
-
-    if not stop_candidates:
-        return
-    if side == 'long':
-        best_stop, reason = max(stop_candidates, key=lambda item: item[0])
+    price_start = time.monotonic()
+    now_ts = time.monotonic()
+    if curr_price is not None and price_ts is not None and (now_ts - price_ts) * 1000.0 <= EXIT_RULE_PRICE_MAX_AGE_MS:
+        curr_price = float(curr_price)
     else:
-        best_stop, reason = min(stop_candidates, key=lambda item: item[0])
-    update_stop_if_tighter(side, best_stop, reason, curr_price, signal_bar_15m=signal_bar_15m)
+        curr_price = get_latest_price()
+    record_perf(perf, 'apply_new_exit_rules_get_latest_price', price_start)
+    try:
+        tick = get_price_tick(curr_price)
+        stop_candidates = []
+
+        def add_stop_candidate(stop, reason):
+            stop = price_to_float(stop)
+            if stop > 0:
+                stop_candidates.append((stop, reason))
+
+        exit_tf = trade_state.get('entry_exit_tf') or STRATEGY_EXIT_TF.get(trade_state.get('entry_strategy_tf'), '15m')
+        df_exit = context['dfs'].get(exit_tf)
+        exit_atr = 0.0
+        if df_exit is not None:
+            df_exit_closed = get_closed_df(df_exit, exit_tf, context['now_dt'])
+            if len(df_exit_closed) > 0:
+                exit_atr = price_to_float(df_exit_closed.iloc[-1].get('atr'))
+            large = latest_large_strong(df_exit_closed)
+            if large:
+                add_stop_candidate(
+                    strong_candle_stop_for_position(side, large, tick),
+                    f"{exit_tf}出现大强{large.get('direction')}线，按强K结构收紧止损"
+                )
+
+            same_strong = latest_effective_strong(df_exit_closed, side)
+            if same_strong:
+                add_stop_candidate(
+                    strong_candle_stop_for_position(side, same_strong, tick),
+                    f"{exit_tf}出现同向{same_strong.get('kind')}强K，按强K结构收紧止损"
+                )
+
+            opposite = 'short' if side == 'long' else 'long'
+            strong_opposite = latest_effective_strong(df_exit_closed, opposite)
+            if strong_opposite:
+                add_stop_candidate(
+                    strong_candle_stop_for_position(side, strong_opposite, tick),
+                    f"{exit_tf}出现反向{strong_opposite.get('kind')}强K，按强K结构收紧止损"
+                )
+
+        entry = price_to_float(trade_state.get('entry_price'))
+        highest = price_to_float(trade_state.get('highest_price'))
+        lowest = price_to_float(trade_state.get('lowest_price'))
+        profit_lock = profit_atr_lock_stop_for_position(side, entry, highest, lowest, exit_atr)
+        if profit_lock:
+            add_stop_candidate(
+                profit_lock['stop'],
+                (
+                    f"最高浮盈达到{profit_lock['profit_atr']:.2f}ATR，"
+                    f"至少保留{profit_lock['retain_ratio']:.0%}利润"
+                )
+            )
+
+        target = price_to_float(trade_state.get('entry_sr_target'))
+        risk = price_to_float(trade_state.get('entry_initial_risk'))
+        if target <= 0 and entry > 0 and risk > 0:
+            target = entry + 2 * risk if side == 'long' else entry - 2 * risk
+        if target > 0:
+            if side == 'long' and curr_price >= target:
+                add_stop_candidate(max(entry, target - 0.5 * risk), "达到第一目标位，收紧保护止损")
+            elif side == 'short' and curr_price <= target:
+                add_stop_candidate(min(entry, target + 0.5 * risk), "达到第一目标位，收紧保护止损")
+
+        df_4h_closed = get_closed_df(context['dfs']['4h'], '4h', context['now_dt'])
+        if len(df_4h_closed) > 0:
+            atr_4h = price_to_float(df_4h_closed.iloc[-1].get('atr'))
+            near_buffer = SUP_RES_NEAR_ATR * atr_4h
+            zones = context.get('zones', {})
+            if side == 'long':
+                resistance = nearest_opposite_zone(zones, side, curr_price - near_buffer)
+                if resistance and curr_price >= resistance['lower'] - near_buffer:
+                    add_stop_candidate(resistance['lower'] - 0.4 * atr_4h, "靠近有效阻力区，缩紧止盈")
+            else:
+                support = nearest_opposite_zone(zones, side, curr_price + near_buffer)
+                if support and curr_price <= support['upper'] + near_buffer:
+                    add_stop_candidate(support['upper'] + 0.4 * atr_4h, "靠近有效支撑区，缩紧止盈")
+
+        if not stop_candidates:
+            return
+        if side == 'long':
+            best_stop, reason = max(stop_candidates, key=lambda item: item[0])
+        else:
+            best_stop, reason = min(stop_candidates, key=lambda item: item[0])
+        update_stop_if_tighter(side, best_stop, reason, curr_price, signal_bar_15m=signal_bar_15m, perf=perf)
+    finally:
+        record_perf(perf, 'apply_new_exit_rules', apply_start)
 
 
-def monitor_position_new(context, signal_bar_15m='', allow_strategy_close=False):
+def monitor_position_new(context, signal_bar_15m='', allow_strategy_close=False, perf=None):
     """新版持仓管理：只保留仓位同步、保护止损和新策略出场规则。"""
     try:
         side = trade_state.get('side')
         if side not in ('long', 'short'):
-            cleanup_orphan_conditional_orders_if_needed(silent=True)
+            cleanup_orphan_conditional_orders_if_needed(silent=True, perf=perf)
             return
 
+        position_risk_start = time.monotonic()
         position_risk = get_position_risk(side=side)
+        record_perf(perf, 'monitor_position_get_position_risk', position_risk_start)
         if position_risk and position_risk.get('fetch_failed'):
             logging.warning("本轮无法获取交易所仓位风险信息，跳过持仓管理，避免误判")
             return
@@ -3838,7 +4190,9 @@ def monitor_position_new(context, signal_bar_15m='', allow_strategy_close=False)
                 )
                 return
 
+            fallback_start = time.monotonic()
             fallback_check = has_open_position_on_exchange(side=side)
+            record_perf(perf, 'monitor_position_fallback_position_check', fallback_start)
             if fallback_check.get('fetch_failed'):
                 logging.warning("二次确认仓位失败，本轮不重置本地状态，避免误判")
                 return
@@ -3851,7 +4205,9 @@ def monitor_position_new(context, signal_bar_15m='', allow_strategy_close=False)
                 'stop_order_id_before_cancel': trade_state.get('stop_order_id', ''),
                 'stop_order_price_before_cancel': trade_state.get('stop_order_price', 0.0)
             }
-            cancel_all_close_position_conditional_orders(silent=True, reason='确认无仓位后清理残留条件委托')
+            external_cleanup_start = time.monotonic()
+            cancel_all_close_position_conditional_orders(silent=True, reason='确认无仓位后清理残留条件委托', perf=perf)
+            record_perf(perf, 'monitor_position_external_close_cleanup', external_cleanup_start)
             reset_trade_state_after_external_close(
                 signal_bar_15m=signal_bar_15m,
                 reason="检测到交易所实际已无仓位，可能是服务端止损或人工操作已成交，本地状态已重置",
@@ -3861,12 +4217,17 @@ def monitor_position_new(context, signal_bar_15m='', allow_strategy_close=False)
 
         trade_state['position_miss_count'] = 0
         trade_state['liquidation_price'] = position_risk.get('liquidation_price') or 0.0
+        reconcile_start = time.monotonic()
         reconcile_conditional_orders_for_position(side, silent=True)
+        record_perf(perf, 'monitor_position_reconcile_conditional_orders', reconcile_start)
         trade_state['close_cond_4h'] = context['trend_states'].get('4h', {}).get('summary', '')
         trade_state['close_cond_1h'] = context['trend_states'].get('1h', {}).get('summary', '')
         trade_state['close_cond_15m'] = context['trend_states'].get('15m', {}).get('summary', '')
 
+        price_start = time.monotonic()
         curr_price = get_latest_price()
+        price_ts = time.monotonic()
+        record_perf(perf, 'monitor_position_get_latest_price', price_start)
         stop_loss = price_to_float(trade_state.get('stop_loss_price'))
         if side == 'long':
             if curr_price > price_to_float(trade_state.get('highest_price')):
@@ -3881,7 +4242,7 @@ def monitor_position_new(context, signal_bar_15m='', allow_strategy_close=False)
                 close_position("触发保护止损", curr_price, signal_bar_15m=signal_bar_15m, trigger_label="保护止损")
                 return
 
-        apply_new_exit_rules(context, signal_bar_15m=signal_bar_15m)
+        apply_new_exit_rules(context, signal_bar_15m=signal_bar_15m, curr_price=curr_price, price_ts=price_ts, perf=perf)
     except Exception as e:
         logging.error(f"新版持仓管理异常: {e}")
         logging.error(traceback.format_exc())
@@ -3909,72 +4270,115 @@ def states_for_candidate(context, candidate):
 
 def run_strategy():
     """新版策略主循环：5M节拍扫描，15m/1h/4h按权重产生候选信号。"""
+    perf = {}
+    run_start = time.monotonic()
+    exit_reason = 'completed'
+    try:
+        exit_reason = _run_strategy_impl(perf)
+    except Exception:
+        exit_reason = 'exception'
+        raise
+    finally:
+        log_run_strategy_perf(perf, run_start, exit_reason)
+
+
+def _run_strategy_impl(perf):
+    """run_strategy主体；返回退出原因，便于统一记录性能日志。"""
     global trade_state
+    gate_result = {}
+
+    if not trade_state.get('has_position'):
+        cleanup_start = time.monotonic()
+        cleanup_ok = cleanup_orphan_conditional_orders_if_needed(silent=True, perf=perf)
+        record_perf(perf, 'empty_position_cleanup', cleanup_start)
+        if not cleanup_ok:
+            logging.warning("无本地仓位时条件委托/交易所仓位状态未清理干净，本轮跳过开仓")
+            return 'empty_position_cleanup_failed'
+
+        gate_result = check_empty_position_lightweight_5m_gate(perf)
+        if gate_result.get('action') == 'skip':
+            return gate_result.get('reason', 'lightweight_gate_skip')
+
+    fetch_all_start = time.monotonic()
+    reused_5m_df = None
+    if gate_result.get('reason') == 'lightweight_new_5m':
+        reused_5m_df = rebuild_5m_df_from_lightweight_cache(SYMBOL, 220, gate_result.get('df_5m'))
 
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
     try:
         futures = {
-            '5m': executor.submit(fetch_df, SYMBOL, '5m', 220),
-            '15m': executor.submit(fetch_df, SYMBOL, '15m', 220),
-            '1h': executor.submit(fetch_df, SYMBOL, '1h', 220),
-            '4h': executor.submit(fetch_df, SYMBOL, '4h', SUP_RES_LOOKBACK_4H),
-            '1d': executor.submit(fetch_df, SYMBOL, '1d', 140),
+            '15m': executor.submit(fetch_df_cached, SYMBOL, '15m', 220),
+            '1h': executor.submit(fetch_df_cached, SYMBOL, '1h', 220),
+            '4h': executor.submit(fetch_df_cached, SYMBOL, '4h', SUP_RES_LOOKBACK_4H),
+            '1d': executor.submit(fetch_df_cached, SYMBOL, '1d', 140),
         }
+        if reused_5m_df is None:
+            futures['5m'] = executor.submit(fetch_df, SYMBOL, '5m', 220)
         dfs = {
             timeframe: future.result(timeout=FETCH_DF_TASK_TIMEOUT_SECONDS)
             for timeframe, future in futures.items()
         }
+        if reused_5m_df is not None:
+            dfs['5m'] = reused_5m_df
+        record_perf(perf, 'fetch_all_klines_total', fetch_all_start)
     except concurrent.futures.TimeoutError:
+        record_perf(perf, 'fetch_all_klines_total', fetch_all_start)
         logging.error(f"抓取K线任务超时，已跳过本轮策略计算: timeout={FETCH_DF_TASK_TIMEOUT_SECONDS}s")
         executor.shutdown(wait=False, cancel_futures=True)
-        return
+        return 'fetch_all_klines_timeout'
     except Exception:
+        record_perf(perf, 'fetch_all_klines_total', fetch_all_start)
         executor.shutdown(wait=False, cancel_futures=True)
         raise
     else:
         executor.shutdown(wait=True)
 
+    copy_df_perf(perf, dfs)
+
     if any(df is None for df in dfs.values()):
         # 多周期数据必须齐全；缺一个周期就放弃本轮，避免用残缺背景做交易决策。
-        return
+        return 'fetch_all_klines_incomplete'
 
     server_now_dt = get_server_now_dt()
+    store_kline_df_cache(SYMBOL, '5m', 220, dfs['5m'], now_dt=server_now_dt)
+    validate_start = time.monotonic()
     signal_bar_5m = get_closed_bar_time(dfs['5m'], '5m', now_dt=server_now_dt)
     signal_bar_15m = get_closed_bar_time(dfs['15m'], '15m', now_dt=server_now_dt)
     signal_guard_5m = validate_signal_bar('5m', signal_bar_5m, now_dt=server_now_dt)
     signal_guard_15m = validate_signal_bar('15m', signal_bar_15m, now_dt=server_now_dt)
+    record_perf(perf, 'validate_signal_bar', validate_start)
 
     if not signal_guard_5m['valid']:
         logging.warning(f"跳过异常5M信号K线: signal={signal_bar_5m}, reason={signal_guard_5m.get('reason')}")
-        return
+        return f"invalid_5m_signal_{signal_guard_5m.get('reason')}"
 
     is_new_signal_5m = bool(signal_guard_5m['is_new'])
     is_new_signal_15m = bool(signal_guard_15m.get('valid') and signal_guard_15m.get('is_new'))
 
-    if not trade_state.get('has_position'):
-        if not cleanup_orphan_conditional_orders_if_needed(silent=True):
-            logging.warning("无本地仓位时条件委托/交易所仓位状态未清理干净，本轮跳过开仓")
-            return
-
     #判断各个周期的趋势条件和4h的支撑和阻挡区间
-    context = build_context(dfs, server_now_dt)
+    context_start = time.monotonic()
+    context = build_context(dfs, server_now_dt, perf=perf)
+    record_perf(perf, 'build_context', context_start)
 
     if trade_state['has_position']:
+        monitor_start = time.monotonic()
         monitor_position_new(
             context,
             signal_bar_15m=signal_bar_15m if signal_guard_15m.get('valid') else '',
-            allow_strategy_close=is_new_signal_5m
+            allow_strategy_close=is_new_signal_5m,
+            perf=perf
         )
+        record_perf(perf, 'monitor_position_new', monitor_start)
         if is_new_signal_5m:
             trade_state['last_processed_bar_5m'] = signal_bar_5m
         if is_new_signal_15m:
             trade_state['last_processed_bar_15m'] = signal_bar_15m
         # 持仓期间只做仓位管理，不在同一轮继续寻找新开仓。
-        return
+        return 'position_managed'
 
     if not is_new_signal_5m:
         # 同一根 5M K 线只处理一次，避免轮询频率高导致重复开仓。
-        return
+        return 'no_new_5m_after_full_fetch'
 
     # 判断是否在平仓冷却期
     if is_in_post_exit_cooldown(server_now_dt):
@@ -3982,17 +4386,19 @@ def run_strategy():
         trade_state['last_processed_bar_5m'] = signal_bar_5m
         if is_new_signal_15m:
             trade_state['last_processed_bar_15m'] = signal_bar_15m
-        return
+        return 'post_exit_cooldown'
 
     # 趋势开仓候选信号
     # 回调候选信号
     # 突破关键位置候选信号
+    candidates_start = time.monotonic()
     candidates = build_entry_candidates(context)
+    record_perf(perf, 'build_entry_candidates', candidates_start)
     if not candidates:
         trade_state['last_processed_bar_5m'] = signal_bar_5m
         if is_new_signal_15m:
             trade_state['last_processed_bar_15m'] = signal_bar_15m
-        return
+        return 'no_candidates'
 
     #这里选择优先级最高的候选信号，如果优先级相同并且有多个多空冲突则跳过
     best_priority = candidate_priority(candidates[0])
@@ -4003,7 +4409,7 @@ def run_strategy():
         trade_state['last_processed_bar_5m'] = signal_bar_5m
         if is_new_signal_15m:
             trade_state['last_processed_bar_15m'] = signal_bar_15m
-        return
+        return 'top_candidate_side_conflict'
 
     candidate = top_candidates[0]
     if candidate['strategy_tf'] == '15m' and signal_bar_15m in (trade_state.get('last_entry_bar_15m'), trade_state.get('last_exit_bar_15m')):
@@ -4011,8 +4417,10 @@ def run_strategy():
         trade_state['last_processed_bar_5m'] = signal_bar_5m
         if is_new_signal_15m:
             trade_state['last_processed_bar_15m'] = signal_bar_15m
-        return
+        return 'same_15m_bar_traded'
+    price_start = time.monotonic()
     curr_price = get_latest_price()
+    record_perf(perf, 'get_latest_price', price_start)
     #判断候选信号的入场价格是否仍然有效
     entry_still_valid, entry_invalid_reason = candidate_entry_price_still_valid(candidate, curr_price)
     if not entry_still_valid:
@@ -4020,21 +4428,21 @@ def run_strategy():
         trade_state['last_processed_bar_5m'] = signal_bar_5m
         if is_new_signal_15m:
             trade_state['last_processed_bar_15m'] = signal_bar_15m
-        return
+        return 'entry_price_invalid'
     sr_zone_still_valid, sr_zone_invalid_reason = candidate_sr_entry_zone_still_valid(candidate, context, curr_price)
     if not sr_zone_still_valid:
         logging.info(sr_zone_invalid_reason)
         trade_state['last_processed_bar_5m'] = signal_bar_5m
         if is_new_signal_15m:
             trade_state['last_processed_bar_15m'] = signal_bar_15m
-        return
+        return 'sr_zone_invalid'
     target_still_valid, target_invalid_reason = candidate_target_profit_still_valid(candidate, curr_price)
     if not target_still_valid:
         logging.info(target_invalid_reason)
         trade_state['last_processed_bar_5m'] = signal_bar_5m
         if is_new_signal_15m:
             trade_state['last_processed_bar_15m'] = signal_bar_15m
-        return
+        return 'target_profit_invalid'
     #获取候选信号的4h、1h、15m状态
     state_4h, state_1h, state_15m = states_for_candidate(context, candidate)
     entry_meta = {
@@ -4044,6 +4452,7 @@ def run_strategy():
         'profit_check_atr': candidate.get('profit_check_atr', 0.0)
     }
     try:
+        open_order_start = time.monotonic()
         opened = open_order(
             candidate['side'],
             curr_price,
@@ -4056,6 +4465,7 @@ def run_strategy():
             entry_trigger_tf=f"{candidate.get('strategy_tf')}->{candidate.get('trigger_tf')}",
             entry_meta=entry_meta
         )
+        record_perf(perf, 'open_order', open_order_start)
         if opened:
             logging.info(
                 f"新版策略开仓成功: side={candidate['side']}, module={candidate['module']}, "
@@ -4065,11 +4475,13 @@ def run_strategy():
         else:
             logging.warning(f"新版策略开仓未成功: {candidate}")
     except Exception:
+        record_perf(perf, 'open_order', open_order_start)
         logging.error(f"新版策略开仓失败:\n{traceback.format_exc()}")
 
     trade_state['last_processed_bar_5m'] = signal_bar_5m
     if is_new_signal_15m:
         trade_state['last_processed_bar_15m'] = signal_bar_15m
+    return 'open_order_attempted'
 
 
 def cleanup_conditional_orders_once():
@@ -4093,10 +4505,24 @@ def cleanup_conditional_orders_once():
     return ok
 
 
+def cli_arg_value(name):
+    """读取形如 --observe-seconds 180 的简单命令行参数。"""
+    if name not in sys.argv:
+        return None
+    idx = sys.argv.index(name)
+    if idx + 1 >= len(sys.argv):
+        return None
+    return sys.argv[idx + 1]
+
+
 # ==========================================
 # 4. 程序入口
 # ==========================================
 if __name__ == '__main__':
+    if '--dry-run-open-order' in sys.argv:
+        DRY_RUN_OPEN_ORDER = True
+        logging.warning("DRY_RUN_OPEN_ORDER 已启用：本进程会拦截所有开仓，不会创建开仓订单")
+
     if '--cleanup-conditions' in sys.argv:
         try:
             current_time_str = get_server_time_str()
@@ -4117,14 +4543,29 @@ if __name__ == '__main__':
     except Exception as e:
         logging.error(f"启动自检失败，但主循环会继续尝试运行: {e}")
     #exchange.load_markets()
+    observe_seconds = None
+    observe_seconds_raw = cli_arg_value('--observe-seconds')
+    if observe_seconds_raw:
+        try:
+            observe_seconds = max(1, int(observe_seconds_raw))
+            logging.info(f"观察模式已启用：最多运行 {observe_seconds}s 后退出")
+        except ValueError:
+            logging.error(f"--observe-seconds 参数必须是整数: {observe_seconds_raw}")
+            sys.exit(2)
+    observe_end_ts = time.time() + observe_seconds if observe_seconds is not None else None
+    loop_count = 0
     while True:
         try:
             maybe_log_heartbeat()
             run_strategy()
+            loop_count += 1
         except Exception as e:
             print(traceback.format_exc())
             logging.error(f"系统运行报错: {e}")
             logging.error("主循环将继续运行，休眠后自动进入下一轮")
             time.sleep(MAIN_LOOP_ERROR_SLEEP_SECONDS)
             continue
+        if observe_end_ts is not None and time.time() >= observe_end_ts:
+            logging.info(f"观察模式结束：loops={loop_count}")
+            break
         time.sleep(MAIN_LOOP_SLEEP_SECONDS)
