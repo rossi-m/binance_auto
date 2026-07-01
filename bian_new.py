@@ -420,13 +420,20 @@ def extract_order_id(order):
         return ''
 
     info = order.get('info', {})
+    # ↓ 对应 CCXT 统一格式的字段名
+
     candidates = [
-        order.get('id'),
-        order.get('orderId'),
-        order.get('algoId'),
-        order.get('clientOrderId'),
-        order.get('clientAlgoId')
+        # 通常id和orderId是通用的，但algoId和clientOrderId可能需要根据具体情况判断
+        order.get('id'), #CCXT 层级的订单 ID
+
+        order.get('orderId'), # 普通挂单的订单 ID
+        order.get('algoId'), #条件委托的算法订单 ID
+
+        order.get('clientOrderId'), #普通挂单的客户端自定义 ID
+
+        order.get('clientAlgoId')   #条件委托的客户端自定义 ID
     ]
+    # ↓ 对应 Binance 原始响应里的字段名
     if isinstance(info, dict):
         candidates.extend([
             info.get('orderId'),
@@ -640,7 +647,7 @@ def fetch_df(symbol, timeframe, limit=100):
         dataframe_start = time.monotonic()
         df = ohlcv_to_dataframe(ohlcv)
         record_perf(perf, f'fetch_df_{timeframe}_dataframe', dataframe_start)
-
+        # 计算指标值：ema20,ema50,atr,adx
         df = add_strategy_indicators(df, timeframe, perf=perf)
         elapsed = time.monotonic() - start_ts
         log_fetch_df_perf(timeframe, elapsed)
@@ -666,9 +673,9 @@ def store_kline_df_cache(symbol, timeframe, limit, df, now_dt=None):
 
     cache = runtime_state.setdefault('kline_df_cache', {})
     cache[kline_cache_key(symbol, timeframe, limit)] = {
-        'bar_time': bar_time,
-        'df': df,
-        'updated_at_monotonic': time.monotonic()
+        'bar_time': bar_time, # 最后一个K线的收盘时间
+        'df': df, # 缓存5分钟数据
+        'updated_at_monotonic': time.monotonic() # 缓存更新时间
     }
 
 
@@ -718,21 +725,27 @@ def rebuild_5m_df_from_lightweight_cache(symbol, limit, lightweight_df):
             return None
 
         cache = runtime_state.setdefault('kline_df_cache', {})
+        # 获取缓存的5分钟220根k线
         entry = cache.get(kline_cache_key(symbol, '5m', limit))
         if not entry or entry.get('df') is None:
             return None
 
         raw_columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
         cached_raw = entry['df'][raw_columns]
+        # 轻量级5分钟K线 5根（包含未收盘的K线）
         lightweight_raw = lightweight_df[raw_columns]
+        # 合并缓存和轻量级K线
         merged = pd.concat([cached_raw, lightweight_raw], ignore_index=True)
+        # 去重并保留最新
         merged = merged.drop_duplicates(subset=['timestamp'], keep='last')
+        # 按时间排序并取最新limit根K线
         merged = merged.sort_values('timestamp').tail(limit).reset_index(drop=True)
 
         if len(merged) < min(limit, len(cached_raw)):
             return None
-
+        # 计算指标值：ema20,ema50,atr,adx
         df = add_strategy_indicators(merged, '5m')
+        # 存储更新后的5分钟K线缓存
         store_kline_df_cache(symbol, '5m', limit, df)
         return df
     except Exception as e:
@@ -1080,21 +1093,25 @@ def is_close_position_conditional_order(order, side=None):
     if not isinstance(info, dict):
         info = {}
 
+    #双向持仓模式下，平掉整个仓位的标志
     close_position = normalize_exchange_bool(
         info.get('closePosition', order.get('closePosition'))
     )
+    #只减仓不加仓的标志
     reduce_only = normalize_exchange_bool(
         info.get('reduceOnly', order.get('reduceOnly'))
     )
     if not close_position and not reduce_only:
         return False
 
+    #获取订单类型
     order_type = extract_order_type_upper(order)
     if order_type not in ('STOP', 'STOP_MARKET', 'TAKE_PROFIT', 'TAKE_PROFIT_MARKET'):
         return False
 
     if side:
         expected_side = 'SELL' if side == 'long' else 'BUY'
+        #获取订单方向
         order_side = extract_order_side_upper(order)
         if order_side != expected_side:
             return False
@@ -1223,6 +1240,7 @@ def fetch_open_close_position_orders(side=None, perf=None):
     unified_fetch_failed = False
     try:
         unified_start = time.monotonic()
+        # 获取ccxt所有未成交的挂单
         open_orders = exchange.fetch_open_orders(SYMBOL)
     except Exception as e:
         logging.warning(f"查询未成交条件单失败: {e}")
@@ -1232,6 +1250,8 @@ def fetch_open_close_position_orders(side=None, perf=None):
         record_perf(perf, 'fetch_open_close_position_orders_unified', unified_start)
 
     raw_open_start = time.monotonic()
+    
+    # 获取原始接口所有未成交的普通挂单
     raw_open_orders = fetch_raw_future_open_orders()
     record_perf(perf, 'fetch_open_close_position_orders_raw_open', raw_open_start)
     if raw_open_orders is None:
@@ -1248,6 +1268,7 @@ def fetch_open_close_position_orders(side=None, perf=None):
             open_orders.append(raw_order)
 
     raw_algo_start = time.monotonic()
+    # 获取原始接口库所有未成交的条件委托挂单
     raw_algo_orders = fetch_raw_future_open_algo_orders()
     record_perf(perf, 'fetch_open_close_position_orders_raw_algo', raw_algo_start)
     if raw_algo_orders is None:
@@ -1265,6 +1286,7 @@ def fetch_open_close_position_orders(side=None, perf=None):
 
     matched_orders = []
     for order in open_orders:
+        # 过滤出平仓条件单，
         if is_close_position_conditional_order(order, side=side):
             matched_orders.append(order)
     record_perf(perf, 'fetch_open_close_position_orders', total_start)
@@ -1393,15 +1415,18 @@ def cancel_conditional_orders(orders, silent=False, reason='清理残留条件�
 
 def cancel_all_close_position_conditional_orders(silent=False, reason='无仓位清理残留条件委托', perf=None):
     """没有交易所仓位时，清掉本交易对所有平仓类条件委托。"""
+    # 获取所有平仓条件单
     matched_orders = fetch_open_close_position_orders(side=None, perf=perf)
     if matched_orders is None:
         return False
     if not matched_orders:
+        #重置本地止损单状态
         clear_local_stop_order_state()
         return True
-
+    # 撤销所有平仓条件单
     ok = cancel_conditional_orders(matched_orders, silent=silent, reason=reason, perf=perf)
     if ok:
+        ##重置本地止损单状态
         clear_local_stop_order_state()
     return ok
 
@@ -2131,11 +2156,12 @@ def extract_order_filled_amount(order):
     if not isinstance(info, dict):
         info = {}
     for value in (
-        order.get('filled'),
-        order.get('filledAmount'),
-        info.get('executedQty'),
-        info.get('cumQty'),
-        info.get('filledAmount'),
+        #订单可能来自 CCXT 统一接口、Binance 原生 openOrders、或 Binance 原生 openAlgoOrders，每种格式的字段名不一样，兜底遍历保证不漏。
+        order.get('filled'), #CCXT 统一格式的已成交数量
+        order.get('filledAmount'), #CCXT 统一格式的已成交数量
+        info.get('executedQty'), #Binance 原始格式的已成交数量
+        info.get('cumQty'), #Binance 原始格式的已成交数量
+        info.get('filledAmount'), #info 里的 filledAmount 字段
     ):
         amount = price_to_float(value)
         if amount > 0:
@@ -2150,11 +2176,11 @@ def extract_order_average_price(order):
     if not isinstance(info, dict):
         info = {}
     for value in (
-        order.get('average'),
-        order.get('avgPrice'),
-        order.get('price'),
-        info.get('avgPrice'),
-        info.get('price'),
+        order.get('average'), #CCXT 统一格式的加权均价
+        order.get('avgPrice'), #归一化后的均价
+        order.get('price'), #订单委托价
+        info.get('avgPrice'), #Binance info 里的均价
+        info.get('price'), #Binance info 里的委托价
     ):
         price = price_to_float(value)
         if price > 0:
@@ -2166,11 +2192,13 @@ def fetch_all_open_orders_for_symbol():
     """读取当前交易对全部未成交单，包含 CCXT 统一接口和 Binance 原始接口。"""
     open_orders = []
     try:
+        # 获取 CCXT 统一接口的未成交单
         open_orders = exchange.fetch_open_orders(SYMBOL)
     except Exception as e:
         logging.warning(f"查询未成交单失败: {e}")
         open_orders = []
 
+    # 添加 Binance 原生接口的普通挂单（LIMIT、STOP_LIMIT 等）,普通挂单是：限价成交	
     raw_open_orders = fetch_raw_future_open_orders()
     if raw_open_orders:
         known_order_ids = {extract_order_id(order) for order in open_orders if extract_order_id(order)}
@@ -2180,6 +2208,7 @@ def fetch_all_open_orders_for_symbol():
                 continue
             open_orders.append(raw_order)
 
+    # 添加 Binance 原生接口的条件委托挂单（STOP_MARKET、TAKE_PROFIT_MARKET、TRAILING_STOP_MARKET等），条件委托是：市价成交
     raw_algo_orders = fetch_raw_future_open_algo_orders()
     if raw_algo_orders:
         known_order_ids = {extract_order_id(order) for order in open_orders if extract_order_id(order)}
@@ -2206,6 +2235,7 @@ def fetch_pending_entry_order():
         if not is_order_already_absent_error(e):
             logging.warning(f"查询 pending 入场单详情失败，将用未成交列表兜底: id={order_id}, error={e}")
 
+    # 获取所有未成交挂单
     for order in fetch_all_open_orders_for_symbol():
         if extract_order_id(order) == order_id:
             return order
@@ -2284,8 +2314,10 @@ def panic_close_pending_entry(side, amount, actual_price, reason, order=None):
     close_order_id = ''
     try:
         panic_side = 'sell' if side == 'long' else 'buy'
+        #平仓
         close_order = exchange.create_market_order(SYMBOL, panic_side, amount)
         close_order_id = extract_order_id(close_order)
+        # 没有仓位的时候，清理残留的条件委托
         cancel_all_close_position_conditional_orders(silent=True, reason='pending 入场撤退后清理残留条件委托')
     except Exception as e:
         logging.error(f"pending 入场撤退平仓失败: {e}")
@@ -2302,6 +2334,7 @@ def panic_close_pending_entry(side, amount, actual_price, reason, order=None):
         f"原因: {reason}\n方向: {side}\n入场估算价: {actual_price}\n数量: {amount}"
         f"{order_id_suffix}"
     )
+    # 清理 pending STOP_LIMIT 入场状态
     clear_pending_entry_state(reason)
     return False
 
@@ -2314,39 +2347,49 @@ def finalize_pending_entry_position(order=None, position_risk=None, signal_bar_1
         return False
 
     if position_risk is None:
+        # 获取持仓的风险信息：包括，开仓价格，强平价格和持仓数量，标记价格，持仓方向
         position_risk = get_position_risk(side=side)
     if position_risk and position_risk.get('fetch_failed'):
         logging.warning("pending 入场可能已成交，但无法获取交易所仓位，本轮暂不初始化持仓")
         return False
-
+    # 获取 pending 入场订单的成交数量
     filled_amount = abs(price_to_float(position_risk.get('position_amt'))) if position_risk else 0.0
     if filled_amount <= 0:
+        # 是从不同来源的订单对象中提取已成交数量
         filled_amount = extract_order_filled_amount(order)
     if filled_amount <= 0:
         logging.warning("pending 入场尚未确认到有效成交数量")
         return False
-
+    # 获取 pending 入场订单的实际成交价
+    # 从持仓信息中获取实际成交价
     actual_price = price_to_float(position_risk.get('entry_price')) if position_risk else 0.0
+    # 如果持仓信息中没有实际成交价，则从订单中获取
     if actual_price <= 0:
+        # 从不同来源提取实际成交均价
         actual_price = extract_order_average_price(order)
     if actual_price <= 0:
         actual_price = price_to_float(trade_state.get('pending_entry_limit_price'))
 
+    # 获取 pending 入场订单的保护止损价
     protective_stop = price_to_float(trade_state.get('pending_entry_protective_stop'))
     actual_liquidation_price = None
     if position_risk and not position_risk.get('fetch_failed'):
+        # 从持仓信息中获取实际强平价
         actual_liquidation_price = position_risk.get('liquidation_price')
+    # 把保护止损价格推向安全侧
     actual_safe_stop, actual_stop_meta = ensure_stop_price_safe(
         actual_price,
         protective_stop,
         side,
         liquidation_price=actual_liquidation_price
     )
+    # 判断止损价格是否仍然有效
     if not stop_price_is_still_valid(actual_price, actual_safe_stop, side):
         logging.error(
             f"pending 入场成交后发现强平价/止损无安全空间，立即撤退: "
             f"side={side}, entry={actual_price}, stop={actual_safe_stop}, liq={actual_liquidation_price}"
         )
+        # 无效的话，立马进行平仓，然后清空条件委托挂单，并重置本地止损状态和pending 入场状态
         return panic_close_pending_entry(
             side,
             filled_amount,
@@ -2357,6 +2400,7 @@ def finalize_pending_entry_position(order=None, position_risk=None, signal_bar_1
 
     target = price_to_float(trade_state.get('pending_entry_target'))
     profit_check_atr = price_to_float(trade_state.get('pending_entry_profit_check_atr'))
+    # 判断目标价是否仍然有效
     target_ok, target_reason = target_profit_still_valid(side, actual_price, actual_safe_stop, target, profit_check_atr)
     if not target_ok:
         logging.error(f"pending 入场成交后目标位对实际成交价无效，立即撤退: {target_reason}")
@@ -2372,8 +2416,11 @@ def finalize_pending_entry_position(order=None, position_risk=None, signal_bar_1
     open_fee = actual_price * filled_amount * taker_fee_rate
     entry_time = get_server_time_str()
     open_order_id = str(trade_state.get('pending_entry_order_id') or extract_order_id(order))
+    #触发周期
     entry_trigger_tf_display = trade_state.get('pending_entry_trigger_tf') or 'STOP_LIMIT'
+    #入场信号k线时间
     entry_signal_bar_15m = signal_bar_15m or trade_state.get('pending_entry_signal_bar', '')
+    #入场原因
     open_condition_details = trade_state.get('pending_entry_condition_details', '')
 
     trade_state.update({
@@ -2410,7 +2457,7 @@ def finalize_pending_entry_position(order=None, position_risk=None, signal_bar_1
         'last_entry_bar_15m': entry_signal_bar_15m,
         'position_miss_count': 0
     })
-
+    # 更新保护止损
     if not refresh_protective_stop_order(actual_safe_stop):
         logging.error("pending 入场成交后服务端止损单挂单失败，立即主动平仓避免裸露风险")
         clear_pending_entry_state('pending 入场已成交但保护止损失败，转主动平仓')
@@ -2422,6 +2469,7 @@ def finalize_pending_entry_position(order=None, position_risk=None, signal_bar_1
         )
         return False
 
+    # 重置 本地pending 状态
     clear_pending_entry_state('pending 入场已成交并转为持仓')
 
     order_id_lines = format_order_id_lines(
@@ -2589,7 +2637,9 @@ def manage_pending_entry(context, signal_bar_15m='', perf=None):
         return 'no_pending_entry'
 
     side = trade_state.get('pending_entry_side')
+    # 获取peding挂单信息
     order = fetch_pending_entry_order()
+    # 判断是否开仓
     position_risk = get_position_risk(side=side)
     if position_risk and position_risk.get('fetch_failed'):
         logging.warning("pending 入场管理无法确认仓位，本轮跳过，避免误处理")
@@ -2611,7 +2661,9 @@ def manage_pending_entry(context, signal_bar_15m='', perf=None):
         return 'pending_entry_missing_cleared'
 
     trade_state['pending_entry_missing_count'] = 0
+    #获取挂单状态
     status = extract_order_status_lower(order)
+    #是从不同来源的订单对象中提取已成交数量
     filled_amount = extract_order_filled_amount(order)
     trade_state['pending_entry_filled_amount'] = filled_amount
     if filled_amount > 0:
@@ -2622,24 +2674,33 @@ def manage_pending_entry(context, signal_bar_15m='', perf=None):
         return 'pending_entry_order_filled'
 
     if filled_amount > 0:
+        #部分成交
         cancel_pending_entry_order('pending 入场已部分成交，撤销剩余数量后等待仓位确认', silent=True, clear_state=False)
         return 'pending_entry_partial_filled_wait_position'
 
+    # canceled/cancelled: 已被撤销（两种拼写Binance都返回）
+    # expired: 订单已过期失效（限价单超时Time in Force到期）
+    # rejected: 被交易所拒绝（保证金不足、价格超限等）
     if status in ('canceled', 'cancelled', 'expired', 'rejected'):
+        # 订单已死亡且未成交，直接清空本地pending状态
         clear_pending_entry_state(f"pending 入场单已结束: status={status}")
         return f'pending_entry_{status}'
 
     curr_price = get_latest_price()
+    # 判断pending 入场价格是否仍然合理
     price_ok, price_reason = pending_entry_price_still_reasonable(curr_price)
     if not price_ok:
+        #取消条件委托
         cancel_pending_entry_order(price_reason)
         return 'pending_entry_price_invalid'
 
+    # 判断pending 入场趋势是否仍然支持
     trend_ok, trend_reason = pending_entry_trend_still_valid(context)
     if not trend_ok:
         cancel_pending_entry_order(f"趋势不再支持 pending 方向: {trend_reason}")
         return 'pending_entry_trend_invalid'
 
+    # 判断pending 入场订单是否超时
     age = pending_entry_age_seconds(now_dt=context.get('now_dt'))
     if age > PENDING_ENTRY_MAX_AGE_SECONDS:
         cancel_pending_entry_order(f"pending 入场单超时: age={age}s")
@@ -2658,31 +2719,41 @@ def sync_pending_entry_fill_if_needed(signal_bar_15m=''):
     if not has_pending_entry():
         return ''
 
+    # 获取条件委托的开仓方向
     side = trade_state.get('pending_entry_side')
+    # 获取peding挂单状态
     order = fetch_pending_entry_order()
+    #判断是否开仓
     position_risk = get_position_risk(side=side)
     if position_risk and position_risk.get('fetch_failed'):
         logging.warning("pending 入场早期同步无法确认仓位，本轮继续后续流程")
         return ''
 
     if position_risk is not None:
+        # pending 入场后，判断入场价格是否合理/利润预期空间是否足够，如果否，则立即平仓，并且清空挂单，重置本地止损状态，重置本地Pending状态,更新保护止损，持仓信息同步到本地
         finalize_pending_entry_position(order=order, position_risk=position_risk, signal_bar_15m=signal_bar_15m)
         return 'pending_entry_early_filled'
 
     if order is None:
         return ''
 
+    # 获取挂单状态
     status = extract_order_status_lower(order)
+    # 获取挂单成交数量
     filled_amount = extract_order_filled_amount(order)
+    #已成交数量
     trade_state['pending_entry_filled_amount'] = filled_amount
     if filled_amount > 0:
         trade_state['pending_entry_triggered'] = True
 
+    #这里是全部成交
     if status in ('closed', 'filled') or filled_amount >= price_to_float(trade_state.get('pending_entry_amount')):
         finalize_pending_entry_position(order=order, position_risk=position_risk, signal_bar_15m=signal_bar_15m)
         return 'pending_entry_early_order_filled'
 
+    #这里是部分成交
     if filled_amount > 0:
+        #部分成交会取消没成交的订单
         cancel_pending_entry_order('pending 入场已部分成交，早期同步撤销剩余数量后等待仓位确认', silent=True, clear_state=False)
         return 'pending_entry_early_partial_filled'
 
@@ -3082,19 +3153,24 @@ def validate_signal_bar(timeframe, signal_bar, now_dt=None):
     signal_close_dt = signal_dt + datetime.timedelta(seconds=tf_seconds)
     stale_seconds = (now_dt - signal_close_dt).total_seconds()
     max_stale_seconds = max(3 * tf_seconds, 15 * 60)
+    # 新鲜度检查
+    # 未来K线检查
     if stale_seconds < -5:
         return {'valid': False, 'is_new': False, 'reason': 'future_bar', 'stale_seconds': stale_seconds}
+    # 过去K线检查
     if stale_seconds > max_stale_seconds:
         return {'valid': False, 'is_new': False, 'reason': 'stale_bar', 'stale_seconds': stale_seconds}
 
     max_seen_key = tf_state_key('max_seen_bar', timeframe)
     processed_key = tf_state_key('last_processed_bar', timeframe)
     max_seen_dt = parse_bar_time(trade_state.get(max_seen_key, ''))
+    # 去重检查
     if max_seen_dt is not None and signal_dt < max_seen_dt:
         return {'valid': False, 'is_new': False, 'reason': 'bar_time_rollback', 'stale_seconds': stale_seconds}
 
     last_processed_dt = parse_bar_time(trade_state.get(processed_key, ''))
     is_new = last_processed_dt is None or signal_dt > last_processed_dt
+    # 更新去重检查
     if max_seen_dt is None or signal_dt > max_seen_dt:
         trade_state[max_seen_key] = signal_bar
 
@@ -3113,9 +3189,10 @@ def check_empty_position_lightweight_5m_gate(perf):
         record_perf(perf, 'lightweight_5m_server_time', server_time_start)
 
         try:
+            #获取5m的5根k线（包含为收盘的k线）
             df_5m, fetch_perf = fetch_lightweight_5m_df(SYMBOL, limit=LIGHTWEIGHT_5M_GATE_LIMIT)
-            for key, value in fetch_perf.items():
-                add_perf(perf, key, value)
+            # for key, value in fetch_perf.items():
+            #     add_perf(perf, key, value)
         except Exception as e:
             logging.warning(f"轻量5M gate抓取失败，降级完整流程: {e}")
             return {'action': 'full', 'reason': 'lightweight_fetch_failed'}
@@ -3124,8 +3201,10 @@ def check_empty_position_lightweight_5m_gate(perf):
             logging.warning("轻量5M gate返回空K线，降级完整流程")
             return {'action': 'full', 'reason': 'lightweight_empty_fetch'}
 
+        #获取最新收盘5分钟K线的开盘时间
         signal_bar_5m = get_closed_bar_time(df_5m, '5m', now_dt=server_now_dt)
         validate_start = time.monotonic()
+        #验证5分钟K线是否有效：从新鲜度/去重/是否为新K线 判断
         signal_guard_5m = validate_signal_bar('5m', signal_bar_5m, now_dt=server_now_dt)
         record_perf(perf, 'lightweight_5m_validate_signal_bar', validate_start)
 
@@ -4244,7 +4323,9 @@ def build_support_resistance_zones(df_4h, now_dt=None):
     
     #找出最近被打破的支撑区和阻力区
     broken = recently_broken_zones(zones, df_closed)
+    #从高到低排序
     support = sorted([z for z in active if z['type'] == 'support'], key=lambda z: z['upper'], reverse=True)
+    #从低到高排序
     resistance = sorted([z for z in active if z['type'] == 'resistance'], key=lambda z: z['lower'])
     broken_support = sorted(broken['broken_support'], key=lambda z: z.get('invalidated_idx', -1), reverse=True)
     broken_resistance = sorted(broken['broken_resistance'], key=lambda z: z.get('invalidated_idx', -1), reverse=True)
@@ -4694,6 +4775,7 @@ def build_context(dfs, now_dt, perf=None):
         zones = copy.deepcopy(sr_cache['zones'])
         add_perf(perf, 'build_context_support_resistance_cache_hit', elapsed_ms(sr_start))
     else:
+        #每4小时执行一次
         zones = build_support_resistance_zones(dfs['4h'], now_dt=now_dt)
         if sr_bar_time:
             runtime_state['support_resistance_cache'] = {
@@ -4984,27 +5066,33 @@ def _run_strategy_impl(perf):
     """run_strategy主体；返回退出原因，便于统一控制流程。"""
     global trade_state
     gate_result = {}
-
+    #没有仓位并且有未完成的开仓委托， has_pending_entry: 是否有未完成的开仓委托
     if not trade_state.get('has_position') and has_pending_entry():
+        #检查peding挂单是否开仓，判断peding开仓位置是否合理，利润预期是否满足，不合理不够就就立马平仓，并且清空挂单,并且重置本地止损状态，重置本地pending状态;
+        #如果开仓合理，就挂止损单，也要重置本地pending状态，持仓信息同步到本地
         early_pending_result = sync_pending_entry_fill_if_needed()
         if early_pending_result:
             return early_pending_result
 
+    #没有仓位并且没有pending挂单
     if not trade_state.get('has_position') and not has_pending_entry():
         cleanup_start = time.monotonic()
+        #清理无用的挂单
         cleanup_ok = cleanup_orphan_conditional_orders_if_needed(silent=True, perf=perf)
         record_perf(perf, 'empty_position_cleanup', cleanup_start)
         if not cleanup_ok:
             logging.warning("无本地仓位时条件委托/交易所仓位状态未清理干净，本轮跳过开仓")
             return 'empty_position_cleanup_failed'
-
+        #获取5m的5根k线(包含未收盘的k线)，并判断是否有效
         gate_result = check_empty_position_lightweight_5m_gate(perf)
         if gate_result.get('action') == 'skip':
             return gate_result.get('reason', 'lightweight_gate_skip')
 
     fetch_all_start = time.monotonic()
     reused_5m_df = None
+    #轻量级5分钟K线数据有效
     if gate_result.get('reason') == 'lightweight_new_5m':
+        # 轻量级5分钟K线和缓存中5分钟K线数据合并，并更新缓存数据
         reused_5m_df = rebuild_5m_df_from_lightweight_cache(SYMBOL, 220, gate_result.get('df_5m'))
 
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
@@ -5041,10 +5129,13 @@ def _run_strategy_impl(perf):
         return 'fetch_all_klines_incomplete'
 
     server_now_dt = get_server_now_dt()
+    #这里也是更新5分钟K线缓存，
     store_kline_df_cache(SYMBOL, '5m', 220, dfs['5m'], now_dt=server_now_dt)
     validate_start = time.monotonic()
+    #获取最新收盘k线的开盘时间
     signal_bar_5m = get_closed_bar_time(dfs['5m'], '5m', now_dt=server_now_dt)
     signal_bar_15m = get_closed_bar_time(dfs['15m'], '15m', now_dt=server_now_dt)
+    #验证最新收盘5分钟K线是否有效
     signal_guard_5m = validate_signal_bar('5m', signal_bar_5m, now_dt=server_now_dt)
     signal_guard_15m = validate_signal_bar('15m', signal_bar_15m, now_dt=server_now_dt)
     record_perf(perf, 'validate_signal_bar', validate_start)
@@ -5056,8 +5147,8 @@ def _run_strategy_impl(perf):
     is_new_signal_5m = bool(signal_guard_5m['is_new'])
     is_new_signal_15m = bool(signal_guard_15m.get('valid') and signal_guard_15m.get('is_new'))
 
-    #判断各个周期的趋势条件和4h的支撑和阻挡区间
     context_start = time.monotonic()
+    #判断各个周期的趋势条件和4h的支撑和阻挡区间
     context = build_context(dfs, server_now_dt, perf=perf)
     record_perf(perf, 'build_context', context_start)
 
@@ -5077,8 +5168,10 @@ def _run_strategy_impl(perf):
         # 持仓期间只做仓位管理，不在同一轮继续寻找新开仓。
         return 'position_managed'
 
+    #这里判断是用来管理pending挂单的，前面的判断pending挂单状态的
     if has_pending_entry():
         pending_start = time.monotonic()
+        #管理pending挂单:用最新趋势判断是否要撤单
         pending_result = manage_pending_entry(
             context,
             signal_bar_15m=signal_bar_15m if signal_guard_15m.get('valid') else '',
