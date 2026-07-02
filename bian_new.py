@@ -265,6 +265,7 @@ trade_state = {
     'has_position': False,  # 记录当前是否持有仓位，初始为False
     'side': None,  # 记录持仓方向：'long' (多单) 或 'short' (空单)，初始为空
     'entry_price': 0,  # 记录开仓时的入场价格，初始为0
+    'entry_trigger_price': 0.0,  # 记录条件委托入场触发价；市价开仓时等于计划入场价
     'stop_loss_price': 0,  # 记录当前的止损价格，初始为0
     'highest_price': 0,  # 记录持有多单时的最高价格，用于计算利润回撤，初始为0
     'lowest_price': 0,  # 记录持有空单时的最低价格，用于计算利润回撤，初始为0
@@ -406,12 +407,19 @@ def send_msg(subject, content):
 # 当前版本交易记录 CSV 的表头，新增字段时要同步兼容旧文件升级逻辑。
 TRADE_CSV_HEADERS = [
     '建仓时间', '趋势方向', '4H条件', '1H条件', '15M条件', '入场原因',
+    '入场触发价',
     '平仓时间', '平仓原因', '点数盈亏', '手续费', '净利润(USDT)', '是否盈利',
     '入场15M信号时间', '平仓15M信号时间', '平仓触发周期', '持仓秒数',
     '开仓订单ID', '平仓订单ID'
 ]
-# 旧版 CSV 表头缺少订单ID字段，用它识别历史文件并自动补齐新列。
-LEGACY_TRADE_CSV_HEADERS = TRADE_CSV_HEADERS[:-2]
+# 旧版 CSV 表头缺少订单ID字段/入场触发价字段，用它识别历史文件并自动补齐新列。
+TRADE_CSV_HEADERS_WITHOUT_TRIGGER_PRICE = [
+    '建仓时间', '趋势方向', '4H条件', '1H条件', '15M条件', '入场原因',
+    '平仓时间', '平仓原因', '点数盈亏', '手续费', '净利润(USDT)', '是否盈利',
+    '入场15M信号时间', '平仓15M信号时间', '平仓触发周期', '持仓秒数',
+    '开仓订单ID', '平仓订单ID'
+]
+LEGACY_TRADE_CSV_HEADERS = TRADE_CSV_HEADERS_WITHOUT_TRIGGER_PRICE[:-2]
 
 
 def extract_order_id(order):
@@ -555,7 +563,7 @@ def format_order_id_lines(open_order_id='', close_order_id='', stop_order_id='')
 
 
 def ensure_trade_csv_schema(filename):
-    """兼容老版CSV表头，必要时补齐订单ID列，避免新旧列数不一致"""
+    """兼容老版CSV表头，必要时补齐缺失列，避免新旧列数不一致。"""
     if not os.path.isfile(filename):
         return True
 
@@ -573,24 +581,26 @@ def ensure_trade_csv_schema(filename):
     if header == TRADE_CSV_HEADERS:
         return True
 
-    if header != LEGACY_TRADE_CSV_HEADERS:
+    compatible_headers = (TRADE_CSV_HEADERS_WITHOUT_TRIGGER_PRICE, LEGACY_TRADE_CSV_HEADERS)
+    if header not in compatible_headers:
         logging.warning(f"CSV表头不是预期格式，跳过自动升级: {filename}")
         return True
 
     upgraded_rows = [TRADE_CSV_HEADERS]
-    legacy_len = len(LEGACY_TRADE_CSV_HEADERS)
+    source_headers = header
+    source_len = len(source_headers)
     for row in rows[1:]:
-        normalized_row = list(row[:legacy_len])
-        if len(normalized_row) < legacy_len:
-            normalized_row.extend([''] * (legacy_len - len(normalized_row)))
-        normalized_row.extend(['', ''])
-        upgraded_rows.append(normalized_row)
+        normalized_row = list(row[:source_len])
+        if len(normalized_row) < source_len:
+            normalized_row.extend([''] * (source_len - len(normalized_row)))
+        row_by_header = dict(zip(source_headers, normalized_row))
+        upgraded_rows.append([row_by_header.get(col, '') for col in TRADE_CSV_HEADERS])
 
     try:
         with open(filename, mode='w', newline='', encoding='utf-8-sig') as f:
             writer = csv.writer(f)
             writer.writerows(upgraded_rows)
-        logging.info(f"已自动升级CSV表头，补充订单ID列: {filename}")
+        logging.info(f"已自动升级CSV表头，补充缺失交易记录列: {filename}")
         return True
     except Exception as e:
         logging.error(f"升级CSV表头失败: {filename}, error={e}")
@@ -1882,6 +1892,7 @@ def reset_trade_state_after_external_close(signal_bar_15m='', reason='检测到�
             round(fee_cost, 4),
             round(net_pnl_usdt, 4),
             is_profit,
+            entry_trigger_price=trade_state.get('entry_trigger_price', ''),
             entry_signal_bar_15m=trade_state.get('entry_signal_bar_15m', ''),
             exit_signal_bar_15m=exit_signal_bar_15m,
             exit_trigger='external_close_detected',
@@ -1909,6 +1920,7 @@ def reset_trade_state_after_external_close(signal_bar_15m='', reason='检测到�
         f"方向: {trade_state.get('side')}\n"
         f"入场时间: {trade_state.get('entry_time', '')}\n"
         f"入场价: {trade_state.get('entry_price', 0)}\n"
+        f"入场触发价: {trade_state.get('entry_trigger_price', 0)}\n"
         f"估算出场价: {estimated_close_price_text}\n"
         f"点数盈亏: {pnl_points_text}\n"
         f"手续费: {fee_cost_text}\n"
@@ -1930,6 +1942,7 @@ def reset_trade_state_after_external_close(signal_bar_15m='', reason='检测到�
         'has_position': False,
         'side': None,
         'entry_price': 0,
+        'entry_trigger_price': 0.0,
         'stop_loss_price': 0,
         'highest_price': 0,
         'lowest_price': 0,
@@ -2060,7 +2073,7 @@ def format_condition_snapshot_for_mail(timeframe, state):
     return f"{timeframe}信号时间={state.get('signal_bar_time', '')}"
 
 
-def log_trade_to_csv(entry_time, side, cond_4h, cond_1h, cond_15m, entry_reason, exit_time, close_reason, pnl_points, fee_cost, net_pnl_usdt, is_profit, entry_signal_bar_15m='', exit_signal_bar_15m='', exit_trigger='', holding_seconds=0, open_order_id='', close_order_id=''):
+def log_trade_to_csv(entry_time, side, cond_4h, cond_1h, cond_15m, entry_reason, exit_time, close_reason, pnl_points, fee_cost, net_pnl_usdt, is_profit, entry_trigger_price='', entry_signal_bar_15m='', exit_signal_bar_15m='', exit_trigger='', holding_seconds=0, open_order_id='', close_order_id=''):
     """将交易记录写入CSV文件，按月分表"""
     # 根据平仓时间生成当月的 CSV 文件名，例如 trades_log_2024-05.csv
     month_str = exit_time[:7]  # 提取 'YYYY-MM' 部分
@@ -2079,6 +2092,7 @@ def log_trade_to_csv(entry_time, side, cond_4h, cond_1h, cond_15m, entry_reason,
             # 写入具体数据
             writer.writerow([
                 entry_time, side, cond_4h, cond_1h, cond_15m, entry_reason,
+                entry_trigger_price,
                 exit_time, close_reason, pnl_points, fee_cost, net_pnl_usdt, is_profit,
                 entry_signal_bar_15m, exit_signal_bar_15m, exit_trigger, holding_seconds,
                 open_order_id, close_order_id
@@ -2497,6 +2511,7 @@ def finalize_pending_entry_position(order=None, position_risk=None, signal_bar_1
     open_fee = actual_price * filled_amount * taker_fee_rate
     entry_time = get_server_time_str()
     open_order_id = str(trade_state.get('pending_entry_order_id') or extract_order_id(order))
+    entry_trigger_price = price_to_float(trade_state.get('pending_entry_stop_price'))
     #触发周期
     entry_trigger_tf_display = trade_state.get('pending_entry_trigger_tf') or 'STOP_LIMIT'
     #入场信号k线时间
@@ -2508,6 +2523,7 @@ def finalize_pending_entry_position(order=None, position_risk=None, signal_bar_1
         'has_position': True,
         'side': side,
         'entry_price': actual_price,
+        'entry_trigger_price': entry_trigger_price,
         'stop_loss_price': actual_safe_stop,
         'highest_price': actual_price,
         'lowest_price': actual_price,
@@ -2561,6 +2577,7 @@ def finalize_pending_entry_position(order=None, position_risk=None, signal_bar_1
     initial_usdt = price_to_float(trade_state.get('initial_balance'))
     msg = (
         f"🚀 【STOP_LIMIT已成交开仓】\n方向: {side}\n入场均价: {actual_price}\n"
+        f"入场触发价: {entry_trigger_price}\n"
         f"止损价: {actual_safe_stop}\n目标位: {target}\n强平价: {actual_liquidation_price}\n数量: {filled_amount}\n"
         f"杠杆: {LEVERAGE}x\n挂单前账户资金(USDT): {initial_usdt:.4f}\n"
         f"入场原因: {trade_state.get('entry_reason', '')}\n触发周期: {entry_trigger_tf_display}\n"
@@ -2990,6 +3007,7 @@ def open_order(side, price, sl_price, state_4h, state_1h, state_15m, signal_bar_
             'has_position': True,
             'side': side,
             'entry_price': actual_price,
+            'entry_trigger_price': price_to_float(price),
             'stop_loss_price': actual_safe_stop,
             'highest_price': actual_price,
             'lowest_price': actual_price,
@@ -3033,6 +3051,7 @@ def open_order(side, price, sl_price, state_4h, state_1h, state_15m, signal_bar_
         )
         order_id_suffix = f"\n{order_id_lines}" if order_id_lines else ''
         msg = (f"🚀 【已开仓】\n方向: {side}\n入场价: {actual_price}\n"
+               f"入场触发价: {trade_state.get('entry_trigger_price', 0)}\n"
                f"止损价: {actual_safe_stop}\n强平价: {actual_liquidation_price}\n数量: {amount}\n"
                f"杠杆: {LEVERAGE}x\n开仓前账户资金(USDT): {initial_usdt:.4f}\n入场原因: {entry_reason}\n触发周期: {entry_trigger_tf_display}\n15M信号时间: {signal_bar_15m}\n"
                f"开仓条件明细:\n{open_condition_details}"
@@ -3137,6 +3156,7 @@ def close_position(reason, curr_price=None, signal_bar_15m='', trigger_label='')
             round(fee_cost, 4),
             round(net_pnl_usdt, 4),
             is_profit,
+            entry_trigger_price=trade_state.get('entry_trigger_price', ''),
             entry_signal_bar_15m=entry_signal_bar_15m,
             exit_signal_bar_15m=exit_signal_bar_15m,
             exit_trigger=trigger_label or reason,
@@ -3159,6 +3179,7 @@ def close_position(reason, curr_price=None, signal_bar_15m='', trigger_label='')
         close_condition_details = '\n'.join(close_condition_lines) if close_condition_lines else f"触发来源: {trigger_label or reason}"
         order_id_suffix = f"\n{order_id_lines}" if order_id_lines else ''
         msg = (f"🏁 【已平仓】\n原因: {reason}\n入场价: {trade_state['entry_price']}\n"
+               f"入场触发价: {trade_state.get('entry_trigger_price', 0)}\n"
                f"出场价: {actual_close_price}\n点数盈亏: {pnl_points:.2f}\n手续费: {fee_cost:.4f}\n净利润(USDT): {net_pnl_usdt:.2f}\n"
                f"平仓后账户资金(USDT): {final_usdt:.4f}\n15M信号时间: {exit_signal_bar_15m}\n触发来源: {trigger_label or reason}\n"
                f"平仓条件明细:\n{close_condition_details}"
@@ -3171,6 +3192,7 @@ def close_position(reason, curr_price=None, signal_bar_15m='', trigger_label='')
             'has_position': False,
             'side': None,
             'entry_price': 0,
+            'entry_trigger_price': 0.0,
             'stop_loss_price': 0,
             'highest_price': 0,
             'lowest_price': 0,
