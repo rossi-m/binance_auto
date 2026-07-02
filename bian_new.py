@@ -1195,8 +1195,11 @@ def normalize_raw_algo_order(raw_order):
         'id': raw_order.get('algoId') or raw_order.get('clientAlgoId'),
         'type': raw_order.get('orderType') or raw_order.get('type'),
         'side': raw_order.get('side'),
+        'status': raw_order.get('algoStatus'),
         'timestamp': raw_order.get('createTime') or raw_order.get('updateTime'),
         'stopPrice': raw_order.get('triggerPrice') or raw_order.get('stopPrice'),
+        'price': raw_order.get('price'),
+        'filled': raw_order.get('actualQty'),
         'closePosition': raw_order.get('closePosition'),
         'reduceOnly': raw_order.get('reduceOnly'),
         'info': raw_order
@@ -2150,7 +2153,7 @@ def extract_order_status_lower(order):
     info = order.get('info', {})
     if not isinstance(info, dict):
         info = {}
-    return str(order.get('status') or info.get('status') or '').strip().lower()
+    return str(order.get('status') or info.get('status') or info.get('algoStatus') or '').strip().lower()
 
 
 def extract_order_filled_amount(order):
@@ -2165,6 +2168,7 @@ def extract_order_filled_amount(order):
         order.get('filledAmount'), #CCXT 统一格式的已成交数量
         info.get('executedQty'), #Binance 原始格式的已成交数量
         info.get('cumQty'), #Binance 原始格式的已成交数量
+        info.get('actualQty'), #Binance openAlgoOrders 里的实际成交数量
         info.get('filledAmount'), #info 里的 filledAmount 字段
     ):
         amount = price_to_float(value)
@@ -2246,6 +2250,74 @@ def fetch_pending_entry_order():
     return None
 
 
+def cancel_pending_entry_algo_order(order_id, reason='', silent=False):
+    """撤销 Binance futures algo 条件入场单；返回 True/False/None，None 表示没找到目标 algo 单。"""
+    order_id = str(order_id or '')
+    if not order_id:
+        return None
+
+    get_method = getattr(exchange, 'fapiPrivateGetOpenAlgoOrders', None)
+    if get_method is None:
+        return None
+
+    try:
+        raw_orders = get_method({'symbol': get_exchange_symbol_id()})
+    except Exception as e:
+        logging.warning(f"查询 pending algo 入场单失败: id={order_id}, reason={reason}, error={e}")
+        return False
+
+    if not isinstance(raw_orders, list):
+        raw_orders = []
+
+    target_orders = []
+    for raw_order in raw_orders:
+        raw_algo_id = str(raw_order.get('algoId') or '')
+        raw_client_algo_id = str(raw_order.get('clientAlgoId') or '')
+        if order_id in (raw_algo_id, raw_client_algo_id):
+            target_orders.append(raw_order)
+
+    if not target_orders:
+        return None
+
+    delete_one_method = getattr(exchange, 'fapiPrivateDeleteAlgoOrder', None)
+    if delete_one_method is not None:
+        all_cancelled = True
+        for raw_order in target_orders:
+            params = {'symbol': get_exchange_symbol_id()}
+            raw_algo_id = raw_order.get('algoId')
+            raw_client_algo_id = raw_order.get('clientAlgoId')
+            if raw_algo_id:
+                params['algoId'] = raw_algo_id
+            elif raw_client_algo_id:
+                params['clientAlgoId'] = raw_client_algo_id
+            try:
+                delete_one_method(params)
+                if not silent:
+                    logging.info(f"{reason}: 已撤销 pending algo 入场单 {params}")
+            except Exception as e:
+                all_cancelled = False
+                logging.warning(f"{reason}: 撤销 pending algo 入场单失败 {params}: {e}")
+        if all_cancelled:
+            return True
+
+    delete_all_method = getattr(exchange, 'fapiPrivateDeleteAlgoOpenOrders', None)
+    if delete_all_method is None:
+        return False
+
+    try:
+        delete_all_method({'symbol': get_exchange_symbol_id()})
+        if not silent:
+            order_ids = [
+                raw_order.get('algoId') or raw_order.get('clientAlgoId') or 'unknown'
+                for raw_order in target_orders
+            ]
+            logging.warning(f"{reason}: 已批量撤销当前交易对 open algo 条件单，目标 pending ids={order_ids}")
+        return True
+    except Exception as e:
+        logging.warning(f"{reason}: 批量撤销 pending algo 条件单失败: id={order_id}, error={e}")
+        return False
+
+
 def cancel_pending_entry_order(reason, silent=False, clear_state=True):
     """撤销 pending STOP_LIMIT 入场单并按需清空本地 pending 状态。"""
     order_id = str(trade_state.get('pending_entry_order_id') or '')
@@ -2260,7 +2332,12 @@ def cancel_pending_entry_order(reason, silent=False, clear_state=True):
         if not silent:
             logging.info(f"已撤销 pending 入场单: id={order_id}, reason={reason}")
     except Exception as e:
-        if is_order_already_absent_error(e):
+        algo_cancelled = cancel_pending_entry_algo_order(order_id, reason=reason, silent=silent)
+        if algo_cancelled is True:
+            ok = True
+        elif algo_cancelled is False:
+            ok = False
+        elif is_order_already_absent_error(e):
             if not silent:
                 logging.warning(f"pending 入场单已不存在，按撤销成功处理: id={order_id}, reason={reason}, error={e}")
         else:
