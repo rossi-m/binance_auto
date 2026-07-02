@@ -1432,7 +1432,8 @@ def cancel_all_close_position_conditional_orders(silent=False, reason='无仓位
 
 
 def reconcile_conditional_orders_for_position(side, silent=False):
-    """有仓位时只保留当前方向一张 STOP/STOP_MARKET，清理反方向和重复条件委托。"""
+    """有仓位时只保留一张出场方向的 STOP/STOP_MARKET 止损单，清理同向重复和反方向的条件委托。"""
+    
     matched_orders = fetch_open_close_position_orders(side=None)
     if matched_orders is None:
         return False
@@ -1441,14 +1442,17 @@ def reconcile_conditional_orders_for_position(side, silent=False):
     same_side_stops = []
     orders_to_cancel = []
     for order in matched_orders:
+        # 提取订单方向和类型
         order_side = extract_order_side_upper(order)
         order_type = extract_order_type_upper(order)
         if order_side != expected_side:
             orders_to_cancel.append(order)
             continue
         if order_type in ('STOP', 'STOP_MARKET'):
+            # 条件委托
             same_side_stops.append(order)
         else:
+            # 普通挂单
             orders_to_cancel.append(order)
 
     active_order = pick_active_protective_stop_order(
@@ -2509,17 +2513,22 @@ def place_pending_entry_order(side, candidate, curr_price, state_4h, state_1h, s
             signal_bar_15m
         )
         return False
-
+    
     entry_level = precision_price(price_to_float(candidate.get('entry_level')))
+    #触发价格
     stop_price = entry_level
+    # 计算允许的滑点
     allowed_slippage = candidate_entry_allowed_slippage(candidate, entry_level)
+    # 计算限价
     if side == 'long':
         limit_price = precision_price(entry_level + allowed_slippage)
     else:
         limit_price = precision_price(entry_level - allowed_slippage)
 
     protective_stop = price_to_float(candidate.get('stop'))
+    # 把止损价推至保护侧(不会触发强平)
     estimated_safe_stop, estimated_stop_meta = ensure_stop_price_safe(entry_level, protective_stop, side, liquidation_price=None)
+    # 判断止损价格是否仍然有效
     if not stop_price_is_still_valid(entry_level, estimated_safe_stop, side):
         logging.warning(
             f"拒绝挂 STOP_LIMIT 入场：预估强平价过近，止损无效 side={side}, "
@@ -2529,6 +2538,7 @@ def place_pending_entry_order(side, candidate, curr_price, state_4h, state_1h, s
 
     target = price_to_float(candidate.get('target'))
     profit_check_atr = price_to_float(candidate.get('profit_check_atr'))
+    # 判断目标价是否仍然有效
     target_ok, target_reason = target_profit_still_valid(side, entry_level, estimated_safe_stop, target, profit_check_atr)
     if not target_ok:
         logging.info(f"拒绝挂 STOP_LIMIT 入场：候选目标利润无效: {target_reason}")
@@ -2559,14 +2569,14 @@ def place_pending_entry_order(side, candidate, curr_price, state_4h, state_1h, s
 
     try:
         balance_before = exchange.fetch_balance({'type': 'future'})
-        initial_usdt = float(balance_before['total']['USDT'])
+        initial_usdt = float(balance_before['total']['USDT']) # 开仓前账户资金(USDT)
         exchange.set_leverage(LEVERAGE, SYMBOL)
 
         order_side = 'buy' if side == 'long' else 'sell'
         params = {
-            'stopPrice': stop_price,
-            'timeInForce': 'GTC',
-            'workingType': STOP_WORKING_TYPE
+            'stopPrice': stop_price, # 触发价：标记价 ≥ 3010 时激活
+            'timeInForce': 'GTC', #  一直有效直到成交或 45 分钟超时
+            'workingType': STOP_WORKING_TYPE # 按标记价触发（非最新成交价）
         }
         order = exchange.create_order(
             SYMBOL,
@@ -4444,7 +4454,9 @@ def candidate_sr_entry_zone_still_valid(candidate, context, curr_price):
         return True, 'ok'
     atr = price_to_float(candidate.get('sr_filter_atr'))
     if atr <= 0:
+        #4h的atr值
         atr = sr_filter_atr_from_context(context)
+    #判断是否在趋势阻挡区域内
     reason = sr_trend_entry_block_reason(candidate.get('side'), curr_price, context.get('zones', {}), atr)
     if reason:
         return False, reason
@@ -4459,6 +4471,7 @@ def find_1h_sr_confirmation(df_1h, zone, side, now_dt=None):
     recent = df_closed.tail(SR_CONFIRM_LOOKBACK_1H)
     touched_until = []
     touched = False
+    #查找最近18根最先站稳的K线这根为true，后面的所有的都为true
     for _, touch_row in recent.iterrows():
         _, touch_high, touch_low, touch_close, _, _ = candle_parts(touch_row)
         if side == 'long':
@@ -4467,8 +4480,10 @@ def find_1h_sr_confirmation(df_1h, zone, side, now_dt=None):
             touched = touched or (touch_high >= zone['lower'] and touch_close <= zone['upper'])
         touched_until.append(touched)
 
-    # 最近18根K线内，从新到旧查找最近一次站稳确认。
-    for pos in range(len(recent) - 1, -1, -1):
+    ## 最近18根K线内，从新到旧查找最近一次站稳确认。
+    # for pos in range(len(recent) - 1, -1, -1):
+    # 最近18根K线内，从旧到新查找最近一次站稳确认。
+    for pos in range(len(recent)):
         row = recent.iloc[pos]
         open_price, high, low, close, _, _ = candle_parts(row)
         body = abs(close - open_price)
@@ -4493,10 +4508,10 @@ def sr_15m_entry_ready(df_15m, confirm, side, now_dt=None):
     if len(observed) == 0:
         return False
     if side == 'long':
-        if bool((observed['low'] < confirm['low']).any()):
+        if bool((observed['close'] < confirm['low']).any()):
             return False
         return price_to_float(observed.iloc[-1]['close']) > confirm['high']
-    if bool((observed['high'] > confirm['high']).any()):
+    if bool((observed['close'] > confirm['high']).any()):
         return False
     return price_to_float(observed.iloc[-1]['close']) < confirm['low']
 
@@ -4509,7 +4524,6 @@ def build_sr_rebound_candidates(context, side):
     atr_4h = price_to_float(df_4h_closed.iloc[-1].get('atr'))
     if atr_4h <= 0:
         return []
-
     zone_list = zones.get('support' if side == 'long' else 'resistance', [])
     candidates = []
     for zone in zone_list[:5]:
@@ -4518,6 +4532,7 @@ def build_sr_rebound_candidates(context, side):
         # 检查后续的k线是否突破这个阻挡/支撑区域
         if not sr_15m_entry_ready(context['dfs']['15m'], confirm, side, now_dt=context['now_dt']):
             continue
+        #获取入场价格
         entry_ref = price_to_float(get_closed_df(context['dfs']['15m'], '15m', context['now_dt']).iloc[-1]['close'])
         tick = get_price_tick(entry_ref)
         if side == 'long':
@@ -4676,6 +4691,7 @@ def build_trend_trigger_candidates(context):
 
             entry_ref = price_to_float(trigger.get('entry_level'))
             stop = price_to_float(trigger['stop'])
+            # 判断是否在阻挡区域
             sr_block_reason = sr_trend_entry_block_reason(side, entry_ref, zones, sr_filter_atr)
             if sr_block_reason:
                 logging.info(f"跳过趋势触发{strategy_tf}->{trigger_tf} {side}: {sr_block_reason}")
@@ -4860,12 +4876,23 @@ def profit_atr_lock_stop_for_position(side, entry, highest, lowest, atr):
 
 
 def apply_new_exit_rules(context, signal_bar_15m='', curr_price=None, price_ts=None, perf=None):
+    """持仓期间动态收紧止损：收集所有候选止损位，取最有利于仓位的那个。
+
+    6 条规则（候选收集模式，互不干扰，最后取 max/min 择优）：
+      1. 大强K线止损  → 出场周期出现大实体强K，止损移到强K极端位预留空间
+      2. 同向强K止损  → 出场周期出现与仓位同向的普通强K，止损移到强K结构位
+      3. 反向强K止损  → 出场周期出现反向强K，止损移到反向K极端位（防止反转）
+      4. ATR利润锁定   → 浮盈达到N倍ATR后，锁住一部分利润不回撤
+      5. 第一目标位     → 价格触及入场时计算的第一目标，止损移到保本位
+      6. SR区间止盈    → 价格靠近4H支撑/阻力区，止损缩到区间边缘附近
+    """
     if not trade_state.get('has_position'):
         return
     apply_start = time.monotonic()
     side = trade_state.get('side')
     price_start = time.monotonic()
     now_ts = time.monotonic()
+    # 复用调用方传入的价格（若未过期），否则重新获取最新价格
     if curr_price is not None and price_ts is not None and (now_ts - price_ts) * 1000.0 <= EXIT_RULE_PRICE_MAX_AGE_MS:
         curr_price = float(curr_price)
     else:
@@ -4873,13 +4900,14 @@ def apply_new_exit_rules(context, signal_bar_15m='', curr_price=None, price_ts=N
     record_perf(perf, 'apply_new_exit_rules_get_latest_price', price_start)
     try:
         tick = get_price_tick(curr_price)
-        stop_candidates = []
+        stop_candidates = []  # 收集所有候选止损位，后续择优选取
 
         def add_stop_candidate(stop, reason):
             stop = price_to_float(stop)
             if stop > 0:
                 stop_candidates.append((stop, reason))
 
+        # 获取出场周期（默认15m）的K线数据，出场周期也是触发周期
         exit_tf = trade_state.get('entry_exit_tf') or STRATEGY_EXIT_TF.get(trade_state.get('entry_strategy_tf'), '15m')
         df_exit = context['dfs'].get(exit_tf)
         exit_atr = 0.0
@@ -4887,6 +4915,8 @@ def apply_new_exit_rules(context, signal_bar_15m='', curr_price=None, price_ts=N
             df_exit_closed = get_closed_df(df_exit, exit_tf, context['now_dt'])
             if len(df_exit_closed) > 0:
                 exit_atr = price_to_float(df_exit_closed.iloc[-1].get('atr'))
+
+            # 规则1：最新收盘大强K线 → 止损移到强K极端位
             large = latest_large_strong(df_exit_closed)
             if large:
                 add_stop_candidate(
@@ -4894,6 +4924,7 @@ def apply_new_exit_rules(context, signal_bar_15m='', curr_price=None, price_ts=N
                     f"{exit_tf}出现大强{large.get('direction')}线，按强K结构收紧止损"
                 )
 
+            # 规则2：同向普通强K → 止损移到同向强K结构位
             same_strong = latest_effective_strong(df_exit_closed, side)
             if same_strong:
                 add_stop_candidate(
@@ -4901,6 +4932,7 @@ def apply_new_exit_rules(context, signal_bar_15m='', curr_price=None, price_ts=N
                     f"{exit_tf}出现同向{same_strong.get('kind')}强K，按强K结构收紧止损"
                 )
 
+            # 规则3：反向强K → 止损移到反向K极端位（防反转）
             opposite = 'short' if side == 'long' else 'long'
             strong_opposite = latest_effective_strong(df_exit_closed, opposite)
             if strong_opposite:
@@ -4909,9 +4941,11 @@ def apply_new_exit_rules(context, signal_bar_15m='', curr_price=None, price_ts=N
                     f"{exit_tf}出现反向{strong_opposite.get('kind')}强K，按强K结构收紧止损"
                 )
 
+        # 规则4：ATR利润锁定 → 浮盈达到阈值后锁住部分利润
         entry = price_to_float(trade_state.get('entry_price'))
         highest = price_to_float(trade_state.get('highest_price'))
         lowest = price_to_float(trade_state.get('lowest_price'))
+        # exit_atr是触发周期的值，比如：4小时作为背景周期，1小时作为策略周期，15m作为触发周期
         profit_lock = profit_atr_lock_stop_for_position(side, entry, highest, lowest, exit_atr)
         if profit_lock:
             add_stop_candidate(
@@ -4922,36 +4956,43 @@ def apply_new_exit_rules(context, signal_bar_15m='', curr_price=None, price_ts=N
                 )
             )
 
+        # 规则5：第一目标位 → 价格触及入场目标，止损收紧到保本附近
         target = price_to_float(trade_state.get('entry_sr_target'))
         risk = price_to_float(trade_state.get('entry_initial_risk'))
         if target <= 0 and entry > 0 and risk > 0:
-            target = entry + 2 * risk if side == 'long' else entry - 2 * risk
+            target = entry + 2 * risk if side == 'long' else entry - 2 * risk  # 无目标时默认2R
         if target > 0:
             if side == 'long' and curr_price >= target:
                 add_stop_candidate(max(entry, target - 0.5 * risk), "达到第一目标位，收紧保护止损")
             elif side == 'short' and curr_price <= target:
                 add_stop_candidate(min(entry, target + 0.5 * risk), "达到第一目标位，收紧保护止损")
 
+        # 规则6：SR区间止盈 → 价格靠近4H支撑/阻力区，止损缩到区间边缘
         df_4h_closed = get_closed_df(context['dfs']['4h'], '4h', context['now_dt'])
         if len(df_4h_closed) > 0:
             atr_4h = price_to_float(df_4h_closed.iloc[-1].get('atr'))
             near_buffer = SUP_RES_NEAR_ATR * atr_4h
             zones = context.get('zones', {})
             if side == 'long':
+                # 做多：找上方最近的阻力区 ,curr_price-near_buffer:是为了提前缩紧止损，避免价格触及阻力区
                 resistance = nearest_opposite_zone(zones, side, curr_price - near_buffer)
                 if resistance and curr_price >= resistance['lower'] - near_buffer:
                     add_stop_candidate(resistance['lower'] - 0.4 * atr_4h, "靠近有效阻力区，缩紧止盈")
             else:
+                # 做空：找下方最近的支撑区
                 support = nearest_opposite_zone(zones, side, curr_price + near_buffer)
                 if support and curr_price <= support['upper'] + near_buffer:
                     add_stop_candidate(support['upper'] + 0.4 * atr_4h, "靠近有效支撑区，缩紧止盈")
 
+        # 无候选止损位 → 不用调整
         if not stop_candidates:
             return
+        # 做多取最大止损价（最高防线）、做空取最小止损价（最低防线）
         if side == 'long':
             best_stop, reason = max(stop_candidates, key=lambda item: item[0])
         else:
             best_stop, reason = min(stop_candidates, key=lambda item: item[0])
+        # 仅当新止损比当前止损更有利于仓位时才更新
         update_stop_if_tighter(side, best_stop, reason, curr_price, signal_bar_15m=signal_bar_15m, perf=perf)
     finally:
         record_perf(perf, 'apply_new_exit_rules', apply_start)
@@ -4966,6 +5007,7 @@ def monitor_position_new(context, signal_bar_15m='', allow_strategy_close=False,
             return
 
         position_risk_start = time.monotonic()
+        #判断是否有仓位
         position_risk = get_position_risk(side=side)
         record_perf(perf, 'monitor_position_get_position_risk', position_risk_start)
         if position_risk and position_risk.get('fetch_failed'):
@@ -5007,6 +5049,7 @@ def monitor_position_new(context, signal_bar_15m='', allow_strategy_close=False,
         trade_state['position_miss_count'] = 0
         trade_state['liquidation_price'] = position_risk.get('liquidation_price') or 0.0
         reconcile_start = time.monotonic()
+        # 有仓位时保留一张出场方向的止损单（做多→SELL，做空→BUY），清理重复和反方向的条件委托
         reconcile_conditional_orders_for_position(side, silent=True)
         record_perf(perf, 'monitor_position_reconcile_conditional_orders', reconcile_start)
         trade_state['close_cond_4h'] = context['trend_states'].get('4h', {}).get('summary', '')
@@ -5184,7 +5227,7 @@ def _run_strategy_impl(perf):
             trade_state['last_processed_bar_15m'] = signal_bar_15m
         # pending 入场期间不扫描新信号，避免同一交易对叠加多个入场单。
         return pending_result
-
+    
     if not is_new_signal_5m:
         # 同一根 5M K 线只处理一次，避免轮询频率高导致重复开仓。
         return 'no_new_5m_after_full_fetch'
@@ -5238,6 +5281,7 @@ def _run_strategy_impl(perf):
         if is_new_signal_15m:
             trade_state['last_processed_bar_15m'] = signal_bar_15m
         return 'entry_price_invalid'
+    #判断候选信号的入场价格是否仍然在支撑阻力区域内
     sr_zone_still_valid, sr_zone_invalid_reason = candidate_sr_entry_zone_still_valid(candidate, context, curr_price)
     if not sr_zone_still_valid:
         logging.info(sr_zone_invalid_reason)
@@ -5245,6 +5289,7 @@ def _run_strategy_impl(perf):
         if is_new_signal_15m:
             trade_state['last_processed_bar_15m'] = signal_bar_15m
         return 'sr_zone_invalid'
+    #判断候选信号的入场价格是否仍然在目标利润区域内
     target_still_valid, target_invalid_reason = candidate_target_profit_still_valid(candidate, curr_price)
     if not target_still_valid:
         logging.info(target_invalid_reason)
