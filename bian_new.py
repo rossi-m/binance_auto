@@ -214,12 +214,19 @@ STRONG_CHOP_LOOKBACK_BARS = 4
 ENTRY_ATR_STOP_MULTIPLIER = 1.0
 # 极强趋势下把原始止损距离缩到该比例，0.5 表示止损距离减半。
 EXTREME_ADX_STOP_RISK_RATIO = 0.5
+# 趋势触发开仓的初始风险距离至少要达到策略周期 ATR 的比例，过滤贴脸止损。
+MIN_TREND_TRIGGER_RISK_ATR_BY_TF = {
+    '4h': 0.3,
+    '1h': 0.6,
+}
 # 普通趋势下止损额外缓冲的 ATR 倍数。
 NORMAL_STOP_BUFFER_ATR = 0.2
 # 预期利润至少要达到 ATR 的这个比例，否则认为空间太小不值得进场。
 MIN_EXPECTED_PROFIT_ATR = 0.25
 # 预期利润至少要覆盖手续费的倍数，防止收益空间被手续费吃掉。
 MIN_EXPECTED_PROFIT_FEE_MULTIPLIER = 3.0
+# 预期利润相对初始风险的最低倍数，避免目标空间够绝对值但盈亏比太差。
+MIN_EXPECTED_REWARD_RISK = 1.2
 # 市价入场最大追价比例，按候选预期利润空间计算，避免把大部分利润让给入场滑点。
 ENTRY_MAX_SLIPPAGE_PROFIT_RATIO = 0.15
 # 币安U本位 STOP_LIMIT 条件限价入场在 CCXT futures 中使用 STOP 类型 + stopPrice + limit price。
@@ -251,6 +258,8 @@ SUP_RES_VALID_TOUCHES = 2
 SUP_RES_RECENT_BREAK_LOOKBACK = 6
 # 根据支撑/阻力设置止损时，止损放在区域外侧的 ATR 缓冲。
 SUP_RES_STOP_BUFFER_ATR = 0.2
+# SR breakout 单独过滤初始止损距离；超过该 4H ATR 倍数时跳过，其它仍用正常仓位。
+SR_BREAKOUT_RISK_ATR_MAX = 1.5
 # 当前价格距离支撑/阻力小于该 ATR 倍数时，认为已经靠近关键区域。
 SUP_RES_NEAR_ATR = 0.25
 # 计算4H支撑/阻力时向前回看的K线数量。
@@ -814,6 +823,74 @@ def calculate_amount(price):
     except Exception as e:
         logging.error(f"计算下单数量失败: {e}")
         return 0
+
+
+def sr_breakout_risk_distance_allowed(risk_distance, atr_4h):
+    """SR breakout 专用风险距离过滤；超过 1.5 倍 4H ATR 则跳过。"""
+    risk_distance = price_to_float(risk_distance)
+    atr_4h = price_to_float(atr_4h)
+    if risk_distance <= 0 or atr_4h <= 0:
+        return False
+    return risk_distance <= SR_BREAKOUT_RISK_ATR_MAX * atr_4h
+
+
+def trend_trigger_risk_distance_allowed(risk_distance, strategy_atr, strategy_tf):
+    """trend_trigger 专用风险距离过滤；止损太近时跳过。"""
+    risk_distance = price_to_float(risk_distance)
+    strategy_atr = price_to_float(strategy_atr)
+    min_risk_atr = MIN_TREND_TRIGGER_RISK_ATR_BY_TF.get(strategy_tf)
+    if min_risk_atr is None:
+        return True
+    if risk_distance <= 0 or strategy_atr <= 0:
+        return False
+    return risk_distance >= min_risk_atr * strategy_atr
+
+
+def calculate_candidate_amount(entry_price, stop_price, candidate=None, account_equity=None):
+    """按候选信号计算仓位；SR breakout 只过滤过宽止损，其它保持原仓位模型。"""
+    candidate = candidate or {}
+    entry_price = price_to_float(entry_price)
+    stop_price = price_to_float(stop_price)
+    if entry_price <= 0:
+        return 0, {'mode': 'invalid_entry_price'}
+
+    try:
+        if account_equity is None:
+            balance = exchange.fetch_balance({'type': 'future'})
+            account_equity = float(balance['total']['USDT'])
+        else:
+            account_equity = float(account_equity)
+    except Exception as e:
+        logging.error(f"计算候选仓位读取账户余额失败: {e}")
+        return 0, {'mode': 'balance_failed', 'error': str(e)}
+
+    normal_amount = account_equity * MARGIN_RATE * LEVERAGE / entry_price
+    if candidate.get('module') != 'sr_breakout':
+        return exchange.amount_to_precision(SYMBOL, normal_amount), {
+            'mode': 'normal_notional',
+            'normal_amount': normal_amount,
+            'account_equity': account_equity
+        }
+
+    risk_distance = abs(entry_price - stop_price)
+    atr_4h = price_to_float(candidate.get('profit_check_atr'))
+    risk_atr = risk_distance / atr_4h if atr_4h > 0 else 0.0
+    if not sr_breakout_risk_distance_allowed(risk_distance, atr_4h):
+        return 0, {
+            'mode': 'sr_breakout_risk_skip',
+            'risk_distance': risk_distance,
+            'atr_4h': atr_4h,
+            'risk_atr': risk_atr
+        }
+
+    return exchange.amount_to_precision(SYMBOL, normal_amount), {
+        'mode': 'sr_breakout_normal_notional_after_risk_filter',
+        'risk_distance': risk_distance,
+        'atr_4h': atr_4h,
+        'risk_atr': risk_atr,
+        'normal_amount': normal_amount,
+        'account_equity': account_equity
+    }
 
 
 def get_trading_fee_rate():
@@ -2638,8 +2715,25 @@ def place_pending_entry_order(side, candidate, curr_price, state_4h, state_1h, s
         logging.info(f"拒绝挂 STOP_LIMIT 入场：候选目标利润无效: {target_reason}")
         return False
 
-    amount = float(calculate_amount(entry_level))
+    try:
+        balance_before = exchange.fetch_balance({'type': 'future'})
+        initial_usdt = float(balance_before['total']['USDT']) # 开仓前账户资金(USDT)
+    except Exception as e:
+        logging.error(f"拒绝挂 STOP_LIMIT 入场：读取账户资金失败: {e}")
+        return False
+
+    amount_raw, amount_meta = calculate_candidate_amount(
+        entry_level,
+        estimated_safe_stop,
+        candidate=candidate,
+        account_equity=initial_usdt
+    )
+    amount = float(amount_raw)
     if amount <= 0:
+        logging.info(
+            f"拒绝挂 STOP_LIMIT 入场：候选仓位为0或风险过滤跳过 side={side}, "
+            f"entry={entry_level}, stop={estimated_safe_stop}, amount_meta={amount_meta}"
+        )
         return False
 
     def format_cond(state, side_dir):
@@ -2662,8 +2756,6 @@ def place_pending_entry_order(side, candidate, curr_price, state_4h, state_1h, s
     open_condition_details = '\n'.join(open_condition_lines) if open_condition_lines else f"原因:{entry_reason}"
 
     try:
-        balance_before = exchange.fetch_balance({'type': 'future'})
-        initial_usdt = float(balance_before['total']['USDT']) # 开仓前账户资金(USDT)
         exchange.set_leverage(LEVERAGE, SYMBOL)
 
         order_side = 'buy' if side == 'long' else 'sell'
@@ -2719,12 +2811,13 @@ def place_pending_entry_order(side, candidate, curr_price, state_4h, state_1h, s
             f"方向: {side}\n触发价: {stop_price}\n限价: {limit_price}\n当前价: {curr_price}\n"
             f"数量: {amount}\n保护止损: {precision_price(estimated_safe_stop)}\n目标位: {target}\n"
             f"允许滑点: {allowed_slippage:.4f}\n入场原因: {entry_reason}\n"
-            f"触发周期: {trade_state.get('pending_entry_trigger_tf')}\n15M信号时间: {signal_bar_15m}\n"
+            f"触发周期: {trade_state.get('pending_entry_trigger_tf')}\n仓位模式: {amount_meta.get('mode')}\n15M信号时间: {signal_bar_15m}\n"
             f"开仓条件明细:\n{open_condition_details}\n开仓订单ID: {order_id}"
         )
         logging.info(
             f"已挂 STOP_LIMIT pending 入场: id={order_id}, side={side}, stopPrice={stop_price}, "
-            f"limitPrice={limit_price}, amount={amount}, target={target}, protective_stop={precision_price(estimated_safe_stop)}"
+            f"limitPrice={limit_price}, amount={amount}, target={target}, "
+            f"protective_stop={precision_price(estimated_safe_stop)}, amount_meta={amount_meta}"
         )
         return True
     except Exception as e:
@@ -4487,6 +4580,9 @@ def expected_profit_ok(side, entry, stop, target, atr):
         risk = stop - entry
     if profit_distance <= 0 or risk <= 0:
         return False, '盈亏方向无效'
+    rr = profit_distance / risk
+    if rr < MIN_EXPECTED_REWARD_RISK:
+        return False, f"盈亏比不足 rr={rr:.2f}, required={MIN_EXPECTED_REWARD_RISK:.2f}"
     fee_rate = 0.0004
     min_fee_price = entry * fee_rate * MIN_EXPECTED_PROFIT_FEE_MULTIPLIER
     min_atr_price = atr * MIN_EXPECTED_PROFIT_ATR if atr and atr > 0 else 0
@@ -4649,7 +4745,7 @@ def build_sr_rebound_candidates(context, side):
             'module': 'sr_rebound',
             'strategy_tf': '15m',
             'trigger_tf': '15m',
-            'exit_tf': '5m',
+            'exit_tf': '15m',
             'side': side,
             'entry_level': entry_ref,
             'stop': precision_price(stop),
@@ -4680,14 +4776,14 @@ def build_sr_breakout_candidates(context, side):
                 entry_ref = price_to_float(recent3.iloc[-1]['close'])
                 stop = zone['upper'] - SUP_RES_STOP_BUFFER_ATR * atr_4h
                 target, target_zone = target_from_zones_or_rr(zones, side, entry_ref, stop)
-                candidates.append({'module': 'sr_breakout', 'strategy_tf': '4h', 'trigger_tf': '4h', 'exit_tf': '1h', 'side': side, 'entry_level': entry_ref, 'stop': precision_price(stop), 'target': precision_price(target), 'target_zone': target_zone, 'reason': "4H有效阻力突破并连续2根收盘守住", 'state_summary': f"SR breakout long: previous_res={zone['lower']:.4f}-{zone['upper']:.4f}"})
+                candidates.append({'module': 'sr_breakout', 'strategy_tf': '4h', 'trigger_tf': '4h', 'exit_tf': '1h', 'side': side, 'entry_level': entry_ref, 'stop': precision_price(stop), 'target': precision_price(target), 'target_zone': target_zone, 'profit_check_atr': atr_4h, 'reason': "4H有效阻力突破并连续2根收盘守住", 'state_summary': f"SR breakout long: previous_res={zone['lower']:.4f}-{zone['upper']:.4f}"})
     else:
         for zone in zones.get('broken_support', [])[:5]:
             if recent3.iloc[0]['close'] < zone['lower'] and bool((recent3.iloc[1:]['close'] <= zone['lower']).all()):
                 entry_ref = price_to_float(recent3.iloc[-1]['close'])
                 stop = zone['lower'] + SUP_RES_STOP_BUFFER_ATR * atr_4h
                 target, target_zone = target_from_zones_or_rr(zones, side, entry_ref, stop)
-                candidates.append({'module': 'sr_breakout', 'strategy_tf': '4h', 'trigger_tf': '4h', 'exit_tf': '1h', 'side': side, 'entry_level': entry_ref, 'stop': precision_price(stop), 'target': precision_price(target), 'target_zone': target_zone, 'reason': "4H有效支撑跌破并连续2根收盘压住", 'state_summary': f"SR breakout short: previous_sup={zone['lower']:.4f}-{zone['upper']:.4f}"})
+                candidates.append({'module': 'sr_breakout', 'strategy_tf': '4h', 'trigger_tf': '4h', 'exit_tf': '1h', 'side': side, 'entry_level': entry_ref, 'stop': precision_price(stop), 'target': precision_price(target), 'target_zone': target_zone, 'profit_check_atr': atr_4h, 'reason': "4H有效支撑跌破并连续2根收盘压住", 'state_summary': f"SR breakout short: previous_sup={zone['lower']:.4f}-{zone['upper']:.4f}"})
     return candidates
 
 
@@ -4804,6 +4900,20 @@ def build_trend_trigger_candidates(context):
                     else:
                         stop = min(stop, entry_ref + EXTREME_ADX_STOP_RISK_RATIO * risk_distance)
 
+
+            strategy_df_closed = get_closed_df(context['dfs'][strategy_tf], strategy_tf, context['now_dt'])
+            strategy_atr = price_to_float(strategy_df_closed.iloc[-1].get('atr')) if len(strategy_df_closed) > 0 else 0.0
+            risk_distance = abs(entry_ref - stop)
+            min_risk_atr = MIN_TREND_TRIGGER_RISK_ATR_BY_TF.get(strategy_tf)
+            if not trend_trigger_risk_distance_allowed(risk_distance, strategy_atr, strategy_tf):
+                risk_atr = risk_distance / strategy_atr if strategy_atr > 0 else 0.0
+                logging.info(
+                    f"跳过趋势触发{strategy_tf}->{trigger_tf} {side}: "
+                    f"初始风险距离过近 risk={risk_distance:.4f}, "
+                    f"{strategy_tf}ATR={strategy_atr:.4f}, risk_atr={risk_atr:.2f}, "
+                    f"min={min_risk_atr:.2f}"
+                )
+                continue
 
             #查找止盈位置
             target, target_zone = target_from_zones_or_rr(zones, side, entry_ref, stop)
