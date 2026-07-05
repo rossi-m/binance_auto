@@ -260,6 +260,9 @@ SUP_RES_RECENT_BREAK_LOOKBACK = 6
 SUP_RES_STOP_BUFFER_ATR = 0.2
 # SR breakout 单独过滤初始止损距离；超过该 4H ATR 倍数时跳过，其它仍用正常仓位。
 SR_BREAKOUT_RISK_ATR_MAX = 1.5
+# SR breakout 失败后，同区间长冷却；同方向短冷却用于避免刚止损后立刻追同一段假突破。
+SR_BREAKOUT_FAILURE_ZONE_COOLDOWN_SECONDS = 24 * 60 * 60
+SR_BREAKOUT_FAILURE_SIDE_COOLDOWN_SECONDS = 4 * 60 * 60
 # 当前价格距离支撑/阻力小于该 ATR 倍数时，认为已经靠近关键区域。
 SUP_RES_NEAR_ATR = 0.25
 # 计算4H支撑/阻力时向前回看的K线数量。
@@ -294,6 +297,8 @@ trade_state = {
     'entry_trigger_tf': '', # 记录本次开仓真正触发的周期，如 1H / 4H / 4H+1H+15M
     'entry_strategy_tf': '', # 记录策略判断周期：15m / 1h / 4h
     'entry_exit_tf': '', # 记录持仓后用于平仓/缩紧止盈的周期
+    'entry_module': '', # 记录入场模块：trend_trigger / sr_breakout / sr_rebound
+    'entry_sr_breakout_key': '', # SR breakout 对应的支撑/阻力区间key，用于失败冷却
     'entry_sr_target': 0.0, # 支撑阻力模块给出的第一目标位
     'entry_initial_risk': 0.0, # 入场价到初始止损的距离，用于1:2备用目标
     'last_exit_time': '', # 最近一次平仓时间，用于5分钟触发策略的冷却
@@ -313,6 +318,8 @@ trade_state = {
     'pending_entry_background_tf': '',  # 背景周期
     'pending_entry_trigger_tf': '',  # 触发周期
     'pending_entry_exit_tf': '',  # 持仓后出场观察周期
+    'pending_entry_module': '',  # 候选模块
+    'pending_entry_sr_breakout_key': '',  # SR breakout 区间key
     'pending_entry_created_time': '',  # pending 单创建时间
     'pending_entry_signal_bar': '',  # 入场信号K线时间
     'pending_entry_candidate_json': '',  # 候选信号快照
@@ -334,6 +341,10 @@ trade_state = {
     'last_processed_bar_15m': '', # 最近一次已处理过的15M已收盘信号K线时间（核心去重字段，防止同一根K线重复执行策略逻辑）
     'max_seen_bar_15m': '',       # 运行期间见过的最大15M信号时间，防止接口回跳旧K线后被当成新信号
     'position_miss_count': 0  # 连续几轮未在交易所查到仓位，用于避免误判“外部平仓”
+}
+sr_breakout_failure_cooldowns = {
+    'side': {},
+    'zone': {},
 }
 last_conditional_order_cleanup_monotonic = 0.0
 
@@ -844,6 +855,82 @@ def trend_trigger_risk_distance_allowed(risk_distance, strategy_atr, strategy_tf
     if risk_distance <= 0 or strategy_atr <= 0:
         return False
     return risk_distance >= min_risk_atr * strategy_atr
+
+
+def sr_breakout_zone_key(side, zone):
+    if not zone:
+        return ''
+    return (
+        f"{side}:"
+        f"{zone.get('type', '')}:"
+        f"{price_to_float(zone.get('lower')):.2f}-"
+        f"{price_to_float(zone.get('upper')):.2f}:"
+        f"{zone.get('break_time', '')}"
+    )
+
+
+def sr_breakout_cooldown_reason(side, zone_key, now_dt=None):
+    now_dt = now_dt or get_server_now_dt()
+    cooldowns = (
+        (f"side:{side}", sr_breakout_failure_cooldowns.get('side', {}).get(side)),
+        (f"zone:{zone_key}", sr_breakout_failure_cooldowns.get('zone', {}).get(zone_key)),
+    )
+    for label, until_dt in cooldowns:
+        if until_dt and now_dt < until_dt:
+            return f"SR breakout 失败冷却中 {label}, until={until_dt.strftime(BAR_TIME_FORMAT)}"
+    return ''
+
+
+def record_sr_breakout_failure_from_state(exit_time='', net_pnl_usdt=0.0):
+    if net_pnl_usdt >= 0:
+        return
+    if trade_state.get('entry_module') != 'sr_breakout':
+        return
+    side = trade_state.get('side')
+    zone_key = trade_state.get('entry_sr_breakout_key', '')
+    if not side:
+        return
+    exit_dt = parse_bar_time(exit_time) if exit_time else get_server_now_dt()
+    if not exit_dt:
+        exit_dt = get_server_now_dt()
+    side_until_dt = exit_dt + datetime.timedelta(seconds=SR_BREAKOUT_FAILURE_SIDE_COOLDOWN_SECONDS)
+    zone_until_dt = exit_dt + datetime.timedelta(seconds=SR_BREAKOUT_FAILURE_ZONE_COOLDOWN_SECONDS)
+    sr_breakout_failure_cooldowns['side'][side] = side_until_dt
+    if zone_key:
+        sr_breakout_failure_cooldowns['zone'][zone_key] = zone_until_dt
+    logging.info(
+        f"记录 SR breakout 失败冷却: side={side}, zone_key={zone_key}, "
+        f"net={net_pnl_usdt:.4f}, side_until={side_until_dt.strftime(BAR_TIME_FORMAT)}, "
+        f"zone_until={zone_until_dt.strftime(BAR_TIME_FORMAT)}"
+    )
+
+
+def sr_breakout_reverse_strength_reason(context, side, zone):
+    """SR breakout 入场前，过滤已经被 1H/15M 强反向拉回关键区间的假突破。"""
+    opposite = 'short' if side == 'long' else 'long'
+    for timeframe in ('1h', '15m'):
+        df = context['dfs'].get(timeframe)
+        if df is None:
+            continue
+        df_closed = get_closed_df(df, timeframe, context['now_dt'])
+        if len(df_closed) <= 0:
+            continue
+        large = latest_large_strong(df_closed)
+        if large and large.get('direction') == opposite and sr_breakout_reverse_reclaimed_zone(side, zone, large):
+            return f"{timeframe}最新大强{'阳' if opposite == 'long' else '阴'}线反向拉回SR区间"
+        strong = latest_effective_strong(df_closed, opposite)
+        if strong and sr_breakout_reverse_reclaimed_zone(side, zone, strong):
+            return f"{timeframe}最新{strong.get('kind')}强{'阳' if opposite == 'long' else '阴'}线反向拉回SR区间"
+    return ''
+
+
+def sr_breakout_reverse_reclaimed_zone(side, zone, strong):
+    if not zone or not strong:
+        return False
+    close = price_to_float(strong.get('close'))
+    if side == 'short':
+        return close >= price_to_float(zone.get('lower'))
+    return close <= price_to_float(zone.get('upper'))
 
 
 def calculate_candidate_amount(entry_price, stop_price, candidate=None, account_equity=None):
@@ -1977,6 +2064,7 @@ def reset_trade_state_after_external_close(signal_bar_15m='', reason='检测到�
             open_order_id=trade_state.get('open_order_id', ''),
             close_order_id=str(external_context.get('external_close_order_id', ''))
         )
+        record_sr_breakout_failure_from_state(exit_time=detected_time, net_pnl_usdt=net_pnl_usdt)
 
     order_id_lines = format_order_id_lines(
         open_order_id=trade_state.get('open_order_id', ''),
@@ -2035,6 +2123,8 @@ def reset_trade_state_after_external_close(signal_bar_15m='', reason='检测到�
         'entry_trigger_tf': '',
         'entry_strategy_tf': '',
         'entry_exit_tf': '',
+        'entry_module': '',
+        'entry_sr_breakout_key': '',
         'entry_sr_target': 0.0,
         'entry_initial_risk': 0.0,
         'last_exit_time': detected_time,
@@ -2191,6 +2281,8 @@ PENDING_ENTRY_FIELDS = (
     'pending_entry_background_tf',
     'pending_entry_trigger_tf',
     'pending_entry_exit_tf',
+    'pending_entry_module',
+    'pending_entry_sr_breakout_key',
     'pending_entry_created_time',
     'pending_entry_signal_bar',
     'pending_entry_candidate_json',
@@ -2616,6 +2708,8 @@ def finalize_pending_entry_position(order=None, position_risk=None, signal_bar_1
         'entry_trigger_tf': entry_trigger_tf_display,
         'entry_strategy_tf': trade_state.get('pending_entry_strategy_tf', ''),
         'entry_exit_tf': trade_state.get('pending_entry_exit_tf', ''),
+        'entry_module': trade_state.get('pending_entry_module', ''),
+        'entry_sr_breakout_key': trade_state.get('pending_entry_sr_breakout_key', ''),
         'entry_sr_target': target,
         'entry_initial_risk': abs(float(actual_price) - float(actual_safe_stop)),
         'initial_balance': price_to_float(trade_state.get('pending_entry_initial_balance')),
@@ -2790,6 +2884,8 @@ def place_pending_entry_order(side, candidate, curr_price, state_4h, state_1h, s
             'pending_entry_background_tf': background_tf,
             'pending_entry_trigger_tf': entry_trigger_tf or f"{candidate.get('strategy_tf')}->{candidate.get('trigger_tf')}",
             'pending_entry_exit_tf': entry_meta.get('exit_tf') or candidate.get('exit_tf', ''),
+            'pending_entry_module': candidate.get('module', ''),
+            'pending_entry_sr_breakout_key': candidate.get('sr_breakout_key', ''),
             'pending_entry_created_time': created_time,
             'pending_entry_signal_bar': signal_bar_15m,
             'pending_entry_candidate_json': json.dumps(candidate, ensure_ascii=False, default=str),
@@ -3116,6 +3212,8 @@ def open_order(side, price, sl_price, state_4h, state_1h, state_15m, signal_bar_
             'entry_trigger_tf': entry_trigger_tf_display,
             'entry_strategy_tf': entry_meta.get('strategy_tf', ''),
             'entry_exit_tf': entry_meta.get('exit_tf', ''),
+            'entry_module': entry_meta.get('module', ''),
+            'entry_sr_breakout_key': entry_meta.get('sr_breakout_key', ''),
             'entry_sr_target': float(entry_meta.get('sr_target', 0.0) or 0.0),
             'entry_initial_risk': abs(float(actual_price) - float(actual_safe_stop)),
             'initial_balance': initial_usdt,
@@ -3257,6 +3355,7 @@ def close_position(reason, curr_price=None, signal_bar_15m='', trigger_label='')
             open_order_id=open_order_id,
             close_order_id=close_order_id
         )
+        record_sr_breakout_failure_from_state(exit_time=exit_time, net_pnl_usdt=net_pnl_usdt)
 
         order_id_lines = format_order_id_lines(
             open_order_id=open_order_id,
@@ -3301,6 +3400,8 @@ def close_position(reason, curr_price=None, signal_bar_15m='', trigger_label='')
             'entry_trigger_tf': '',
             'entry_strategy_tf': '',
             'entry_exit_tf': '',
+            'entry_module': '',
+            'entry_sr_breakout_key': '',
             'entry_sr_target': 0.0,
             'entry_initial_risk': 0.0,
             'last_exit_time': exit_time,
@@ -4771,19 +4872,37 @@ def build_sr_breakout_candidates(context, side):
     candidates = []
     if side == 'long':
         for zone in zones.get('broken_resistance', [])[:5]:
+            zone_key = sr_breakout_zone_key(side, zone)
+            cooldown_reason = sr_breakout_cooldown_reason(side, zone_key, context['now_dt'])
+            if cooldown_reason:
+                logging.info(f"跳过 SR breakout long: {cooldown_reason}")
+                continue
+            reverse_reason = sr_breakout_reverse_strength_reason(context, side, zone)
+            if reverse_reason:
+                logging.info(f"跳过 SR breakout long: {reverse_reason}, zone={zone_key}")
+                continue
             #4小时K线中，第一根阻力突破后面连续2根收盘价都站稳
             if recent3.iloc[0]['close'] > zone['upper'] and bool((recent3.iloc[1:]['close'] >= zone['upper']).all()):
                 entry_ref = price_to_float(recent3.iloc[-1]['close'])
                 stop = zone['upper'] - SUP_RES_STOP_BUFFER_ATR * atr_4h
                 target, target_zone = target_from_zones_or_rr(zones, side, entry_ref, stop)
-                candidates.append({'module': 'sr_breakout', 'strategy_tf': '4h', 'trigger_tf': '4h', 'exit_tf': '1h', 'side': side, 'entry_level': entry_ref, 'stop': precision_price(stop), 'target': precision_price(target), 'target_zone': target_zone, 'profit_check_atr': atr_4h, 'reason': "4H有效阻力突破并连续2根收盘守住", 'state_summary': f"SR breakout long: previous_res={zone['lower']:.4f}-{zone['upper']:.4f}"})
+                candidates.append({'module': 'sr_breakout', 'strategy_tf': '4h', 'trigger_tf': '4h', 'exit_tf': '1h', 'side': side, 'entry_level': entry_ref, 'stop': precision_price(stop), 'target': precision_price(target), 'target_zone': target_zone, 'profit_check_atr': atr_4h, 'sr_breakout_key': zone_key, 'sr_breakout_zone': dict(zone), 'reason': "4H有效阻力突破并连续2根收盘守住", 'state_summary': f"SR breakout long: previous_res={zone['lower']:.4f}-{zone['upper']:.4f}"})
     else:
         for zone in zones.get('broken_support', [])[:5]:
+            zone_key = sr_breakout_zone_key(side, zone)
+            cooldown_reason = sr_breakout_cooldown_reason(side, zone_key, context['now_dt'])
+            if cooldown_reason:
+                logging.info(f"跳过 SR breakout short: {cooldown_reason}")
+                continue
+            reverse_reason = sr_breakout_reverse_strength_reason(context, side, zone)
+            if reverse_reason:
+                logging.info(f"跳过 SR breakout short: {reverse_reason}, zone={zone_key}")
+                continue
             if recent3.iloc[0]['close'] < zone['lower'] and bool((recent3.iloc[1:]['close'] <= zone['lower']).all()):
                 entry_ref = price_to_float(recent3.iloc[-1]['close'])
                 stop = zone['lower'] + SUP_RES_STOP_BUFFER_ATR * atr_4h
                 target, target_zone = target_from_zones_or_rr(zones, side, entry_ref, stop)
-                candidates.append({'module': 'sr_breakout', 'strategy_tf': '4h', 'trigger_tf': '4h', 'exit_tf': '1h', 'side': side, 'entry_level': entry_ref, 'stop': precision_price(stop), 'target': precision_price(target), 'target_zone': target_zone, 'profit_check_atr': atr_4h, 'reason': "4H有效支撑跌破并连续2根收盘压住", 'state_summary': f"SR breakout short: previous_sup={zone['lower']:.4f}-{zone['upper']:.4f}"})
+                candidates.append({'module': 'sr_breakout', 'strategy_tf': '4h', 'trigger_tf': '4h', 'exit_tf': '1h', 'side': side, 'entry_level': entry_ref, 'stop': precision_price(stop), 'target': precision_price(target), 'target_zone': target_zone, 'profit_check_atr': atr_4h, 'sr_breakout_key': zone_key, 'sr_breakout_zone': dict(zone), 'reason': "4H有效支撑跌破并连续2根收盘压住", 'state_summary': f"SR breakout short: previous_sup={zone['lower']:.4f}-{zone['upper']:.4f}"})
     return candidates
 
 
