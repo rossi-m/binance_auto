@@ -7,3 +7,15 @@ venv/
 *.csv
 .codex
 .log
+# TradingAgents research runtime outputs
+tradingAgents/.env
+tradingAgents/.env.*
+!tradingAgents/.env.example
+tradingAgents/.ai_research/
+tradingAgents/.tradingagents/
+tradingAgents/outputs/
+tradingAgents/output/
+tradingAgents/.agents/
+tradingAgents/.codex/
+tradingAgents/.git/
+tradingAgents/__pycache__/
