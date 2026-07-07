@@ -529,9 +529,17 @@ size_multiplier 只能降低风险，不能放大仓位。
 未来实盘读取时必须按 timezone-aware datetime 解析，不能去掉 `+08:00` 后用字符串或 naive datetime 比较。
 ```
 
-fail-open 规则：
+### 9.6 fail-open 和方向过滤规则
+
+#### fail-open 规则
+
+fail-open 的意思是：AI 不拦截，不改变 `bian_new.py` 原策略。它不是“不开仓”，而是“AI 放行，是否开仓仍由原策略决定”。
 
 ```text
+数据异常、过期、缺字段、解析失败:
+  allow_long = true
+  allow_short = true
+
 confidence < 0.55:
   allow_long = true
   allow_short = true
@@ -539,7 +547,15 @@ confidence < 0.55:
 bias = neutral 或 mixed:
   allow_long = true
   allow_short = true
+```
 
+#### 高置信度方向过滤规则
+
+下面两条不是 fail-open，而是未来可能接入的方向过滤。
+
+它们不会让 AI 主动开仓，只会在 `bian_new.py` 原策略已经出现开仓候选后，决定是否允许这个方向继续。
+
+```text
 bias = bullish 且 confidence >= 0.65:
   allow_long = true
   allow_short = false
@@ -549,13 +565,22 @@ bias = bearish 且 confidence >= 0.65:
   allow_short = true
 ```
 
-解释：
+未来接入后的含义：
 
 ```text
-低置信度不拦截。
-mixed/neutral 不拦截。
-只有高置信度且方向明确，未来才可能用于过滤或降仓。
-所有异常、过期、缺字段、解析失败，都应该按 fail-open 处理，也就是不影响原实盘策略。
+如果原策略没有开仓信号:
+  AI bias 不能自己开仓。
+
+如果原策略给出多单候选:
+  allow_long = true  -> 允许继续走原策略下单流程。
+  allow_long = false -> 跳过这次多单候选。
+
+如果原策略给出空单候选:
+  allow_short = true  -> 允许继续走原策略下单流程。
+  allow_short = false -> 跳过这次空单候选。
+
+当前阶段:
+  bian_new.py 还没有读取这些字段，所以不会影响实盘。
 ```
 
 ## 10. 当前测试结果
