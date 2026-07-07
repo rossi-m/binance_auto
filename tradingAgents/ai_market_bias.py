@@ -16,7 +16,7 @@ import os
 import re
 import subprocess
 import sys
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
@@ -51,10 +51,15 @@ FRED_SERIES = {
     "DGS10": "10Y Treasury Yield",
     "DGS2": "2Y Treasury Yield",
 }
+EXCHANGE_TZ = timezone(timedelta(hours=8))
 
 
 def now_utc() -> datetime:
     return datetime.now(UTC)
+
+
+def now_exchange() -> datetime:
+    return datetime.now(EXCHANGE_TZ)
 
 
 def symbol_to_binance(symbol: str) -> str:
@@ -478,11 +483,12 @@ def normalize_bias(raw: dict[str, Any], symbol: str, hours: int, source_counts: 
         size_multiplier = 1.0
     size_multiplier = max(0.0, min(1.0, size_multiplier))
 
-    generated = now_utc()
+    generated = now_exchange()
+    expires = generated + timedelta(hours=hours)
     return {
         "symbol": symbol,
         "generated_at": generated.isoformat(),
-        "expires_at": (generated + timedelta(hours=hours)).isoformat(),
+        "expires_at": expires.isoformat(),
         "bias": bias,
         "confidence": confidence,
         "allow_long": allow_long,

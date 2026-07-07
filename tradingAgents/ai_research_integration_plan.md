@@ -397,8 +397,8 @@ schema：
 ```json
 {
   "symbol": "ETHUSDT",
-  "generated_at": "2026-07-07T13:02:22+00:00",
-  "expires_at": "2026-07-07T21:02:22+00:00",
+  "generated_at": "2026-07-07T21:02:22+08:00",
+  "expires_at": "2026-07-08T05:02:22+08:00",
   "bias": "bullish|bearish|neutral|mixed",
   "confidence": 0.0,
   "allow_long": true,
@@ -416,8 +416,8 @@ schema：
 | key | 类型 | 作用 | 当前是否用于实盘 |
 |---|---|---|---|
 | `symbol` | string | bias 对应的交易标的。当前固定为 `ETHUSDT`。 | 否 |
-| `generated_at` | ISO datetime | bias 生成时间，UTC 时间。用于判断这份判断是什么时候产生的。 | 否 |
-| `expires_at` | ISO datetime | bias 过期时间。未来接入时，过期必须 fail-open。 | 否 |
+| `generated_at` | ISO datetime | bias 生成时间，统一使用实盘交易时区：北京时间/UTC+8，必须带时区偏移，例如 `+08:00`。 | 否 |
+| `expires_at` | ISO datetime | bias 过期时间，统一使用实盘交易时区：北京时间/UTC+8，必须带时区偏移。未来接入时，过期必须 fail-open。 | 否 |
 | `bias` | string | 方向偏见，只允许 `bullish`、`bearish`、`neutral`、`mixed`。 | 否 |
 | `confidence` | number | 置信度，范围 `0.0` 到 `1.0`。低于阈值不允许拦截。 | 否 |
 | `allow_long` | boolean | 未来接入时是否允许策略开多。当前只记录，不执行。 | 否 |
@@ -433,6 +433,8 @@ schema：
 ```text
 当前这些 key 都不会被 bian_new.py 读取。
 它们只是观察期记录和未来接入时的协议草案。
+时间字段只保留一套口径：和 `bian_new.py` 的 `EXCHANGE_TZ` 一致，使用北京时间/UTC+8 ISO 时间。
+未来实盘读取时必须按 timezone-aware datetime 解析，不能去掉 `+08:00` 后用字符串或 naive datetime 比较。
 ```
 
 fail-open 规则：
