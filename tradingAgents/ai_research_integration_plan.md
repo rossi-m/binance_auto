@@ -83,6 +83,7 @@ outputs/ETH-USD_YYYY-MM-DD_decision.json
 |---|---|---|---|
 | `tradingAgents/analyze_eth_tradingagents.py` | 当前实现 | TradingAgents 研究入口；运行时 patch 数据源；输出多 Agent 报告 | 是 |
 | `tradingAgents/ai_market_bias.py` | 当前实现 | 读取 TradingAgents 报告，结合辅助数据，生成 bias JSON | 是 |
+| `tradingAgents/ai_bias_observer.py` | 当前实现 | 读取 latest bias、TradingAgents 报告和 Binance 摘要，追加观察期 CSV 日志 | 是 |
 | `tradingAgents/ai_research_integration_plan.md` | 当前实现 | 当前方案文档、运行命令、下一步计划 | 是 |
 | `tradingAgents/.env.example` | 当前实现 | 环境变量模板，只放占位符，不放真实 key | 是 |
 
@@ -93,7 +94,7 @@ outputs/ETH-USD_YYYY-MM-DD_decision.json
 | `tradingAgents/.env` | 用户手工创建 | 存真实 API key，例如 `DEEPSEEK_API_KEY` | 含密钥，不能进 git |
 | `tradingAgents/.ai_research/latest_bias_ETHUSDT.json` | `ai_market_bias.py` | 最新 AI bias 输出，未来可给观察/实盘读取 | 运行态结果，会频繁变化 |
 | `tradingAgents/.ai_research/cache/` | `ai_market_bias.py` | 新闻、FRED、Binance、TradingAgents 输入快照缓存 | 缓存数据，体积和内容会变 |
-| `tradingAgents/.ai_research/logs/` | 计划中的观察日志脚本 / cron | AI bias 观察日志、cron 日志 | 运行日志，不属于源码 |
+| `tradingAgents/.ai_research/logs/` | `ai_bias_observer.py` / cron | AI bias 观察日志、cron 日志 | 运行日志，不属于源码 |
 | `tradingAgents/outputs/*_summary.md` | `analyze_eth_tradingagents.py` | 人看的 TradingAgents 研究报告 | 每次运行结果，不属于源码 |
 | `tradingAgents/outputs/*_state.json` | `analyze_eth_tradingagents.py` | TradingAgents 全流程状态，内容最全 | 文件大、运行态输出 |
 | `tradingAgents/outputs/*_decision.json` | `analyze_eth_tradingagents.py` | TradingAgents 最终决策 | 每次运行结果 |
@@ -396,7 +397,79 @@ tradingAgents/.ai_research/latest_bias_ETHUSDT.json
 
 当前写出这个文件也不会影响实盘，因为 `bian_new.py` 尚未读取它。
 
-## 9. Bias JSON 规则
+## 9. ai_bias_observer.py 命令
+
+目的：进入观察期后，把每次 AI bias 和当时市场状态记录下来，形成复盘数据集。
+
+它解决的问题：
+
+```text
+只看 latest_bias_ETHUSDT.json 只能知道最新一次判断。
+无法复盘过去每次 AI 判断当时的价格、趋势、置信度和 TradingAgents 报告。
+
+ai_bias_observer.py 会把这些信息追加到月度 CSV。
+后面才能判断 AI bias 是否有帮助，是否经常误判，是否适合接入 bian_new.py。
+```
+
+只打印观察记录，不写 CSV：
+
+```bash
+python tradingAgents/ai_bias_observer.py --symbol ETHUSDT --dry-run
+```
+
+追加写观察日志：
+
+```bash
+python tradingAgents/ai_bias_observer.py --symbol ETHUSDT
+```
+
+输出：
+
+```text
+tradingAgents/.ai_research/logs/ai_bias_YYYY-MM.csv
+```
+
+每行记录包括：
+
+```text
+observed_at
+symbol
+bias_generated_at
+bias_expires_at
+bias
+confidence
+allow_long
+allow_short
+size_multiplier
+reason
+risk_events
+news_used
+source_counts
+latest_price
+trend_1h
+pct_change_1h
+trend_4h
+pct_change_4h
+trend_1d
+pct_change_1d
+binance_errors
+tradingagents_available
+tradingagents_age_hours
+tradingagents_summary_path
+tradingagents_modified_at
+tradingagents_decision_path
+tradingagents_decision
+```
+
+边界：
+
+```text
+ai_bias_observer.py 不导入 bian_new.py。
+不下单，不撤单，不改止损，不改仓位。
+它只读 latest bias、TradingAgents 输出和 Binance 公开行情，然后追加 CSV。
+```
+
+## 10. Bias JSON 规则
 
 schema：
 
@@ -434,7 +507,7 @@ schema：
 | `news_used` | array[string] | DeepSeek 归一化时认为关键的新闻标题或主题。用于追溯来源。 | 否 |
 | `source_counts` | object | 本次输入里各数据源数量，例如 Finnhub/RSS/GDELT。用于判断数据覆盖度。 | 否 |
 
-### 9.1 bias 方向含义
+### 10.1 bias 方向含义
 
 `bias` 是研究层对未来 9 小时市场环境的方向偏见，不是交易信号，也不是订单指令。
 
@@ -456,7 +529,7 @@ AI bias 未来最多只能做过滤、降仓或观察提示。
 真正入场、止损、止盈仍由 bian_new.py 的原策略决定。
 ```
 
-### 9.2 confidence 置信度含义
+### 10.2 confidence 置信度含义
 
 `confidence` 表示这次研究结论的证据一致性和方向明确程度。
 
@@ -488,7 +561,7 @@ confidence >= 0.65 且 bias 明确为 bullish/bearish:
   可以记录，但不应用来拦截方向。
 ```
 
-### 9.3 allow_long / allow_short 含义
+### 10.3 allow_long / allow_short 含义
 
 `allow_long` 和 `allow_short` 是未来接入实盘时的方向许可位。当前 `bian_new.py` 没有读取它们，所以它们只用于观察。
 
@@ -499,7 +572,7 @@ confidence >= 0.65 且 bias 明确为 bullish/bearish:
 | `false` | `true` | 只允许做空，不允许新开多。通常只可能来自高置信度 `bearish`。 |
 | `false` | `false` | 当前规则不主动生成这种状态。未来即使出现，也应按 fail-open 或禁止新开仓单独评估，不能未经验证直接接实盘。 |
 
-### 9.4 size_multiplier 含义
+### 10.4 size_multiplier 含义
 
 `size_multiplier` 是未来可能使用的仓位系数，当前不影响任何实盘仓位。
 
@@ -517,7 +590,7 @@ size_multiplier 只能降低风险，不能放大仓位。
 实盘接入前必须单独测试降仓逻辑，避免和 bian_new.py 的保证金、杠杆、止损规则冲突。
 ```
 
-### 9.5 reason / risk_events / news_used / source_counts 含义
+### 10.5 reason / risk_events / news_used / source_counts 含义
 
 | key | 详细说明 |
 |---|---|
@@ -535,7 +608,7 @@ size_multiplier 只能降低风险，不能放大仓位。
 未来实盘读取时必须按 timezone-aware datetime 解析，不能去掉 `+08:00` 后用字符串或 naive datetime 比较。
 ```
 
-### 9.6 fail-open 和方向过滤规则
+### 10.6 fail-open 和方向过滤规则
 
 #### fail-open 规则
 
@@ -589,9 +662,9 @@ bias = bearish 且 confidence >= 0.65:
   bian_new.py 还没有读取这些字段，所以不会影响实盘。
 ```
 
-## 10. 当前测试结果
+## 11. 当前测试结果
 
-### 10.1 数据源测试
+### 11.1 数据源测试
 
 已通过：
 
@@ -607,7 +680,7 @@ FRED macro cache
 Binance 多周期摘要
 ```
 
-### 10.2 TradingAgents 完整流程
+### 11.2 TradingAgents 完整流程
 
 已成功生成：
 
@@ -634,7 +707,7 @@ outputs/ETH-USD_2026-07-07_decision.json
 TradingAgents final decision: Overweight
 ```
 
-### 10.3 ai_market_bias.py
+### 11.3 ai_market_bias.py
 
 已通过：
 
@@ -660,7 +733,7 @@ fail-open 规则校验
 
 因为 `confidence = 0.55` 未达到 `0.65`，所以不拦截任何方向。
 
-## 11. 运行产物目录
+## 12. 运行产物目录
 
 这些目录是运行产物，不属于方案源码。
 
@@ -694,7 +767,7 @@ TradingAgents 框架自己的缓存、日志和 memory。
 .tradingagents/memory/
 ```
 
-## 12. 调度建议
+## 13. 调度建议
 
 先只跑观察任务。
 
@@ -708,7 +781,7 @@ TradingAgents 框架自己的缓存、日志和 memory。
 20:50 启动串行任务：先生成 TradingAgents 报告，完成后生成 latest bias
 ```
 
-不要再拆成两条 cron。`ai_market_bias.py --run-tradingagents` 会先同步运行 TradingAgents；只有 TradingAgents 正常结束并写出报告后，才会继续生成 bias。
+不要再拆成两条 cron。`ai_market_bias.py --run-tradingagents` 会先同步运行 TradingAgents；只有 TradingAgents 正常结束并写出报告后，才会继续生成 bias。bias 成功写出后，再运行 `ai_bias_observer.py` 追加观察日志。
 
 `--hours 9` 同时控制新闻回看窗口和 bias 有效期。bias 的 `generated_at` 以实际写入时间为准，`expires_at = generated_at + 9 小时`。
 
@@ -723,7 +796,7 @@ TradingAgents 框架自己的缓存、日志和 memory。
 如果 TradingAgents 跑得更久，bias 会顺延生成，不会提前读取旧报告或未写完的报告。
 
 ```cron
-50 5,13,20 * * * cd /home/ubuntu/binance_auto && python tradingAgents/ai_market_bias.py --symbol ETHUSDT --hours 9 --run-tradingagents --tradingagents-ticker ETH-USD --asset-type crypto --tradingagents-provider deepseek --tradingagents-deep deepseek-v4-pro --tradingagents-quick deepseek-v4-flash --tradingagents-offline --tradingagents-llm-timeout 300 --tradingagents-llm-max-retries 1 --tradingagents-max-data-rows 60 --tradingagents-max-news-items 12 --tradingagents-max-news-summary-chars 500 >> tradingAgents/.ai_research/logs/cron.log 2>&1
+50 5,13,20 * * * cd /home/ubuntu/binance_auto && ( python tradingAgents/ai_market_bias.py --symbol ETHUSDT --hours 9 --run-tradingagents --tradingagents-ticker ETH-USD --asset-type crypto --tradingagents-provider deepseek --tradingagents-deep deepseek-v4-pro --tradingagents-quick deepseek-v4-flash --tradingagents-offline --tradingagents-llm-timeout 300 --tradingagents-llm-max-retries 1 --tradingagents-max-data-rows 60 --tradingagents-max-news-items 12 --tradingagents-max-news-summary-chars 500 && python tradingAgents/ai_bias_observer.py --symbol ETHUSDT ) >> tradingAgents/.ai_research/logs/cron.log 2>&1
 ```
 
 注意：
@@ -733,31 +806,33 @@ TradingAgents 框架自己的缓存、日志和 memory。
 ai_market_bias.py 默认要求有最新 TradingAgents summary。
 如果 summary 缺失或过期，应失败，而不是偷偷变成单模型分析。
 如果 TradingAgents 执行失败，整条串行任务失败，不会生成新的 latest bias。
+如果 latest bias 没有生成，`ai_bias_observer.py` 不会执行。
 ```
 
-## 13. 下一步
+## 14. 下一步
 
-### A. 观察期日志化
+### A. 观察期日志运行
 
 优先级最高。
 
-目标：不改变交易行为，只把 AI bias 和市场状态记录下来。
+目标：不改变交易行为，连续记录 AI bias 和市场状态，积累可复盘样本。
 
 要做：
 
 ```text
-1. 新增独立观察日志脚本，不改 bian_new.py 主流程。
-2. 读取 .ai_research/latest_bias_ETHUSDT.json。
-3. 读取最新 TradingAgents summary/decision。
-4. 读取 Binance 当前多周期摘要。
-5. 追加写 .ai_research/logs/ai_bias_YYYY-MM.csv。
+1. 每次 latest_bias_ETHUSDT.json 生成后运行 ai_bias_observer.py。
+2. 追加写 .ai_research/logs/ai_bias_YYYY-MM.csv。
+3. 连续记录至少 7 天。
+4. 对比 bias、confidence、价格变化和 TradingAgents 报告。
+5. 统计高置信度 bullish/bearish 是否真的有过滤价值。
 ```
 
 每条记录至少包含：
 
 ```text
-generated_at
-expires_at
+observed_at
+bias_generated_at
+bias_expires_at
 bias
 confidence
 allow_long
@@ -767,10 +842,17 @@ reason
 risk_events
 source_counts
 latest_price
-1h trend
-4h trend
-1d trend
+trend_1h
+pct_change_1h
+trend_4h
+pct_change_4h
+trend_1d
+pct_change_1d
+binance_errors
+tradingagents_available
+tradingagents_age_hours
 tradingagents_decision
+tradingagents_decision_path
 tradingagents_summary_path
 ```
 
