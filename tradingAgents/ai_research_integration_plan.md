@@ -75,6 +75,34 @@ outputs/ETH-USD_YYYY-MM-DD_decision.json
 
 重要：`ai_market_bias.py` 是 TradingAgents-first。它默认要求有新鲜 TradingAgents summary，不应该退化成单 DeepSeek 模型自己判断行情。
 
+### 文件清单和用途
+
+#### 仓库内应该上传的文件
+
+| 文件 | 由谁产生 | 用途 | 是否上传 git |
+|---|---|---|---|
+| `tradingAgents/analyze_eth_tradingagents.py` | 当前实现 | TradingAgents 研究入口；运行时 patch 数据源；输出多 Agent 报告 | 是 |
+| `tradingAgents/ai_market_bias.py` | 当前实现 | 读取 TradingAgents 报告，结合辅助数据，生成 bias JSON | 是 |
+| `tradingAgents/ai_research_integration_plan.md` | 当前实现 | 当前方案文档、运行命令、下一步计划 | 是 |
+| `tradingAgents/.env.example` | 当前实现 | 环境变量模板，只放占位符，不放真实 key | 是 |
+
+#### 运行后会产生但不上传的文件和目录
+
+| 路径 | 由谁产生 | 用途 | 为什么不上传 |
+|---|---|---|---|
+| `tradingAgents/.env` | 用户手工创建 | 存真实 API key，例如 `DEEPSEEK_API_KEY` | 含密钥，不能进 git |
+| `tradingAgents/.ai_research/latest_bias_ETHUSDT.json` | `ai_market_bias.py` | 最新 AI bias 输出，未来可给观察/实盘读取 | 运行态结果，会频繁变化 |
+| `tradingAgents/.ai_research/cache/` | `ai_market_bias.py` | 新闻、FRED、Binance、TradingAgents 输入快照缓存 | 缓存数据，体积和内容会变 |
+| `tradingAgents/.ai_research/logs/` | 计划中的观察日志脚本 / cron | AI bias 观察日志、cron 日志 | 运行日志，不属于源码 |
+| `tradingAgents/outputs/*_summary.md` | `analyze_eth_tradingagents.py` | 人看的 TradingAgents 研究报告 | 每次运行结果，不属于源码 |
+| `tradingAgents/outputs/*_state.json` | `analyze_eth_tradingagents.py` | TradingAgents 全流程状态，内容最全 | 文件大、运行态输出 |
+| `tradingAgents/outputs/*_decision.json` | `analyze_eth_tradingagents.py` | TradingAgents 最终决策 | 每次运行结果 |
+| `tradingAgents/.tradingagents/cache/` | TradingAgents 框架 | TradingAgents 数据缓存 | 缓存数据 |
+| `tradingAgents/.tradingagents/logs/` | TradingAgents 框架 | TradingAgents 内部运行日志 | 日志文件 |
+| `tradingAgents/.tradingagents/memory/` | TradingAgents 框架 | TradingAgents memory log | 运行态记忆，不适合提交 |
+| `tradingAgents/__pycache__/` | Python | Python 字节码缓存 | 可再生成，无需提交 |
+
+
 ## 3. 当前数据流
 
 ```text
@@ -383,6 +411,30 @@ schema：
 }
 ```
 
+每个 key 的作用：
+
+| key | 类型 | 作用 | 当前是否用于实盘 |
+|---|---|---|---|
+| `symbol` | string | bias 对应的交易标的。当前固定为 `ETHUSDT`。 | 否 |
+| `generated_at` | ISO datetime | bias 生成时间，UTC 时间。用于判断这份判断是什么时候产生的。 | 否 |
+| `expires_at` | ISO datetime | bias 过期时间。未来接入时，过期必须 fail-open。 | 否 |
+| `bias` | string | 方向偏见，只允许 `bullish`、`bearish`、`neutral`、`mixed`。 | 否 |
+| `confidence` | number | 置信度，范围 `0.0` 到 `1.0`。低于阈值不允许拦截。 | 否 |
+| `allow_long` | boolean | 未来接入时是否允许策略开多。当前只记录，不执行。 | 否 |
+| `allow_short` | boolean | 未来接入时是否允许策略开空。当前只记录，不执行。 | 否 |
+| `size_multiplier` | number | 未来可能用于降仓，范围通常 `0.0` 到 `1.0`。当前不影响仓位。 | 否 |
+| `reason` | string | 简短解释，说明为什么给出该 bias。用于人工复盘。 | 否 |
+| `risk_events` | array[string] | 需要关注的风险事件，例如宏观事件、监管、重大新闻。 | 否 |
+| `news_used` | array[string] | DeepSeek 归一化时认为关键的新闻标题或主题。用于追溯来源。 | 否 |
+| `source_counts` | object | 本次输入里各数据源数量，例如 Finnhub/RSS/GDELT。用于判断数据覆盖度。 | 否 |
+
+注意：
+
+```text
+当前这些 key 都不会被 bian_new.py 读取。
+它们只是观察期记录和未来接入时的协议草案。
+```
+
 fail-open 规则：
 
 ```text
@@ -484,7 +536,7 @@ fail-open 规则校验
 
 ## 11. 运行产物目录
 
-这些目录不上传 git。
+这些目录是运行产物，不属于方案源码。
 
 ### .ai_research/
 
@@ -516,35 +568,7 @@ TradingAgents 框架自己的缓存、日志和 memory。
 .tradingagents/memory/
 ```
 
-## 12. Git 忽略规则
-
-真实仓库根目录 `.gitignore` 已忽略：
-
-```text
-tradingAgents/.env
-tradingAgents/.env.*
-!tradingAgents/.env.example
-tradingAgents/.ai_research/
-tradingAgents/.tradingagents/
-tradingAgents/outputs/
-tradingAgents/output/
-tradingAgents/.agents/
-tradingAgents/.codex/
-tradingAgents/.git/
-tradingAgents/__pycache__/
-```
-
-因此：
-
-```text
-上传 .env.example
-不上传 .env
-不上传研究缓存
-不上传 TradingAgents 输出报告
-不上传本地工具元数据
-```
-
-## 13. 调度建议
+## 12. 调度建议
 
 先只跑观察任务。
 
@@ -560,7 +584,7 @@ ai_market_bias.py 默认要求有最新 TradingAgents summary。
 如果 summary 缺失或过期，应失败，而不是偷偷变成单模型分析。
 ```
 
-## 14. 下一步
+## 13. 下一步
 
 ### A. 观察期日志化
 
