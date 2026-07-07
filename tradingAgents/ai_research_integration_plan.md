@@ -367,19 +367,19 @@ OHLCV CSV 和新闻过长时，DeepSeek V4 容易在响应读取阶段变慢或�
 只抓数据，不调用 DeepSeek：
 
 ```bash
-python tradingAgents/ai_market_bias.py --symbol ETHUSDT --hours 8 --fetch-only
+python tradingAgents/ai_market_bias.py --symbol ETHUSDT --hours 9 --fetch-only
 ```
 
 调用 DeepSeek 归一化，但不写 latest bias：
 
 ```bash
-python tradingAgents/ai_market_bias.py --symbol ETHUSDT --hours 8 --dry-run
+python tradingAgents/ai_market_bias.py --symbol ETHUSDT --hours 9 --dry-run
 ```
 
 写研究层 bias 文件：
 
 ```bash
-python tradingAgents/ai_market_bias.py --symbol ETHUSDT --hours 8
+python tradingAgents/ai_market_bias.py --symbol ETHUSDT --hours 9
 ```
 
 输出：
@@ -430,7 +430,7 @@ schema：
 
 ### 9.1 bias 方向含义
 
-`bias` 是研究层对未来 8 小时市场环境的方向偏见，不是交易信号，也不是订单指令。
+`bias` 是研究层对未来 9 小时市场环境的方向偏见，不是交易信号，也不是订单指令。
 
 | bias | 含义 | 未来接入时的默认态度 |
 |---|---|---|
@@ -707,9 +707,17 @@ TradingAgents 框架自己的缓存、日志和 memory。
 
 `ai_market_bias.py` 比 TradingAgents 晚 10 分钟跑，避免报告还没写完就读取。
 
+`--hours 9` 同时控制新闻回看窗口和 bias 有效期。按下面调度，覆盖窗口是：
+
+```text
+06:00 -> 15:00
+14:00 -> 23:00
+21:00 -> 次日 06:00
+```
+
 ```cron
 50 5,13,20 * * * cd /home/ubuntu/binance_auto && python tradingAgents/analyze_eth_tradingagents.py --ticker ETH-USD --asset-type crypto --provider deepseek --deep deepseek-v4-pro --quick deepseek-v4-flash --offline --llm-timeout 300 --llm-max-retries 1 --max-data-rows 60 --max-news-items 12 --max-news-summary-chars 500 >> tradingAgents/.ai_research/logs/tradingagents.log 2>&1
-0 6,14,21 * * * cd /home/ubuntu/binance_auto && python tradingAgents/ai_market_bias.py --symbol ETHUSDT --hours 8 >> tradingAgents/.ai_research/logs/cron.log 2>&1
+0 6,14,21 * * * cd /home/ubuntu/binance_auto && python tradingAgents/ai_market_bias.py --symbol ETHUSDT --hours 9 >> tradingAgents/.ai_research/logs/cron.log 2>&1
 ```
 
 注意：

@@ -531,7 +531,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build AI research inputs and optional bias JSON.")
     parser.add_argument("--symbol", default="ETHUSDT", help="Trading symbol, default ETHUSDT.")
     parser.add_argument("--tradingagents-ticker", default="ETH-USD", help="Ticker used by TradingAgents outputs.")
-    parser.add_argument("--hours", type=int, default=8, help="News lookback and bias expiry horizon.")
+    parser.add_argument("--hours", type=int, default=9, help="News lookback and bias expiry horizon.")
     parser.add_argument("--research-dir", default=DEFAULT_RESEARCH_DIR, help="Research cache/output directory.")
     parser.add_argument("--outputs-dir", default=DEFAULT_OUTPUTS_DIR, help="TradingAgents outputs directory.")
     parser.add_argument("--model", default=DEFAULT_DEEPSEEK_MODEL, help="DeepSeek chat model.")
