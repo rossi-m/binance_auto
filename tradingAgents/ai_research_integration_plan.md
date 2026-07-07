@@ -382,6 +382,12 @@ python tradingAgents/ai_market_bias.py --symbol ETHUSDT --hours 9 --dry-run
 python tradingAgents/ai_market_bias.py --symbol ETHUSDT --hours 9
 ```
 
+先跑 TradingAgents，完成后再写研究层 bias 文件：
+
+```bash
+python tradingAgents/ai_market_bias.py --symbol ETHUSDT --hours 9 --run-tradingagents --tradingagents-ticker ETH-USD --asset-type crypto --tradingagents-provider deepseek --tradingagents-deep deepseek-v4-pro --tradingagents-quick deepseek-v4-flash --tradingagents-offline --tradingagents-llm-timeout 300 --tradingagents-llm-max-retries 1 --tradingagents-max-data-rows 60 --tradingagents-max-news-items 12 --tradingagents-max-news-summary-chars 500
+```
+
 输出：
 
 ```text
@@ -695,19 +701,18 @@ TradingAgents 框架自己的缓存、日志和 memory。
 按北京时间/UTC+8 每天三次：
 
 ```text
-05:50 生成 TradingAgents 报告
-06:00 生成 latest bias
+05:50 启动串行任务：先生成 TradingAgents 报告，完成后生成 latest bias
 
-13:50 生成 TradingAgents 报告
-14:00 生成 latest bias
+13:50 启动串行任务：先生成 TradingAgents 报告，完成后生成 latest bias
 
-20:50 生成 TradingAgents 报告
-21:00 生成 latest bias
+20:50 启动串行任务：先生成 TradingAgents 报告，完成后生成 latest bias
 ```
 
-`ai_market_bias.py` 比 TradingAgents 晚 10 分钟跑，避免报告还没写完就读取。
+不要再拆成两条 cron。`ai_market_bias.py --run-tradingagents` 会先同步运行 TradingAgents；只有 TradingAgents 正常结束并写出报告后，才会继续生成 bias。
 
-`--hours 9` 同时控制新闻回看窗口和 bias 有效期。按下面调度，覆盖窗口是：
+`--hours 9` 同时控制新闻回看窗口和 bias 有效期。bias 的 `generated_at` 以实际写入时间为准，`expires_at = generated_at + 9 小时`。
+
+如果 TradingAgents 大约 10 分钟完成，目标覆盖窗口是：
 
 ```text
 06:00 -> 15:00
@@ -715,17 +720,19 @@ TradingAgents 框架自己的缓存、日志和 memory。
 21:00 -> 次日 06:00
 ```
 
+如果 TradingAgents 跑得更久，bias 会顺延生成，不会提前读取旧报告或未写完的报告。
+
 ```cron
-50 5,13,20 * * * cd /home/ubuntu/binance_auto && python tradingAgents/analyze_eth_tradingagents.py --ticker ETH-USD --asset-type crypto --provider deepseek --deep deepseek-v4-pro --quick deepseek-v4-flash --offline --llm-timeout 300 --llm-max-retries 1 --max-data-rows 60 --max-news-items 12 --max-news-summary-chars 500 >> tradingAgents/.ai_research/logs/tradingagents.log 2>&1
-0 6,14,21 * * * cd /home/ubuntu/binance_auto && python tradingAgents/ai_market_bias.py --symbol ETHUSDT --hours 9 >> tradingAgents/.ai_research/logs/cron.log 2>&1
+50 5,13,20 * * * cd /home/ubuntu/binance_auto && python tradingAgents/ai_market_bias.py --symbol ETHUSDT --hours 9 --run-tradingagents --tradingagents-ticker ETH-USD --asset-type crypto --tradingagents-provider deepseek --tradingagents-deep deepseek-v4-pro --tradingagents-quick deepseek-v4-flash --tradingagents-offline --tradingagents-llm-timeout 300 --tradingagents-llm-max-retries 1 --tradingagents-max-data-rows 60 --tradingagents-max-news-items 12 --tradingagents-max-news-summary-chars 500 >> tradingAgents/.ai_research/logs/cron.log 2>&1
 ```
 
 注意：
 
 ```text
-这两条 cron 需要运行在北京时间/UTC+8 口径下。
+这条 cron 需要运行在北京时间/UTC+8 口径下。
 ai_market_bias.py 默认要求有最新 TradingAgents summary。
 如果 summary 缺失或过期，应失败，而不是偷偷变成单模型分析。
+如果 TradingAgents 执行失败，整条串行任务失败，不会生成新的 latest bias。
 ```
 
 ## 13. 下一步

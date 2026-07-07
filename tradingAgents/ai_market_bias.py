@@ -34,6 +34,11 @@ DEFAULT_DEEPSEEK_MODEL = "deepseek-chat"
 DEFAULT_TRADINGAGENTS_PROVIDER = "deepseek"
 DEFAULT_TRADINGAGENTS_DEEP = "deepseek-v4-pro"
 DEFAULT_TRADINGAGENTS_QUICK = "deepseek-v4-flash"
+DEFAULT_TRADINGAGENTS_LLM_TIMEOUT = 300.0
+DEFAULT_TRADINGAGENTS_LLM_MAX_RETRIES = 1
+DEFAULT_TRADINGAGENTS_MAX_DATA_ROWS = 60
+DEFAULT_TRADINGAGENTS_MAX_NEWS_ITEMS = 12
+DEFAULT_TRADINGAGENTS_MAX_NEWS_SUMMARY_CHARS = 500
 NEWS_KEYWORDS = (
     "ETH", "Ethereum", "Bitcoin", "BTC", "crypto", "stablecoin", "ETF",
     "SEC", "Fed", "rates", "inflation", "risk appetite", "Binance",
@@ -360,6 +365,16 @@ def run_tradingagents_report(args: argparse.Namespace) -> None:
         args.tradingagents_quick,
         "--out-dir",
         args.outputs_dir,
+        "--llm-timeout",
+        str(args.tradingagents_llm_timeout),
+        "--llm-max-retries",
+        str(args.tradingagents_llm_max_retries),
+        "--max-data-rows",
+        str(args.tradingagents_max_data_rows),
+        "--max-news-items",
+        str(args.tradingagents_max_news_items),
+        "--max-news-summary-chars",
+        str(args.tradingagents_max_news_summary_chars),
     ]
     if args.tradingagents_date:
         command.extend(["--date", args.tradingagents_date])
@@ -542,6 +557,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tradingagents-quick", default=DEFAULT_TRADINGAGENTS_QUICK, help="Quick model for --run-tradingagents.")
     parser.add_argument("--tradingagents-date", default=None, help="Optional YYYY-MM-DD date passed to TradingAgents.")
     parser.add_argument("--tradingagents-offline", action="store_true", help="Pass --offline to analyze_eth_tradingagents.py.")
+    parser.add_argument("--tradingagents-llm-timeout", type=float, default=DEFAULT_TRADINGAGENTS_LLM_TIMEOUT, help="LLM timeout passed to analyze_eth_tradingagents.py.")
+    parser.add_argument("--tradingagents-llm-max-retries", type=int, default=DEFAULT_TRADINGAGENTS_LLM_MAX_RETRIES, help="LLM retry count passed to analyze_eth_tradingagents.py.")
+    parser.add_argument("--tradingagents-max-data-rows", type=int, default=DEFAULT_TRADINGAGENTS_MAX_DATA_ROWS, help="Maximum data rows passed to analyze_eth_tradingagents.py.")
+    parser.add_argument("--tradingagents-max-news-items", type=int, default=DEFAULT_TRADINGAGENTS_MAX_NEWS_ITEMS, help="Maximum news items passed to analyze_eth_tradingagents.py.")
+    parser.add_argument("--tradingagents-max-news-summary-chars", type=int, default=DEFAULT_TRADINGAGENTS_MAX_NEWS_SUMMARY_CHARS, help="Maximum news summary length passed to analyze_eth_tradingagents.py.")
     parser.add_argument("--max-report-age-hours", type=float, default=24.0, help="Maximum acceptable TradingAgents report age for bias generation.")
     parser.add_argument("--allow-missing-tradingagents", action="store_true", help="Allow DeepSeek normalization without a fresh TradingAgents report; intended only for data-source debugging.")
     parser.add_argument("--fetch-only", action="store_true", help="Only fetch/cache research inputs; do not call DeepSeek.")
