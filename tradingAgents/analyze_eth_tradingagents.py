@@ -33,7 +33,25 @@ import requests
 from dotenv import load_dotenv
 from stockstats import wrap
 
-load_dotenv()
+
+def load_env_files() -> None:
+    script_dir = Path(__file__).resolve().parent
+    repo_dir = script_dir.parent
+    legacy_env = Path("/home/ubuntu/binance/tradingAgents/.env")
+    explicit_env = os.getenv("TRADINGAGENTS_ENV_FILE", "").strip()
+    for env_path in (
+        Path(explicit_env) if explicit_env else None,
+        script_dir / ".env",
+        legacy_env,
+        repo_dir / ".ai_env.local",
+        repo_dir / ".env.local",
+        Path.cwd() / ".env",
+    ):
+        if env_path and env_path.exists():
+            load_dotenv(env_path, override=False)
+
+
+load_env_files()
 
 REQUEST_TIMEOUT = 30
 NO_YFINANCE_VENDOR = "no_yfinance"
@@ -727,12 +745,12 @@ def get_news_no_yfinance(ticker: str, start_date: str, end_date: str) -> str:
 
     if is_crypto_symbol(ticker):
         try:
-            from ai_market_bias import dedupe_news, fetch_finnhub_crypto_news, fetch_gdelt_news, fetch_rss_news
+            from ai_market_bias import fetch_finnhub_crypto_news, fetch_gdelt_news, fetch_rss_news, select_news_items
 
             start_dt = datetime.strptime(start_date, "%Y-%m-%d")
             end_dt = datetime.strptime(end_date, "%Y-%m-%d")
             lookback_hours = max(24, int((end_dt - start_dt).total_seconds() // 3600))
-            items = dedupe_news(
+            items = select_news_items(
                 fetch_finnhub_crypto_news(lookback_hours, limit=MAX_NEWS_ITEMS)
                 + fetch_rss_news(lookback_hours, limit_per_feed=4)
                 + fetch_gdelt_news(lookback_hours, limit=MAX_NEWS_ITEMS),

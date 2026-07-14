@@ -25,7 +25,25 @@ from xml.etree import ElementTree
 import requests
 from dotenv import load_dotenv
 
-load_dotenv()
+
+def load_env_files() -> None:
+    script_dir = Path(__file__).resolve().parent
+    repo_dir = script_dir.parent
+    legacy_env = Path("/home/ubuntu/binance/tradingAgents/.env")
+    explicit_env = os.getenv("TRADINGAGENTS_ENV_FILE", "").strip()
+    for env_path in (
+        Path(explicit_env) if explicit_env else None,
+        script_dir / ".env",
+        legacy_env,
+        repo_dir / ".ai_env.local",
+        repo_dir / ".env.local",
+        Path.cwd() / ".env",
+    ):
+        if env_path and env_path.exists():
+            load_dotenv(env_path, override=False)
+
+
+load_env_files()
 
 REQUEST_TIMEOUT = 30
 DEFAULT_RESEARCH_DIR = ".ai_research"
@@ -48,6 +66,34 @@ RSS_FEEDS = (
     "https://cointelegraph.com/rss",
     "https://decrypt.co/feed",
     "https://blog.ethereum.org/feed.xml",
+)
+NEWS_SOURCE_TRUST = {
+    "ethereum.org": 15.0,
+    "blog.ethereum.org": 15.0,
+    "reuters": 14.0,
+    "bloomberg": 14.0,
+    "coindesk": 13.0,
+    "decrypt": 12.0,
+    "cointelegraph": 11.0,
+    "finnhub": 10.0,
+    "gdelt": 7.0,
+    "rss": 8.0,
+}
+ETH_DIRECT_TERMS = (
+    "ethereum", "ether", "eth ", "eth-", "eth/", "staking", "pectra",
+    "layer 2", "layer-2", "rollup", "eip-",
+)
+CRYPTO_CONTEXT_TERMS = (
+    "bitcoin", "btc", "crypto", "stablecoin", "defi", "token", "binance",
+)
+MARKET_IMPACT_TERM_GROUPS = (
+    ("etf", "inflow", "outflow"),
+    ("sec", "regulation", "regulator", "approval", "lawsuit"),
+    ("fed", "interest rate", "rates", "inflation", "cpi", "yield"),
+    ("hack", "exploit", "breach", "attack", "outage"),
+    ("upgrade", "hard fork", "eip-", "staking"),
+    ("liquidation", "whale", "open interest", "funding rate"),
+    ("war", "conflict", "sanction", "geopolitical"),
 )
 FRED_SERIES = {
     "FEDFUNDS": "Fed Funds Rate",
@@ -263,6 +309,164 @@ def dedupe_news(items: list[dict[str, Any]], limit: int = 60) -> list[dict[str, 
     return result
 
 
+def news_source_group(item: dict[str, Any]) -> str:
+    source = str(item.get("source", "")).lower()
+    if source.startswith("finnhub"):
+        return "finnhub"
+    if source.startswith("rss"):
+        return "rss"
+    if source.startswith("gdelt"):
+        return "gdelt"
+    return "other"
+
+
+def parse_news_datetime(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        parsed = None
+    if parsed is None:
+        for pattern in ("%Y%m%dT%H%M%SZ", "%Y%m%dT%H%M%S%z", "%Y-%m-%d %H:%M:%S"):
+            try:
+                parsed = datetime.strptime(text, pattern)
+                break
+            except ValueError:
+                continue
+    if parsed is None:
+        try:
+            parsed = parsedate_to_datetime(text)
+        except Exception:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def news_item_score(item: dict[str, Any], current_time: datetime | None = None) -> float:
+    current_time = (current_time or now_utc()).astimezone(UTC)
+    title = str(item.get("title", "")).lower()
+    summary = str(item.get("summary", "")).lower()
+    combined = f"{title} {summary}"
+
+    published = parse_news_datetime(item.get("published_at"))
+    if published is None:
+        recency_score = 4.0
+    else:
+        age_hours = max(0.0, (current_time - published).total_seconds() / 3600.0)
+        if age_hours <= 6:
+            recency_score = 40.0
+        elif age_hours <= 24:
+            recency_score = 34.0
+        elif age_hours <= 72:
+            recency_score = 26.0
+        elif age_hours <= 168:
+            recency_score = 16.0
+        elif age_hours <= 336:
+            recency_score = 6.0
+        else:
+            recency_score = 0.0
+
+    direct_in_title = any(term in f"{title} " for term in ETH_DIRECT_TERMS)
+    direct_in_text = any(term in f"{combined} " for term in ETH_DIRECT_TERMS)
+    context_in_title = any(term in title for term in CRYPTO_CONTEXT_TERMS)
+    context_in_text = any(term in combined for term in CRYPTO_CONTEXT_TERMS)
+    if direct_in_title:
+        relevance_score = 30.0
+    elif direct_in_text:
+        relevance_score = 24.0
+    elif context_in_title:
+        relevance_score = 12.0
+    elif context_in_text:
+        relevance_score = 7.0
+    else:
+        relevance_score = 0.0
+
+    source = str(item.get("source", "")).lower()
+    trust_score = 5.0
+    for source_name, score in NEWS_SOURCE_TRUST.items():
+        if source_name in source:
+            trust_score = max(trust_score, score)
+
+    impact_matches = sum(1 for terms in MARKET_IMPACT_TERM_GROUPS if any(term in combined for term in terms))
+    impact_score = min(21.0, impact_matches * 5.0)
+    if any(term in title for terms in MARKET_IMPACT_TERM_GROUPS for term in terms):
+        impact_score = min(25.0, impact_score + 4.0)
+
+    return round(recency_score + relevance_score + trust_score + impact_score, 3)
+
+
+def select_news_items(
+    items: list[dict[str, Any]],
+    limit: int = 12,
+    current_time: datetime | None = None,
+) -> list[dict[str, Any]]:
+    limit = max(1, int(limit))
+    best_by_key: dict[str, tuple[float, dict[str, Any]]] = {}
+    for item in items:
+        title = str(item.get("title", "")).strip()
+        if not title or title.upper() == "DATA_UNAVAILABLE":
+            continue
+        key = re.sub(r"\W+", "", (title or str(item.get("url", ""))).lower())[:120]
+        if not key:
+            continue
+        score = news_item_score(item, current_time)
+        existing = best_by_key.get(key)
+        if existing is None or score > existing[0]:
+            best_by_key[key] = (score, item)
+
+    ranked = sorted(
+        best_by_key.values(),
+        key=lambda pair: (
+            -pair[0],
+            -(parse_news_datetime(pair[1].get("published_at")) or datetime.min.replace(tzinfo=UTC)).timestamp(),
+            str(pair[1].get("title", "")).lower(),
+        ),
+    )
+    if len(ranked) <= limit:
+        return [item for _, item in ranked]
+
+    groups = sorted({news_source_group(item) for _, item in ranked})
+    reserve_per_group = 2 if limit >= len(groups) * 2 else 1
+    selected: list[tuple[float, dict[str, Any]]] = []
+    selected_ids: set[int] = set()
+    group_counts = {group: 0 for group in groups}
+
+    for group in groups:
+        for pair in ranked:
+            if news_source_group(pair[1]) != group or id(pair[1]) in selected_ids:
+                continue
+            selected.append(pair)
+            selected_ids.add(id(pair[1]))
+            group_counts[group] += 1
+            if group_counts[group] >= reserve_per_group or len(selected) >= limit:
+                break
+
+    soft_group_cap = max(reserve_per_group, math.ceil(limit / 2))
+    for pair in ranked:
+        if len(selected) >= limit:
+            break
+        item = pair[1]
+        group = news_source_group(item)
+        if id(item) in selected_ids or group_counts[group] >= soft_group_cap:
+            continue
+        selected.append(pair)
+        selected_ids.add(id(item))
+        group_counts[group] += 1
+
+    for pair in ranked:
+        if len(selected) >= limit:
+            break
+        if id(pair[1]) not in selected_ids:
+            selected.append(pair)
+            selected_ids.add(id(pair[1]))
+
+    selected.sort(key=lambda pair: -pair[0])
+    return [item for _, item in selected]
+
+
 def fetch_fred_macro(cache_dir: Path) -> dict[str, Any]:
     cache_dir.mkdir(parents=True, exist_ok=True)
     today = now_utc().date().isoformat()
@@ -438,6 +642,7 @@ def build_research_snapshot(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def deepseek_prompt(snapshot: dict[str, Any]) -> list[dict[str, str]]:
+    horizon_hours = int(snapshot.get("hours", 9))
     return [
         {
             "role": "system",
@@ -453,50 +658,93 @@ def deepseek_prompt(snapshot: dict[str, Any]) -> list[dict[str, str]]:
             "role": "user",
             "content": (
                 "Return this schema exactly: "
-                '{"bias":"bullish|bearish|neutral|mixed","confidence":0.0,'
-                '"allow_long":true,"allow_short":true,"size_multiplier":1.0,'
+                '{"portfolio_stance":"overweight|neutral|underweight",'
+                '"futures_bias":"long|short|neutral|mixed","confidence":0.0,'
+                '"explicit_long_signal":false,"explicit_short_signal":false,'
+                '"allow_long":true,"allow_short":true,"risk_multiplier":1.0,'
                 '"reason":"short reason","risk_events":[],"news_used":[]}.\n\n'
-                "Rules: confidence < 0.55 must allow both directions. "
-                "Only block a side when confidence >= 0.65 and evidence is clear. "
+                f"The futures horizon is the next {horizon_hours} hours. "
+                "portfolio_stance describes stock-style allocation only. "
+                "futures_bias describes the short-horizon perpetual-futures direction only. "
+                "Underweight, SELL, reduce exposure, or trim longs does not by itself imply futures_bias=short. "
+                "Overweight or buy gradually does not by itself imply futures_bias=long. "
+                "Use futures_bias=short only when the report explicitly supports opening or favoring a short "
+                "for this crypto symbol within the stated horizon; set explicit_short_signal=true in that case. "
+                "Use futures_bias=long only with equally explicit short-horizon long evidence and set "
+                "explicit_long_signal=true. Otherwise use neutral or mixed. "
+                "confidence < 0.55 must allow both directions. "
+                "Only block a side when confidence >= 0.65, the matching explicit signal is true, and the "
+                "report clearly says the opposite side should not be opened. "
                 "Use fail-open behavior when data is missing. Do not invent a direction when the "
                 "TradingAgents report is stale, unavailable, or internally mixed; lower confidence instead. "
-                "Do not treat SELL in a stock-style report as automatic futures short unless the report "
-                "explicitly supports short-side risk/reward for this crypto symbol.\n\n"
+                "risk_multiplier may reduce risk but must remain between 0 and 1.\n\n"
                 f"Research input:\n{json.dumps(snapshot, ensure_ascii=False)[:45000]}"
             ),
         },
     ]
 
 
+def coerce_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes"}:
+            return True
+        if normalized in {"false", "0", "no"}:
+            return False
+    if value is None:
+        return default
+    return bool(value)
+
+
 def normalize_bias(raw: dict[str, Any], symbol: str, hours: int, source_counts: dict[str, int]) -> dict[str, Any]:
-    bias = str(raw.get("bias", "neutral")).lower()
-    if bias not in {"bullish", "bearish", "neutral", "mixed"}:
-        bias = "neutral"
+    portfolio_stance = str(raw.get("portfolio_stance", "neutral")).strip().lower()
+    portfolio_stance = {
+        "buy": "overweight",
+        "overweight": "overweight",
+        "hold": "neutral",
+        "neutral": "neutral",
+        "sell": "underweight",
+        "underweight": "underweight",
+    }.get(portfolio_stance, "neutral")
+
+    raw_futures_bias = str(raw.get("futures_bias", raw.get("bias", "neutral"))).strip().lower()
+    futures_bias = {
+        "bullish": "long",
+        "long": "long",
+        "bearish": "short",
+        "short": "short",
+        "neutral": "neutral",
+        "mixed": "mixed",
+    }.get(raw_futures_bias, "neutral")
+    bias = {"long": "bullish", "short": "bearish"}.get(futures_bias, futures_bias)
+
     try:
         confidence = float(raw.get("confidence", 0.0))
     except (TypeError, ValueError):
         confidence = 0.0
     confidence = max(0.0, min(1.0, confidence))
 
-    allow_long = bool(raw.get("allow_long", True))
-    allow_short = bool(raw.get("allow_short", True))
-    if confidence < 0.55 or bias in {"neutral", "mixed"}:
-        allow_long = True
-        allow_short = True
-    elif bias == "bullish" and confidence >= 0.65:
-        allow_long = True
-        allow_short = False
-    elif bias == "bearish" and confidence >= 0.65:
-        allow_long = False
-        allow_short = True
+    explicit_long_signal = coerce_bool(raw.get("explicit_long_signal"), False)
+    explicit_short_signal = coerce_bool(raw.get("explicit_short_signal"), False)
+    requested_allow_long = coerce_bool(raw.get("allow_long"), True)
+    requested_allow_short = coerce_bool(raw.get("allow_short"), True)
+
+    allow_long = True
+    allow_short = True
+    if confidence >= 0.65 and futures_bias == "long" and explicit_long_signal:
+        allow_short = requested_allow_short
+    elif confidence >= 0.65 and futures_bias == "short" and explicit_short_signal:
+        allow_long = requested_allow_long
 
     try:
-        size_multiplier = float(raw.get("size_multiplier", 1.0))
+        risk_multiplier = float(raw.get("risk_multiplier", raw.get("size_multiplier", 1.0)))
     except (TypeError, ValueError):
-        size_multiplier = 1.0
-    if not math.isfinite(size_multiplier):
-        size_multiplier = 1.0
-    size_multiplier = max(0.0, min(1.0, size_multiplier))
+        risk_multiplier = 1.0
+    if not math.isfinite(risk_multiplier):
+        risk_multiplier = 1.0
+    risk_multiplier = max(0.0, min(1.0, risk_multiplier))
 
     generated = now_exchange()
     expires = generated + timedelta(hours=hours)
@@ -504,11 +752,17 @@ def normalize_bias(raw: dict[str, Any], symbol: str, hours: int, source_counts: 
         "symbol": symbol,
         "generated_at": generated.isoformat(),
         "expires_at": expires.isoformat(),
+        "portfolio_stance": portfolio_stance,
+        "futures_bias": futures_bias,
+        "time_horizon_hours": int(hours),
+        "explicit_long_signal": explicit_long_signal,
+        "explicit_short_signal": explicit_short_signal,
         "bias": bias,
         "confidence": confidence,
         "allow_long": allow_long,
         "allow_short": allow_short,
-        "size_multiplier": size_multiplier,
+        "risk_multiplier": risk_multiplier,
+        "size_multiplier": risk_multiplier,
         "reason": str(raw.get("reason", ""))[:800],
         "risk_events": list(raw.get("risk_events", []))[:10] if isinstance(raw.get("risk_events", []), list) else [],
         "news_used": list(raw.get("news_used", []))[:20] if isinstance(raw.get("news_used", []), list) else [],

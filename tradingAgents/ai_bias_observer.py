@@ -29,10 +29,16 @@ CSV_FIELDS = [
     "symbol",
     "bias_generated_at",
     "bias_expires_at",
+    "portfolio_stance",
+    "futures_bias",
+    "time_horizon_hours",
+    "explicit_long_signal",
+    "explicit_short_signal",
     "bias",
     "confidence",
     "allow_long",
     "allow_short",
+    "risk_multiplier",
     "size_multiplier",
     "reason",
     "risk_events",
@@ -113,10 +119,16 @@ def build_observation(args: argparse.Namespace) -> dict[str, Any]:
         "symbol": symbol,
         "bias_generated_at": bias.get("generated_at", ""),
         "bias_expires_at": bias.get("expires_at", ""),
+        "portfolio_stance": bias.get("portfolio_stance", ""),
+        "futures_bias": bias.get("futures_bias", ""),
+        "time_horizon_hours": bias.get("time_horizon_hours", ""),
+        "explicit_long_signal": bias.get("explicit_long_signal", ""),
+        "explicit_short_signal": bias.get("explicit_short_signal", ""),
         "bias": bias.get("bias", ""),
         "confidence": bias.get("confidence", ""),
         "allow_long": bias.get("allow_long", ""),
         "allow_short": bias.get("allow_short", ""),
+        "risk_multiplier": bias.get("risk_multiplier", bias.get("size_multiplier", "")),
         "size_multiplier": bias.get("size_multiplier", ""),
         "reason": bias.get("reason", ""),
         "risk_events": compact_json(bias.get("risk_events", [])),
@@ -146,6 +158,20 @@ def default_log_path(research_dir: Path, observed_at: str) -> Path:
 
 def append_csv(path: Path, row: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        with path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            existing_fields = reader.fieldnames or []
+            existing_rows = list(reader)
+        if existing_fields != CSV_FIELDS:
+            migrated_path = path.with_suffix(path.suffix + ".tmp")
+            with migrated_path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
+                writer.writeheader()
+                for existing_row in existing_rows:
+                    writer.writerow({field: existing_row.get(field, "") for field in CSV_FIELDS})
+            migrated_path.replace(path)
+
     file_exists = path.exists()
     with path.open("a", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
