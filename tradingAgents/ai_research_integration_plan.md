@@ -259,6 +259,157 @@ TradingAgents news/sentiment 输入
 ai_market_bias.py 新闻上下文
 ```
 
+#### 5.2.1 新闻时间窗口和使用方
+
+ETH 资产新闻默认使用最近约 7 天的滚动窗口。一天运行 3 次时，每次都会重新读取最近 7 天，不是只读取上次运行之后的新新闻，因此相邻两次运行的新闻会有较高重合度。
+
+新闻主要提供给：
+
+```text
+资产新闻 -> Sentiment Analyst -> sentiment_report
+资产新闻 / 全球新闻 -> News Analyst -> news_report
+news_report + sentiment_report -> Bull / Bear Researchers 和 Risk Agents
+```
+
+`--max-news-items 12` 是单次新闻工具返回上限：
+
+```text
+ETH 资产新闻最多 12 条。
+News Analyst 如果另外调用全球新闻工具，全球新闻可以再返回最多 12 条。
+它不是整个 TradingAgents 流程绝对只能读取 12 条新闻。
+```
+
+#### 5.2.2 新闻候选汇总
+
+ETH 新闻选择前先汇总当前已经抓到的候选：
+
+```text
+Finnhub crypto：当前最多抓取 max-news-items 条候选。
+RSS：CoinDesk、Cointelegraph、Decrypt、Ethereum Blog，每个 feed 当前最多抓取 4 条候选。
+GDELT：当前最多抓取 max-news-items 条候选。
+```
+
+候选必须满足时间窗口和 crypto/ETH 关键词条件。GDELT 自身使用 Ethereum、ETH、Bitcoin、crypto、spot ETF、stablecoin 等查询条件。
+
+汇总后不再按 `Finnhub -> RSS -> GDELT` 的固定顺序直接取前 12 条，而是统一去重、评分和分配来源配额。
+
+#### 5.2.3 去重规则
+
+```text
+1. 标题转为小写。
+2. 删除标点、空格等非单词字符。
+3. 使用标准化结果的前 120 个字符作为去重 key。
+4. 相同 key 只保留综合评分更高的版本。
+5. DATA_UNAVAILABLE 等错误占位项不计入新闻数量。
+```
+
+同一事件但标题文字明显不同的报道，当前仍可能同时保留。后续可以增加 URL canonicalization、标题相似度和事件聚类。
+
+#### 5.2.4 综合评分
+
+每条候选新闻按四个维度计算确定性分数。这里不调用额外 LLM 预筛选，评分规则可以测试和复现。
+
+##### A. 时效性，最高 40 分
+
+| 发布时间距离当前时间 | 分数 |
+|---|---:|
+| 6 小时以内 | 40 |
+| 6 到 24 小时 | 34 |
+| 24 到 72 小时 | 26 |
+| 72 到 168 小时 | 16 |
+| 168 到 336 小时 | 6 |
+| 无法解析发布时间 | 4 |
+| 超过 336 小时 | 0 |
+
+##### B. ETH 相关度，最高 30 分
+
+直接 ETH 词包括：
+
+```text
+Ethereum、Ether、ETH、staking、Pectra、Layer 2、rollup、EIP
+```
+
+广义 crypto 词包括：
+
+```text
+Bitcoin、BTC、crypto、stablecoin、DeFi、token、Binance
+```
+
+| 命中位置和类型 | 分数 |
+|---|---:|
+| 标题命中直接 ETH 词 | 30 |
+| 摘要或全文命中直接 ETH 词 | 24 |
+| 标题只命中广义 crypto 词 | 12 |
+| 摘要或全文只命中广义 crypto 词 | 7 |
+| 都未命中 | 0 |
+
+##### C. 来源可信度，最高 15 分
+
+来源分数来自新闻 `source` 字段中的发布机构或域名。若同时命中多个规则，取最高分，例如 `finnhub:Reuters` 取 Reuters 的 14 分，而不是 Finnhub 的 10 分。
+
+| 来源 | 分数 |
+|---|---:|
+| Ethereum 官方博客 | 15 |
+| Reuters / Bloomberg | 14 |
+| CoinDesk | 13 |
+| Decrypt | 12 |
+| Cointelegraph | 11 |
+| Finnhub 中未识别具体媒体的内容 | 10 |
+| 普通 RSS | 8 |
+| GDELT | 7 |
+| 无法识别 | 5 |
+
+这个分数只代表预设的来源基础权重，不代表已验证文章事实。当前不会自动检查记者署名、转载关系、匿名消息、历史准确率或多来源交叉验证。
+
+##### D. 事件影响力，最高 25 分
+
+标题和摘要按事件类别匹配，每命中一个不同类别加 5 分：
+
+| 事件类别 | 关键词示例 |
+|---|---|
+| ETF 与资金流 | ETF、inflow、outflow |
+| 监管与法律 | SEC、regulation、approval、lawsuit |
+| 宏观与利率 | Fed、interest rate、inflation、CPI、yield |
+| 安全与故障 | hack、exploit、breach、attack、outage |
+| 协议与质押 | upgrade、hard fork、EIP、staking |
+| 衍生品与大额资金 | liquidation、whale、open interest、funding rate |
+| 地缘政治 | war、conflict、sanction、geopolitical |
+
+计算规则：
+
+```text
+正文事件类别分：每类 5 分，先限制到最高 21 分。
+只要标题直接命中任意事件类别，再加 4 分。
+最终事件影响力最高 25 分。
+```
+
+事件影响力只表示“可能影响市场”，不判断利多、利空，也不判断新闻真假。
+
+#### 5.2.5 来源配额和最终选择
+
+在 `max-news-items=12` 且 Finnhub、RSS、GDELT 都有有效候选时：
+
+```text
+1. 每个可用来源组先保留该组评分最高的 2 条。
+2. 剩余名额按所有候选的综合评分竞争。
+3. 正常填充阶段单一来源组最多占 6 条，即总上限的一半。
+4. 其他来源没有足够候选时，允许高分来源突破软上限补足 12 条。
+5. 最终结果按综合评分从高到低返回给 Agent。
+```
+
+该规则解决 Finnhub 先返回 12 条时 RSS 和 GDELT 完全无法进入的问题，同时保留质量不足时由其他来源补位的能力。
+
+#### 5.2.6 当前局限
+
+```text
+来源可信度是静态表，不是实时媒体质量评估。
+事件影响力依赖关键词，可能有误命中或漏命中。
+GDELT source 当前有时只有国家信息，无法精确识别原始媒体。
+不同标题描述同一事件时，简单标题去重无法完全合并。
+没有执行正文抓取、事实核查或多个独立来源交叉确认。
+没有判断新闻是首发、转载、评论还是旧事件重复报道。
+```
+
 ### 5.3 宏观数据
 
 ```text
@@ -409,7 +560,8 @@ python analyze_eth_tradingagents.py \
   技术指标内部仍可使用完整拉取数据。
 
 --max-news-items 12
-  返回给 LLM 的新闻最多 12 条。
+  单次新闻工具最多返回 12 条。
+  ETH 资产新闻和全球新闻工具分别计算上限。
 
 --max-news-summary-chars 500
   每条新闻摘要最多 500 字符。
