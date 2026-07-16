@@ -3,10 +3,10 @@
 文档状态：
 
 ```text
-更新时间：2026-07-11
+更新时间：2026-07-17
 当前运行目录：/home/ubuntu/binance/tradingAgents
-当前阶段：三天观察期，不接入实盘执行
-当前协议：portfolio_stance 与 futures_bias 分离的 JSON v2
+当前阶段：观察验证已完成，bian_new.py 实盘接入尚未实现
+当前协议：只使用 portfolio_stance、futures_bias、risk_multiplier 等正式字段
 ```
 
 ## 1. 目标和边界
@@ -33,12 +33,6 @@
   在数据缺失时强行给方向
 ```
 
-当前阶段：
-
-```text
-第 1 阶段：只做观察，不拦截交易。
-```
-
 `bian_new.py` 当前没有读取 `.ai_research/latest_bias_ETHUSDT.json`，所以 AI 研究层不会影响实盘交易。
 
 ## 2. 当前文件
@@ -48,9 +42,7 @@ tradingAgents/
   analyze_eth_tradingagents.py
   ai_market_bias.py
   ai_bias_observer.py
-  ai_research_failure_classifier.py
   test_ai_market_bias.py
-  test_ai_research_failure_classifier.py
   ai_research_integration_plan.md
   .env.example
 ```
@@ -96,16 +88,6 @@ Overweight / BUY / 分批买入不等于期货 long。
 没有明确短周期期货信号时必须使用 futures_bias=neutral 或 mixed。
 ```
 
-### ai_research_failure_classifier.py
-
-职责：
-
-```text
-1. 读取每轮独立运行日志。
-2. 区分 data_source_failure、llm_timeout、authentication_failure 等失败。
-3. 供观察脚本写入 tradingagents_failures_YYYY-MM.csv。
-```
-
 ### 文件清单和用途
 
 #### 仓库内应该上传的文件
@@ -114,10 +96,8 @@ Overweight / BUY / 分批买入不等于期货 long。
 |---|---|---|---|
 | `tradingAgents/analyze_eth_tradingagents.py` | 当前实现 | TradingAgents 研究入口；运行时 patch 数据源；输出多 Agent 报告 | 是 |
 | `tradingAgents/ai_market_bias.py` | 当前实现 | 读取 TradingAgents 报告，结合辅助数据，生成 bias JSON | 是 |
-| `tradingAgents/ai_bias_observer.py` | 当前实现 | 读取 latest bias、TradingAgents 报告和 Binance 摘要，追加观察期 CSV 日志 | 是 |
-| `tradingAgents/ai_research_failure_classifier.py` | 当前实现 | 对失败运行日志分类：数据源、LLM timeout、认证或未知失败 | 是 |
-| `tradingAgents/test_ai_market_bias.py` | 当前实现 | 验证新 JSON 协议、fail-open 和 CSV schema 迁移 | 是 |
-| `tradingAgents/test_ai_research_failure_classifier.py` | 当前实现 | 验证失败分类规则 | 是 |
+| `tradingAgents/ai_bias_observer.py` | 当前实现 | 可选的手动观察/复盘工具；读取 latest bias、TradingAgents 报告和 Binance 摘要并追加 CSV | 是 |
+| `tradingAgents/test_ai_market_bias.py` | 当前实现 | 验证 JSON 协议、新闻选择、fail-open 和 CSV schema 迁移 | 是 |
 | `tradingAgents/ai_research_integration_plan.md` | 当前实现 | 当前方案文档、运行命令、下一步计划 | 是 |
 | `tradingAgents/.env.example` | 当前实现 | 环境变量模板，只放占位符，不放真实 key | 是 |
 
@@ -128,8 +108,7 @@ Overweight / BUY / 分批买入不等于期货 long。
 | `tradingAgents/.env` | 用户手工创建 | 存真实 API key，例如 `DEEPSEEK_API_KEY` | 含密钥，不能进 git |
 | `tradingAgents/.ai_research/latest_bias_ETHUSDT.json` | `ai_market_bias.py` | 最新 AI bias 输出，未来可给观察/实盘读取 | 运行态结果，会频繁变化 |
 | `tradingAgents/.ai_research/cache/` | `ai_market_bias.py` | 新闻、FRED、Binance、TradingAgents 输入快照缓存 | 缓存数据，体积和内容会变 |
-| `tradingAgents/.ai_research/logs/` | `ai_bias_observer.py` / cron | AI bias 观察日志、cron 日志 | 运行日志，不属于源码 |
-| `tradingAgents/.ai_research/run_ai_research_observation.sh` | 当前服务器运行配置 | 串行执行研究、bias、observer，带锁和观察截止时间 | 服务器运行脚本，不属于方案源码 |
+| `tradingAgents/.ai_research/logs/` | `ai_bias_observer.py` | 手动观察或复盘日志 | 运行日志，不属于源码 |
 | `tradingAgents/outputs/*_summary.md` | `analyze_eth_tradingagents.py` | 人看的 TradingAgents 研究报告 | 每次运行结果，不属于源码 |
 | `tradingAgents/outputs/*_state.json` | `analyze_eth_tradingagents.py` | TradingAgents 全流程状态，内容最全 | 文件大、运行态输出 |
 | `tradingAgents/outputs/*_decision.json` | `analyze_eth_tradingagents.py` | TradingAgents 最终决策 | 每次运行结果 |
@@ -140,9 +119,7 @@ Overweight / BUY / 分批买入不等于期货 long。
 
 ### 环境变量加载顺序
 
-当前观察任务实际运行代码在 `/home/ubuntu/binance/tradingAgents/`。
-
-`/home/ubuntu/binance_auto/tradingAgents/` 是部署副本之一，但当前观察 cron 不使用它；此前该副本曾因环境变量缺失或无效 key 运行失败。
+当前工作目录是 `/home/ubuntu/binance/tradingAgents/`，Git 仓库副本位于 `/home/ubuntu/binance_auto/tradingAgents/`。
 
 为了兼容当前服务器已有配置，TradingAgents 研究脚本会按下面顺序加载环境变量，先加载到的 key 优先：
 
@@ -611,7 +588,7 @@ tradingAgents/.ai_research/latest_bias_ETHUSDT.json
 
 ## 9. ai_bias_observer.py 命令
 
-目的：进入观察期后，把每次 AI bias 和当时市场状态记录下来，形成复盘数据集。
+目的：需要手工复盘时，把 AI bias 和当时市场状态追加到 CSV。该工具不是当前常驻任务。
 
 它解决的问题：
 
@@ -653,12 +630,10 @@ futures_bias
 time_horizon_hours
 explicit_long_signal
 explicit_short_signal
-bias
 confidence
 allow_long
 allow_short
 risk_multiplier
-size_multiplier
 reason
 risk_events
 news_used
@@ -701,12 +676,10 @@ schema：
   "time_horizon_hours": 9,
   "explicit_long_signal": false,
   "explicit_short_signal": false,
-  "bias": "bullish|bearish|neutral|mixed",
   "confidence": 0.0,
   "allow_long": true,
   "allow_short": true,
   "risk_multiplier": 1.0,
-  "size_multiplier": 1.0,
   "reason": "short reason",
   "risk_events": [],
   "news_used": [],
@@ -726,18 +699,16 @@ schema：
 | `time_horizon_hours` | integer | 期货方向对应的时间窗口，当前为 9 小时。 | 否 |
 | `explicit_long_signal` | boolean | 报告是否明确支持当前时间窗口做多，而不只是 Overweight 或分批买入。 | 否 |
 | `explicit_short_signal` | boolean | 报告是否明确支持当前时间窗口做空，而不只是 Underweight、SELL 或减仓。 | 否 |
-| `bias` | string | `futures_bias` 的兼容字段：`long -> bullish`、`short -> bearish`。 | 否 |
 | `confidence` | number | 置信度，范围 `0.0` 到 `1.0`。越高代表证据越一致、方向越明确；它不是胜率，也不代表保证盈利。 | 否 |
 | `allow_long` | boolean | 只有明确 short 信号、足够置信度并明确要求禁止多单时才可能为 `false`。 | 否 |
 | `allow_short` | boolean | 只有明确 long 信号、足够置信度并明确要求禁止空单时才可能为 `false`。 | 否 |
 | `risk_multiplier` | number | 已有仓位相对初始成交量的目标保留比例，范围 `0.0` 到 `1.0`；不参与初始开仓量计算。 | 否 |
-| `size_multiplier` | number | `risk_multiplier` 的兼容字段，值保持一致。 | 否 |
 | `reason` | string | 简短解释，说明为什么给出该 bias。用于人工复盘。 | 否 |
 | `risk_events` | array[string] | 需要关注的风险事件，例如宏观事件、监管、重大新闻。 | 否 |
 | `news_used` | array[string] | DeepSeek 归一化时认为关键的新闻标题或主题。用于追溯来源。 | 否 |
 | `source_counts` | object | 本次输入里各数据源数量，例如 Finnhub/RSS/GDELT。用于判断数据覆盖度。 | 否 |
 
-### 10.1 portfolio_stance / futures_bias / bias
+### 10.1 portfolio_stance / futures_bias
 
 `portfolio_stance` 和 `futures_bias` 必须分开：
 
@@ -749,15 +720,6 @@ Underweight / SELL / 减少现货多头:
 Overweight / BUY / 分批买入:
   portfolio_stance 可以是 overweight
   不能仅凭这些词得到 futures_bias = long
-```
-
-`bias` 是兼容旧消费者的字段，由 `futures_bias` 映射生成：
-
-```text
-long    -> bullish
-short   -> bearish
-neutral -> neutral
-mixed   -> mixed
 ```
 
 `futures_bias` 是研究层对未来 9 小时期货环境的方向偏见，不是交易信号，也不是订单指令。
@@ -824,9 +786,9 @@ confidence >= 0.65、futures_bias 明确、对应 explicit 信号为 true，
 | `false` | `true` | 只允许做空。必须同时有高置信度、明确 short 信号和明确禁止多单。 |
 | `false` | `false` | 当前规则不主动生成这种状态。未来即使出现，也应按 fail-open 或禁止新开仓单独评估，不能未经验证直接接实盘。 |
 
-### 10.4 risk_multiplier / size_multiplier 含义
+### 10.4 risk_multiplier 含义
 
-`risk_multiplier` 是未来接入实盘后用于已有仓位的目标保留比例，`size_multiplier` 是兼容别名，当前观察程序不影响任何实盘仓位。
+`risk_multiplier` 是未来接入实盘后用于已有仓位的目标保留比例，当前观察程序不影响任何实盘仓位。
 
 ```text
 1.0 = 保留初始成交仓位，不减仓。
@@ -857,7 +819,7 @@ risk_multiplier 只能缩紧已有仓位，不能放大仓位，也不能补回�
 
 ```text
 当前这些 key 都不会被 bian_new.py 读取。
-它们只是观察期记录和未来接入时的协议草案。
+它们是研究输出字段和未来接入时的协议定义。
 时间字段只保留一套口径：和 `bian_new.py` 的 `EXCHANGE_TZ` 一致，使用北京时间/UTC+8 ISO 时间。
 未来实盘读取时必须按 timezone-aware datetime 解析，不能去掉 `+08:00` 后用字符串或 naive datetime 比较。
 ```
@@ -982,7 +944,7 @@ LLM timeout：0
 正常写 latest_bias_ETHUSDT.json
 JSON schema 校验
 fail-open 规则校验
-旧 schema 兼容校验
+旧字段忽略校验
 观察 CSV schema 自动迁移
 ```
 
@@ -995,12 +957,10 @@ fail-open 规则校验
   "time_horizon_hours": 9,
   "explicit_long_signal": false,
   "explicit_short_signal": false,
-  "bias": "neutral",
   "confidence": 0.55,
   "allow_long": true,
   "allow_short": true,
-  "risk_multiplier": 0.7,
-  "size_multiplier": 0.7
+  "risk_multiplier": 0.7
 }
 ```
 
@@ -1017,12 +977,12 @@ bearish + confidence >= 0.65 不再自动覆盖 allow_long=false。
 测试命令：
 
 ```bash
-python -m unittest -v test_ai_market_bias.py test_ai_research_failure_classifier.py
+python -m unittest -v test_ai_market_bias.py
 ```
 
-当前共 12 个测试通过。
+当前共 11 个测试通过。
 
-### 11.4 三天观察阶段结果
+### 11.4 历史三天观察结论
 
 截至 2026-07-11 05:58，北京时间共记录 10 轮完整任务：
 
@@ -1035,9 +995,9 @@ TradingAgents 成功：10 / 10
 Binance 摘要错误：0
 ```
 
-每天均成功生成 ETH-USD summary、state 和 decision。
+观察期内每天均成功生成 ETH-USD summary、state 和 decision；对应运行产物已清理，不属于当前源码。
 
-旧协议 bias 与 Binance ETHUSDT 5 分钟 K 线对齐后的结果：
+历史旧协议方向字段与 Binance ETHUSDT 5 分钟 K 线对齐后的结果：
 
 | 预测窗口 | 方向样本 | 正确率 | 平均方向收益 |
 |---|---:|---:|---:|
@@ -1049,7 +1009,7 @@ Binance 摘要错误：0
 
 ```text
 运行稳定性已验证。
-旧 bias 方向没有表现出可直接用于开多/开空的优势。
+历史方向字段没有表现出可直接用于开多/开空的优势。
 不能把 TradingAgents 的 Underweight 直接理解为期货 short。
 当前仍不接入 bian_new.py，不影响实盘交易行为。
 ```
@@ -1067,9 +1027,6 @@ Binance 摘要错误：0
 .ai_research/cache/
 .ai_research/logs/
 .ai_research/logs/ai_bias_YYYY-MM.csv
-.ai_research/logs/tradingagents_stability_YYYY-MM.csv
-.ai_research/logs/tradingagents_failures_YYYY-MM.csv
-.ai_research/logs/runs/
 ```
 
 ### outputs/
@@ -1094,248 +1051,40 @@ TradingAgents 框架自己的缓存、日志和 memory。
 
 ## 13. 当前调度
 
-当前只跑观察任务。
+当前没有 TradingAgents 或 AI bias 的 cron 定时任务。
 
-按北京时间/UTC+8 每天三次：
+三天观察任务已经结束，相关临时脚本、独立运行日志和定时条目均已删除。需要生成研究结果时使用第 7、8 节的命令手工运行；未来接入 `bian_new.py` 后，再单独设计生产调度、锁和告警。
 
-```text
-05:50 启动串行任务：先生成 TradingAgents 报告，完成后生成 latest bias
-
-13:50 启动串行任务：先生成 TradingAgents 报告，完成后生成 latest bias
-
-20:50 启动串行任务：先生成 TradingAgents 报告，完成后生成 latest bias
-```
-
-不要再拆成两条 cron。`ai_market_bias.py --run-tradingagents` 会先同步运行 TradingAgents；只有 TradingAgents 正常结束并写出报告后，才会继续生成 bias。bias 成功写出后，再运行 `ai_bias_observer.py` 追加观察日志。
-
-`--hours 9` 同时控制新闻回看窗口和 bias 有效期。bias 的 `generated_at` 以实际写入时间为准，`expires_at = generated_at + 9 小时`。
-
-如果 TradingAgents 大约 10 分钟完成，目标覆盖窗口是：
+保留的运行原则：
 
 ```text
-06:00 -> 15:00
-14:00 -> 23:00
-21:00 -> 次日 06:00
-```
-
-如果 TradingAgents 跑得更久，bias 会顺延生成，不会提前读取旧报告或未写完的报告。
-
-```cron
-SHELL=/bin/bash
-TZ=Asia/Shanghai
-50 5,13,20 * * * /home/ubuntu/binance/tradingAgents/.ai_research/run_ai_research_observation.sh
-```
-
-运行脚本内部负责：
-
-```text
-flock 防止任务重叠。
-串行运行 TradingAgents -> bias -> observer。
-每轮保存独立日志。
-写 TradingAgents 稳定性 CSV。
-失败时分类并写 failures CSV。
-```
-
-本轮三天观察窗口：
-
-```text
-开始：2026-07-08 14:10 CST
-截止：2026-07-11 14:10 CST
-截止后脚本 no-op，不再生成新观察。
-```
-
-注意：
-
-```text
-这条 cron 按北京时间/UTC+8 口径运行。
-ai_market_bias.py 默认要求有最新 TradingAgents summary。
-如果 summary 缺失或过期，应失败，而不是偷偷变成单模型分析。
-如果 TradingAgents 执行失败，整条串行任务失败，不会生成新的 latest bias。
-如果 latest bias 没有生成，`ai_bias_observer.py` 不会执行。
+ai_market_bias.py 默认要求存在新鲜的 TradingAgents summary。
+summary 缺失或过期时应失败，不能退化成单模型自行判断。
+AI JSON 缺失、过期或损坏时，交易执行层必须 fail-open。
 ```
 
 ## 14. 当前状态与下一步
 
-### A. 观察期日志运行
-
-状态：三天观察窗口进行中；截至 2026-07-11 05:58 已有 10 条记录，最后一轮计划在 13:50 运行。
-
-目标：不改变交易行为，连续记录 AI bias 和市场状态，积累可复盘样本。
-
-要做：
+已完成：
 
 ```text
-1. 每次 latest_bias_ETHUSDT.json 生成后运行 ai_bias_observer.py。
-2. 追加写 .ai_research/logs/ai_bias_YYYY-MM.csv。
-3. 连续记录 3 天。
-4. 对比 bias、confidence、价格变化和 TradingAgents 报告。
-5. 统计明确的 futures long/short 信号是否真的有过滤价值。
+TradingAgents 连续运行稳定性验证。
+portfolio_stance 与 futures_bias 语义拆分。
+旧字段 bias 和 size_multiplier 移除。
+多来源新闻汇总、评分、去重和来源配额。
+Bias JSON fail-open 与观察 CSV schema 迁移测试。
 ```
 
-每条记录至少包含：
+尚未实现：
 
 ```text
-observed_at
-symbol
-bias_generated_at
-bias_expires_at
-portfolio_stance
-futures_bias
-time_horizon_hours
-explicit_long_signal
-explicit_short_signal
-bias
-confidence
-allow_long
-allow_short
-risk_multiplier
-size_multiplier
-reason
-risk_events
-news_used
-source_counts
-latest_price
-trend_1h
-pct_change_1h
-trend_4h
-pct_change_4h
-trend_1d
-pct_change_1d
-binance_errors
-tradingagents_available
-tradingagents_age_hours
-tradingagents_modified_at
-tradingagents_decision
-tradingagents_decision_path
-tradingagents_summary_path
+bian_new.py 读取和校验 AI JSON。
+log / reduce / filter / manage 执行模式。
+reduceOnly 部分减仓、止损重挂和部分减仓记账。
+JSON 原子写入和交易侧幂等动作记录。
 ```
 
-验收：
-
-```text
-.ai_research/logs/ai_bias_YYYY-MM.csv 每天稳定追加。
-脚本异常不影响 bian_new.py。
-不存在任何下单、撤单、改止损逻辑。
-```
-
-当前验收状态：
-
-```text
-CSV 每轮稳定追加：通过。
-必填字段完整：通过。
-Binance 摘要错误为 0：通过。
-不影响 bian_new.py：通过。
-三天时间窗口：将在 2026-07-11 14:10 正式结束。
-```
-
-### B. TradingAgents 稳定性观察
-
-目标：确认低频报告能稳定落盘。
-
-状态：截至 2026-07-11 05:58，10 / 10 轮成功，未出现 LLM timeout。
-
-要做：
-
-```text
-1. 连续跑 3 天。
-2. 记录每次是否成功、耗时、final decision。
-3. 如果仍有 DeepSeek timeout：
-   - max-data-rows 降到 45
-   - max-news-items 降到 8
-   - max-news-summary-chars 降到 350
-4. 如果稳定，再考虑每天 1 次启用 debate-rounds 1 / risk-rounds 1。
-```
-
-验收：
-
-```text
-连续 3 天至少每天成功生成 1 份 ETH-USD summary。
-失败日志能明确区分数据源失败或 LLM timeout。
-```
-
-当前验收状态：
-
-```text
-每天至少一份 ETH-USD summary：通过。
-10 / 10 轮 exit=0：通过。
-成功、耗时、final decision 结构化记录：通过。
-数据源失败故障注入分类：data_source_failure，通过。
-真实低超时链路分类：llm_timeout，通过。
-历史无效 key 日志分类：authentication_failure，通过。
-```
-
-运行时会为每轮任务保留独立日志：
-
-```text
-.ai_research/logs/runs/ai_research_YYYYMMDDTHHMMSS+ZZZZ.log
-```
-
-失败时由 `ai_research_failure_classifier.py` 分类，并追加：
-
-```text
-.ai_research/logs/tradingagents_failures_YYYY-MM.csv
-```
-
-当前分类至少包括：
-
-```text
-data_source_failure
-llm_timeout
-authentication_failure
-timeout_unclassified
-unclassified_failure
-```
-
-故障分类器可用以下命令验证：
-
-```bash
-python -m unittest -v test_ai_research_failure_classifier.py
-```
-
-### C. bian_new.py 只记录接入
-
-观察期后再做。
-
-目标：`bian_new.py` 读取 AI bias，但不拦截，只写日志。
-
-要做：
-
-```text
-1. 在开仓候选生成后读取 latest_bias_ETHUSDT.json。
-2. 校验 schema 和 expires_at。
-3. 写日志：
-   candidate side
-   portfolio_stance
-   futures_bias
-   explicit_long_signal / explicit_short_signal
-   兼容 bias
-   confidence
-   allow_long / allow_short
-   risk_multiplier / size_multiplier
-   reason
-4. 不跳过开仓，不改仓位，不改止损。
-```
-
-验收：
-
-```text
-bias 缺失、过期、解析失败时 fail-open。
-交易行为和接入前完全一致。
-日志可用于后续复盘。
-```
-
-### D. 复盘后再决定是否过滤
-
-目标：用样本决定 AI 是否值得参与过滤。
-
-要做：
-
-```text
-1. 收集 30-60 天样本。
-2. 对比 AI 支持/反对/mixed 的信号后续表现。
-3. 先评估降仓，不优先硬拦截。
-4. 只有 confidence >= 0.65、对应 explicit 信号为 true，且样本表现稳定，才考虑启用方向过滤。
-```
+下一步按第 15 节实施：先接入 `log` 模式并确保交易行为完全不变，再在 Binance Demo 验证 `reduce`，最后才评估方向过滤。观察器保留为可选的手工复盘工具，不再作为常驻定时任务运行。
 
 ## 15. bian_new.py 实盘接入方案
 
@@ -1467,7 +1216,7 @@ risk_multiplier = 1.0
 不平仓
 ~~~
 
-执行层只使用 JSON v2 字段。兼容字段 bias 和 size_multiplier 只记录，不参与新执行逻辑。
+执行层只使用当前 JSON 字段。旧字段 `bias` 和 `size_multiplier` 不再生成，也不参与读取或执行逻辑。
 
 ### 15.4 开仓候选接入点
 
