@@ -34,6 +34,15 @@ import sqlite3
 import copy
 import json
 
+from tradingAgents.ai_research_guard import (
+    append_ai_audit_event,
+    config_for_log,
+    evaluate_entry_candidate,
+    evaluate_position_reduction,
+    load_ai_research_config,
+    load_ai_research_guard,
+)
+
 BAR_TIME_FORMAT = '%Y-%m-%d %H:%M:%S'  # 定义统一的K线时间格式字符串，用于日志记录和CSV输出
 TIMEFRAME_SECONDS = {  # 定义各时间周期对应的秒数，用于计算K线是否已收盘
     '5m': 5 * 60,      # 5分钟 = 300秒
@@ -119,6 +128,10 @@ MAIN_LOOP_ERROR_SLEEP_SECONDS = 5  # 主循环遇到顶层异常后，先休息5
 HEARTBEAT_INTERVAL_SECONDS = 15 * 60  # 每15分钟输出一次心跳日志，方便判断进程是否还活着
 MAX_SIGNAL_BAR_STALENESS_SECONDS = 45 * 60  # 15M信号K线最多允许落后45分钟，防止交易所/测试网返回旧K线
 DRY_RUN_OPEN_ORDER = False  # 运行时 dry-run 开关；开启后只走信号流程，不实际创建开仓订单。
+
+# --- TradingAgents AI research guard ---
+# 默认 off，且减仓/全平/反手都有独立关闭开关。配置错误会阻止程序启动，避免误用宽松默认值。
+AI_RESEARCH_CONFIG = load_ai_research_config()
 
 # --- 新版策略参数 ---
 # 策略会参与打分和选信号的主周期；越靠前代表越高周期、权重通常越重。
@@ -282,6 +295,7 @@ trade_state = {
     'highest_price': 0,  # 记录持有多单时的最高价格，用于计算利润回撤，初始为0
     'lowest_price': 0,  # 记录持有空单时的最低价格，用于计算利润回撤，初始为0
     'amount': 0,  # 记录当前持仓的数量，初始为0
+    'entry_initial_amount': 0.0,  # 该笔交易最初实际成交数量，AI目标仓位以此为基准
     'entry_time': '',  # 记录建仓时间
     'cond_4h': '',     # 记录开仓时的 4H 具体条件信息
     'cond_1h': '',     # 记录开仓时的 1H 具体条件信息
@@ -333,6 +347,7 @@ trade_state = {
     'pending_entry_cond_15m': '',  # pending 创建时的15M条件快照
     'pending_entry_condition_details': '',  # pending 创建时的条件明细
     'pending_entry_profit_check_atr': 0.0,  # 成交后复核利润空间使用的ATR
+    'pending_entry_ai_snapshot_json': '',  # 挂单时的有效AI快照，仅用于审计和成交后追溯
     'entry_signal_bar_15m': '',   # 记录入场所对应的15M已收盘信号K线时间
     'last_entry_bar_15m': '',     # 最近一次入场所对应的15M已收盘信号K线时间（防止同根K线重复开仓）
     'last_exit_bar_15m': '',      # 最近一次平仓所对应的15M已收盘信号K线时间（防止同根K线平仓后立即重开）
@@ -340,7 +355,15 @@ trade_state = {
     'max_seen_bar_5m': '',        # 运行期间见过的最大5M信号时间
     'last_processed_bar_15m': '', # 最近一次已处理过的15M已收盘信号K线时间（核心去重字段，防止同一根K线重复执行策略逻辑）
     'max_seen_bar_15m': '',       # 运行期间见过的最大15M信号时间，防止接口回跳旧K线后被当成新信号
-    'position_miss_count': 0  # 连续几轮未在交易所查到仓位，用于避免误判“外部平仓”
+    'position_miss_count': 0,  # 连续几轮未在交易所查到仓位，用于避免误判“外部平仓”
+    'ai_snapshot_json': '',  # 最近一次与该仓位关联的AI快照
+    'ai_last_reduce_generated_at': '',  # 上一次成功AI减仓对应的generated_at，用于幂等
+    'ai_last_reduce_target_ratio': 1.0,
+    'ai_partial_reduce_count': 0,
+    'ai_partial_reduce_amount': 0.0,
+    'ai_partial_reduce_realized_pnl': 0.0,
+    'ai_partial_reduce_fee': 0.0,
+    'ai_reduce_reasons': []
 }
 sr_breakout_failure_cooldowns = {
     'side': {},
@@ -356,14 +379,15 @@ exchange = ccxt.binance({
     'enableRateLimit': True,  # 开启内置的速率限制功能，防止请求频率过高被封IP
     'timeout': EXCHANGE_HTTP_TIMEOUT_MS,  # 给交易所HTTP请求设置硬超时，避免网络卡死时无限等待
 })
-exchange.enable_demo_trading(True)  # 开启模拟交易模式（测试网），不会产生真实交易
+exchange.enable_demo_trading(True)
 
 # 日志配置
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
-logging.info("Binance demo trading 已启用：当前运行使用测试网/模拟交易接口")
+logging.info("Binance Demo U本位合约 API 已初始化")
+logging.info("AI research guard 配置: %s", config_for_log(AI_RESEARCH_CONFIG))
 
 # 记录程序层面的临时运行状态，不属于某一笔交易。
 runtime_state = {
@@ -375,13 +399,71 @@ runtime_state = {
         'zones': None
     },
     # 背景周期K线只在对应已收盘K线变化后才需要重新抓取和计算指标。
-    'kline_df_cache': {}
+    'kline_df_cache': {},
+    # AI审计事件幂等key，避免持仓轮询每秒重复写同一结论。
+    'ai_audit_keys': {}
 }
 
 
 # ==========================================
 # 2. 功能模块
 # ==========================================
+
+AI_GUARD_SNAPSHOT_FIELDS = (
+    'valid', 'fail_open', 'error', 'symbol', 'generated_at', 'expires_at',
+    'portfolio_stance', 'futures_bias', 'time_horizon_hours',
+    'explicit_long_signal', 'explicit_short_signal', 'confidence',
+    'allow_long', 'allow_short', 'risk_multiplier', 'reason'
+)
+
+
+def get_current_ai_guard():
+    """读取一次AI JSON并执行严格校验；任何异常返回fail-open guard。"""
+    return load_ai_research_guard(
+        AI_RESEARCH_CONFIG,
+        expected_symbol=SYMBOL.replace('/', '').replace(':USDT', ''),
+        now=datetime.datetime.now(EXCHANGE_TZ)
+    )
+
+
+def ai_guard_snapshot(guard):
+    return {field: guard.get(field) for field in AI_GUARD_SNAPSHOT_FIELDS}
+
+
+def write_ai_audit(event_type, guard, details=None, dedupe_key=''):
+    """写独立AI JSONL审计，不写交易成交CSV；审计失败不得影响交易。"""
+    if AI_RESEARCH_CONFIG.mode == 'off':
+        return
+    details = details or {}
+    generated_at = str(guard.get('generated_at', '') or 'invalid')
+    key = dedupe_key or f"{event_type}:{generated_at}:{details.get('actual_action', '')}:{details.get('shadow_action', '')}"
+    seen = runtime_state.setdefault('ai_audit_keys', {})
+    if key in seen:
+        return
+    try:
+        event = {
+            'event': event_type,
+            'mode': AI_RESEARCH_CONFIG.mode,
+            'guard': ai_guard_snapshot(guard),
+            **details
+        }
+        path = append_ai_audit_event(AI_RESEARCH_CONFIG, event)
+        seen[key] = time.monotonic()
+        if len(seen) > 300:
+            oldest_keys = sorted(seen, key=seen.get)[:100]
+            for oldest_key in oldest_keys:
+                seen.pop(oldest_key, None)
+        logging.info(
+            "AI_RESEARCH event=%s actual=%s shadow=%s valid=%s reason=%s audit=%s",
+            event_type,
+            details.get('actual_action', ''),
+            details.get('shadow_action', ''),
+            guard.get('valid'),
+            details.get('reason') or guard.get('error', ''),
+            path
+        )
+    except Exception as e:
+        logging.warning(f"写AI审计日志失败，交易流程继续: {e}")
 
 def elapsed_ms(start_ts):
     return (time.monotonic() - start_ts) * 1000.0
@@ -2112,6 +2194,7 @@ def reset_trade_state_after_external_close(signal_bar_15m='', reason='检测到�
         'highest_price': 0,
         'lowest_price': 0,
         'amount': 0,
+        'entry_initial_amount': 0.0,
         'entry_time': '',
         'cond_4h': '',
         'cond_1h': '',
@@ -2140,7 +2223,15 @@ def reset_trade_state_after_external_close(signal_bar_15m='', reason='检测到�
         'entry_signal_bar_15m': '',
         'last_exit_bar_15m': exit_signal_bar_15m,
         'last_processed_bar_15m': post_exit_processed_bar_15m,
-        'position_miss_count': 0
+        'position_miss_count': 0,
+        'ai_snapshot_json': '',
+        'ai_last_reduce_generated_at': '',
+        'ai_last_reduce_target_ratio': 1.0,
+        'ai_partial_reduce_count': 0,
+        'ai_partial_reduce_amount': 0.0,
+        'ai_partial_reduce_realized_pnl': 0.0,
+        'ai_partial_reduce_fee': 0.0,
+        'ai_reduce_reasons': []
     })
     logging.warning(reason)
 
@@ -2296,6 +2387,7 @@ PENDING_ENTRY_FIELDS = (
     'pending_entry_cond_15m',
     'pending_entry_condition_details',
     'pending_entry_profit_check_atr',
+    'pending_entry_ai_snapshot_json',
 )
 
 
@@ -2697,6 +2789,7 @@ def finalize_pending_entry_position(order=None, position_risk=None, signal_bar_1
         'highest_price': actual_price,
         'lowest_price': actual_price,
         'amount': filled_amount,
+        'entry_initial_amount': filled_amount,
         'entry_time': entry_time,
         'cond_4h': trade_state.get('pending_entry_cond_4h', ''),
         'cond_1h': trade_state.get('pending_entry_cond_1h', ''),
@@ -2723,7 +2816,15 @@ def finalize_pending_entry_position(order=None, position_risk=None, signal_bar_1
         'last_stop_order_refresh_error': '',
         'entry_signal_bar_15m': entry_signal_bar_15m,
         'last_entry_bar_15m': entry_signal_bar_15m,
-        'position_miss_count': 0
+        'position_miss_count': 0,
+        'ai_snapshot_json': trade_state.get('pending_entry_ai_snapshot_json', ''),
+        'ai_last_reduce_generated_at': '',
+        'ai_last_reduce_target_ratio': 1.0,
+        'ai_partial_reduce_count': 0,
+        'ai_partial_reduce_amount': 0.0,
+        'ai_partial_reduce_realized_pnl': 0.0,
+        'ai_partial_reduce_fee': 0.0,
+        'ai_reduce_reasons': []
     })
     # 更新保护止损
     if not refresh_protective_stop_order(actual_safe_stop):
@@ -2899,6 +3000,7 @@ def place_pending_entry_order(side, candidate, curr_price, state_4h, state_1h, s
             'pending_entry_cond_15m': cond_15m_str,
             'pending_entry_condition_details': open_condition_details,
             'pending_entry_profit_check_atr': profit_check_atr,
+            'pending_entry_ai_snapshot_json': entry_meta.get('ai_snapshot_json', ''),
             'last_entry_bar_15m': signal_bar_15m
         })
 
@@ -2978,6 +3080,34 @@ def manage_pending_entry(context, signal_bar_15m='', perf=None):
         # 订单已死亡且未成交，直接清空本地pending状态
         clear_pending_entry_state(f"pending 入场单已结束: status={status}")
         return f'pending_entry_{status}'
+
+    ai_guard = get_current_ai_guard()
+    ai_pending_decision = evaluate_entry_candidate(side, ai_guard, AI_RESEARCH_CONFIG)
+    ai_pending_should_cancel = bool(
+        AI_RESEARCH_CONFIG.mode == 'manage'
+        and ai_pending_decision.get('shadow_action') == 'would_filter'
+    )
+    pending_audit_decision = {
+        'pending_order_id': trade_state.get('pending_entry_order_id', ''),
+        'pending_side': side,
+        'actual_action': 'cancel_pending' if ai_pending_should_cancel else (
+            'log_only' if AI_RESEARCH_CONFIG.mode == 'log' else 'hold'
+        ),
+        'shadow_action': 'would_cancel_pending' if ai_pending_decision.get('shadow_action') == 'would_filter' else 'would_hold',
+        'reason': ai_pending_decision.get('reason', '')
+    }
+    write_ai_audit(
+        'pending_evaluation',
+        ai_guard,
+        pending_audit_decision,
+        dedupe_key=(
+            f"pending:{trade_state.get('pending_entry_order_id', '')}:{side}:"
+            f"{ai_guard.get('generated_at', 'invalid')}:{pending_audit_decision['shadow_action']}"
+        )
+    )
+    if ai_pending_should_cancel:
+        cancel_pending_entry_order('AI明确反向信号，撤销尚未成交pending')
+        return 'pending_entry_ai_filtered'
 
     curr_price = get_latest_price()
     # 判断pending 入场价格是否仍然合理
@@ -3116,8 +3246,12 @@ def open_order(side, price, sl_price, state_4h, state_1h, state_15m, signal_bar_
         # 成交后再拿交易所真实仓位风险信息，获取真正的强平价
         position_risk = get_position_risk(side=side)
         actual_liquidation_price = None
+        actual_filled_amount = amount
         if position_risk and not position_risk.get('fetch_failed'):
             actual_liquidation_price = position_risk['liquidation_price']
+            confirmed_amount = abs(price_to_float(position_risk.get('position_amt')))
+            if confirmed_amount > POSITION_AMT_EPSILON:
+                actual_filled_amount = confirmed_amount
         actual_safe_stop, actual_stop_meta = ensure_stop_price_safe(actual_price, estimated_safe_stop, side, liquidation_price=actual_liquidation_price)
         if not stop_price_is_still_valid(actual_price, actual_safe_stop, side):
             logging.error(
@@ -3164,7 +3298,7 @@ def open_order(side, price, sl_price, state_4h, state_1h, state_15m, signal_bar_
 
         # 计算开仓手续费 (参考 test.py 方式)
         taker_fee_rate = get_trading_fee_rate()
-        open_fee = actual_price * amount * taker_fee_rate
+        open_fee = actual_price * actual_filled_amount * taker_fee_rate
         logging.info(f"开仓手续费估算: {open_fee}")
 
         # 提取各个级别的具体成立条件字符串
@@ -3200,7 +3334,8 @@ def open_order(side, price, sl_price, state_4h, state_1h, state_15m, signal_bar_
             'stop_loss_price': actual_safe_stop,
             'highest_price': actual_price,
             'lowest_price': actual_price,
-            'amount': amount,
+            'amount': actual_filled_amount,
+            'entry_initial_amount': actual_filled_amount,
             'entry_time': entry_time,
             'cond_4h': cond_4h_str,
             'cond_1h': cond_1h_str,
@@ -3227,7 +3362,15 @@ def open_order(side, price, sl_price, state_4h, state_1h, state_15m, signal_bar_
             'last_stop_order_refresh_error': '',
             'entry_signal_bar_15m': signal_bar_15m,
             'last_entry_bar_15m': signal_bar_15m,
-            'position_miss_count': 0
+            'position_miss_count': 0,
+            'ai_snapshot_json': entry_meta.get('ai_snapshot_json', ''),
+            'ai_last_reduce_generated_at': '',
+            'ai_last_reduce_target_ratio': 1.0,
+            'ai_partial_reduce_count': 0,
+            'ai_partial_reduce_amount': 0.0,
+            'ai_partial_reduce_realized_pnl': 0.0,
+            'ai_partial_reduce_fee': 0.0,
+            'ai_reduce_reasons': []
         })
 
         # 开仓成功后立刻把服务端止损单挂上，真正的触发由交易所负责，不依赖本地轮询
@@ -3243,7 +3386,7 @@ def open_order(side, price, sl_price, state_4h, state_1h, state_15m, signal_bar_
         order_id_suffix = f"\n{order_id_lines}" if order_id_lines else ''
         msg = (f"🚀 【已开仓】\n方向: {side}\n入场价: {actual_price}\n"
                f"入场触发价: {trade_state.get('entry_trigger_price', 0)}\n"
-               f"止损价: {actual_safe_stop}\n强平价: {actual_liquidation_price}\n数量: {amount}\n"
+               f"止损价: {actual_safe_stop}\n强平价: {actual_liquidation_price}\n数量: {actual_filled_amount}\n"
                f"杠杆: {LEVERAGE}x\n开仓前账户资金(USDT): {initial_usdt:.4f}\n入场原因: {entry_reason}\n触发周期: {entry_trigger_tf_display}\n15M信号时间: {signal_bar_15m}\n"
                f"开仓条件明细:\n{open_condition_details}"
                f"{order_id_suffix}")
@@ -3389,6 +3532,7 @@ def close_position(reason, curr_price=None, signal_bar_15m='', trigger_label='')
             'highest_price': 0,
             'lowest_price': 0,
             'amount': 0,
+            'entry_initial_amount': 0.0,
             'entry_time': '',
             'cond_4h': '',
             'cond_1h': '',
@@ -3417,7 +3561,15 @@ def close_position(reason, curr_price=None, signal_bar_15m='', trigger_label='')
             'entry_signal_bar_15m': '',
             'last_exit_bar_15m': exit_signal_bar_15m,
             'last_processed_bar_15m': post_exit_processed_bar_15m,
-            'position_miss_count': 0
+            'position_miss_count': 0,
+            'ai_snapshot_json': '',
+            'ai_last_reduce_generated_at': '',
+            'ai_last_reduce_target_ratio': 1.0,
+            'ai_partial_reduce_count': 0,
+            'ai_partial_reduce_amount': 0.0,
+            'ai_partial_reduce_realized_pnl': 0.0,
+            'ai_partial_reduce_fee': 0.0,
+            'ai_reduce_reasons': []
         })
         logging.info(
             f"清仓成功: {reason}, PnL: {pnl_points:.2f}, Net USDT: {net_pnl_usdt:.2f}, "
@@ -5326,6 +5478,238 @@ def apply_new_exit_rules(context, signal_bar_15m='', curr_price=None, price_ts=N
         record_perf(perf, 'apply_new_exit_rules', apply_start)
 
 
+def exchange_min_amount():
+    try:
+        market = exchange.market(SYMBOL)
+        return price_to_float(market.get('limits', {}).get('amount', {}).get('min'))
+    except Exception:
+        return 0.0
+
+
+def ai_reduce_existing_position(position_risk, decision, guard, signal_bar_15m=''):
+    """按AI目标仓位执行单向持仓reduceOnly市价减仓，并同步保护止损数量。"""
+    side = position_risk.get('side')
+    current_amount = abs(price_to_float(position_risk.get('position_amt')))
+    info = position_risk.get('info') if isinstance(position_risk.get('info'), dict) else {}
+    raw_position_side = str(info.get('positionSide', 'BOTH') or 'BOTH').upper()
+    if raw_position_side in ('LONG', 'SHORT'):
+        logging.warning("AI减仓暂不支持Binance对冲持仓模式，本轮跳过: positionSide=%s", raw_position_side)
+        write_ai_audit(
+            'position_reduction_skipped',
+            guard,
+            {
+                **decision,
+                'position_side': side,
+                'current_amount': current_amount,
+                'actual_action': 'hold',
+                'reason': 'hedge position mode is unsupported'
+            },
+            dedupe_key=f"reduce-hedge:{guard.get('generated_at', '')}:{side}:{raw_position_side}"
+        )
+        return position_risk
+
+    requested_amount = min(current_amount, price_to_float(decision.get('reduce_amount')))
+    try:
+        reduce_amount = float(exchange.amount_to_precision(SYMBOL, requested_amount))
+    except Exception as e:
+        logging.warning(f"AI减仓数量精度处理失败，本轮跳过: {e}")
+        return position_risk
+    min_amount = exchange_min_amount()
+    if reduce_amount <= POSITION_AMT_EPSILON or (min_amount > 0 and reduce_amount < min_amount):
+        logging.info(
+            "AI减仓数量低于交易所最小值，跳过: requested=%s, precision=%s, min=%s",
+            requested_amount,
+            reduce_amount,
+            min_amount
+        )
+        return position_risk
+    if reduce_amount >= current_amount - POSITION_AMT_EPSILON:
+        logging.error("AI减仓计算可能导致全平，已拒绝: current=%s reduce=%s", current_amount, reduce_amount)
+        return position_risk
+
+    order_side = 'sell' if side == 'long' else 'buy'
+    try:
+        order = exchange.create_order(
+            SYMBOL,
+            'market',
+            order_side,
+            reduce_amount,
+            None,
+            {'reduceOnly': True}
+        )
+    except Exception as e:
+        logging.error(f"AI reduceOnly部分减仓失败: {e}")
+        write_ai_audit(
+            'position_reduction_failed',
+            guard,
+            {
+                **decision,
+                'position_side': side,
+                'current_amount': current_amount,
+                'requested_reduce_amount': reduce_amount,
+                'actual_action': 'reduce_failed',
+                'reason': str(e)
+            }
+        )
+        return position_risk
+
+    order_id = extract_order_id(order)
+    reported_fill = extract_order_filled_amount(order)
+    fallback_reduced_amount = reported_fill if reported_fill > POSITION_AMT_EPSILON else reduce_amount
+    expected_remaining = max(0.0, current_amount - fallback_reduced_amount)
+    confirmed_position = None
+    position_confirmed = False
+    for confirm_delay in (0.0, 0.2, 0.5):
+        if confirm_delay > 0:
+            time.sleep(confirm_delay)
+        candidate_position = get_position_risk(side=side)
+        if not candidate_position or candidate_position.get('fetch_failed'):
+            continue
+        candidate_amount = abs(price_to_float(candidate_position.get('position_amt')))
+        if POSITION_AMT_EPSILON < candidate_amount < current_amount - POSITION_AMT_EPSILON:
+            confirmed_position = candidate_position
+            position_confirmed = True
+            break
+    remaining_amount = (
+        abs(price_to_float(confirmed_position.get('position_amt')))
+        if position_confirmed
+        else expected_remaining
+    )
+    actual_reduced_amount = max(0.0, current_amount - remaining_amount)
+    if actual_reduced_amount <= POSITION_AMT_EPSILON:
+        actual_reduced_amount = fallback_reduced_amount
+        remaining_amount = expected_remaining
+
+    reduce_price = price_to_float(order.get('average')) if isinstance(order, dict) else 0.0
+    if reduce_price <= 0:
+        reduce_price = price_to_float(position_risk.get('mark_price'))
+    if reduce_price <= 0:
+        reduce_price = price_to_float(trade_state.get('entry_price'))
+    fee_rate = get_trading_fee_rate()
+    reduce_fee = reduce_price * actual_reduced_amount * fee_rate
+    entry_price = price_to_float(trade_state.get('entry_price'))
+    if side == 'long':
+        realized_pnl = (reduce_price - entry_price) * actual_reduced_amount
+    else:
+        realized_pnl = (entry_price - reduce_price) * actual_reduced_amount
+
+    trade_state['amount'] = remaining_amount
+    trade_state['open_fee'] = price_to_float(trade_state.get('open_fee')) + reduce_fee
+    trade_state['ai_snapshot_json'] = json.dumps(ai_guard_snapshot(guard), ensure_ascii=False, default=str)
+    trade_state['ai_last_reduce_generated_at'] = guard.get('generated_at', '')
+    trade_state['ai_last_reduce_target_ratio'] = price_to_float(decision.get('target_ratio'))
+    trade_state['ai_partial_reduce_count'] = int(trade_state.get('ai_partial_reduce_count', 0) or 0) + 1
+    trade_state['ai_partial_reduce_amount'] = price_to_float(trade_state.get('ai_partial_reduce_amount')) + actual_reduced_amount
+    trade_state['ai_partial_reduce_realized_pnl'] = (
+        price_to_float(trade_state.get('ai_partial_reduce_realized_pnl')) + realized_pnl
+    )
+    trade_state['ai_partial_reduce_fee'] = price_to_float(trade_state.get('ai_partial_reduce_fee')) + reduce_fee
+    reasons = list(trade_state.get('ai_reduce_reasons') or [])
+    reasons.append({
+        'generated_at': guard.get('generated_at', ''),
+        'trigger': decision.get('trigger', ''),
+        'target_ratio': decision.get('target_ratio'),
+        'amount': actual_reduced_amount,
+        'order_id': order_id
+    })
+    trade_state['ai_reduce_reasons'] = reasons[-20:]
+
+    stop_price = price_to_float(trade_state.get('stop_loss_price'))
+    stop_refreshed = False
+    if stop_price > 0:
+        stop_refreshed = refresh_protective_stop_order(stop_price)
+        if not stop_refreshed:
+            handle_stop_order_refresh_failure(
+                'AI减仓后保护止损数量刷新失败',
+                reduce_price,
+                signal_bar_15m=signal_bar_15m,
+                trigger_label='AI减仓止损刷新失败'
+            )
+    else:
+        logging.error("AI减仓后本地没有有效保护止损价，需要人工检查")
+
+    execution = {
+        **decision,
+        'position_side': side,
+        'position_confirmed': position_confirmed,
+        'previous_amount': current_amount,
+        'requested_reduce_amount': reduce_amount,
+        'actual_reduce_amount': actual_reduced_amount,
+        'remaining_amount': remaining_amount,
+        'reduce_price': reduce_price,
+        'reduce_fee': reduce_fee,
+        'realized_pnl': realized_pnl,
+        'reduce_order_id': order_id,
+        'stop_refreshed': stop_refreshed,
+        'actual_action': 'reduced'
+    }
+    write_ai_audit(
+        'position_reduction_executed',
+        guard,
+        execution,
+        dedupe_key=f"reduce-executed:{guard.get('generated_at', '')}:{side}:{order_id}"
+    )
+    send_msg(
+        f"ETH交易: AI部分减仓 {side}",
+        f"触发: {decision.get('trigger')}\n原仓位: {current_amount}\n减仓: {actual_reduced_amount}\n"
+        f"剩余仓位: {remaining_amount}\n目标比例: {decision.get('target_ratio')}\n"
+        f"成交估价: {reduce_price}\n手续费: {reduce_fee:.4f}\n已实现盈亏: {realized_pnl:.4f}\n"
+        f"减仓订单ID: {order_id}\n保护止损数量刷新: {stop_refreshed}"
+    )
+    logging.warning(
+        "AI部分减仓完成: side=%s previous=%s reduced=%s remaining=%s order_id=%s stop_refreshed=%s",
+        side,
+        current_amount,
+        actual_reduced_amount,
+        remaining_amount,
+        order_id,
+        stop_refreshed
+    )
+    if position_confirmed:
+        return confirmed_position
+    return {**position_risk, 'position_amt': remaining_amount if side == 'long' else -remaining_amount}
+
+
+def apply_ai_position_guard(position_risk, signal_bar_15m=''):
+    """评估已有仓位；默认只审计，显式开启后才调用reduceOnly。"""
+    side = position_risk.get('side')
+    current_amount = abs(price_to_float(position_risk.get('position_amt')))
+    initial_amount = price_to_float(trade_state.get('entry_initial_amount'))
+    if initial_amount <= 0:
+        initial_amount = max(current_amount, price_to_float(trade_state.get('amount')))
+        trade_state['entry_initial_amount'] = initial_amount
+        logging.warning("AI仓位基准缺失，使用当前交易所仓位建立安全baseline: %s", initial_amount)
+    trade_state['amount'] = current_amount
+
+    guard = get_current_ai_guard()
+    decision = evaluate_position_reduction(
+        side,
+        initial_amount,
+        current_amount,
+        guard,
+        AI_RESEARCH_CONFIG,
+        last_reduce_generated_at=trade_state.get('ai_last_reduce_generated_at', '')
+    )
+    audit = {
+        'position_side': side,
+        'entry_initial_amount': initial_amount,
+        'current_amount': current_amount,
+        **decision
+    }
+    write_ai_audit(
+        'position_evaluation',
+        guard,
+        audit,
+        dedupe_key=(
+            f"position:{guard.get('generated_at', 'invalid')}:{side}:{current_amount:.12f}:"
+            f"{decision.get('shadow_action')}:{decision.get('target_ratio')}"
+        )
+    )
+    if not decision.get('should_reduce'):
+        return position_risk
+    return ai_reduce_existing_position(position_risk, decision, guard, signal_bar_15m=signal_bar_15m)
+
+
 def monitor_position_new(context, signal_bar_15m='', allow_strategy_close=False, perf=None):
     """新版持仓管理：只保留仓位同步、保护止损和新策略出场规则。"""
     try:
@@ -5376,6 +5760,7 @@ def monitor_position_new(context, signal_bar_15m='', allow_strategy_close=False,
 
         trade_state['position_miss_count'] = 0
         trade_state['liquidation_price'] = position_risk.get('liquidation_price') or 0.0
+        position_risk = apply_ai_position_guard(position_risk, signal_bar_15m=signal_bar_15m)
         reconcile_start = time.monotonic()
         # 有仓位时保留一张出场方向的止损单（做多→SELL，做空→BUY），清理重复和反方向的条件委托
         reconcile_conditional_orders_for_position(side, silent=True)
@@ -5625,13 +6010,45 @@ def _run_strategy_impl(perf):
         if is_new_signal_15m:
             trade_state['last_processed_bar_15m'] = signal_bar_15m
         return 'target_profit_invalid'
+
+    ai_guard = get_current_ai_guard()
+    ai_entry_decision = evaluate_entry_candidate(candidate['side'], ai_guard, AI_RESEARCH_CONFIG)
+    write_ai_audit(
+        'candidate_evaluation',
+        ai_guard,
+        {
+            'candidate_side': candidate.get('side'),
+            'candidate_module': candidate.get('module', ''),
+            'candidate_strategy_tf': candidate.get('strategy_tf', ''),
+            'candidate_trigger_tf': candidate.get('trigger_tf', ''),
+            'signal_bar_15m': signal_bar_15m,
+            **ai_entry_decision
+        },
+        dedupe_key=(
+            f"candidate:{signal_bar_15m}:{candidate.get('side')}:{candidate.get('module', '')}:"
+            f"{ai_guard.get('generated_at', 'invalid')}:{ai_entry_decision.get('shadow_action')}"
+        )
+    )
+    if not ai_entry_decision['allowed']:
+        logging.info(
+            "AI明确反向信号过滤开仓候选: side=%s, module=%s, generated_at=%s",
+            candidate.get('side'),
+            candidate.get('module', ''),
+            ai_guard.get('generated_at', '')
+        )
+        trade_state['last_processed_bar_5m'] = signal_bar_5m
+        if is_new_signal_15m:
+            trade_state['last_processed_bar_15m'] = signal_bar_15m
+        return 'ai_candidate_filtered'
+
     #获取候选信号的4h、1h、15m状态
     state_4h, state_1h, state_15m = states_for_candidate(context, candidate)
     entry_meta = {
         'strategy_tf': candidate.get('strategy_tf'),
         'exit_tf': candidate.get('exit_tf'),
         'sr_target': candidate.get('target', 0.0),
-        'profit_check_atr': candidate.get('profit_check_atr', 0.0)
+        'profit_check_atr': candidate.get('profit_check_atr', 0.0),
+        'ai_snapshot_json': json.dumps(ai_guard_snapshot(ai_guard), ensure_ascii=False, default=str)
     }
     try:
         open_order_start = time.monotonic()

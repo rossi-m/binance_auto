@@ -677,7 +677,9 @@ def deepseek_prompt(snapshot: dict[str, Any]) -> list[dict[str, str]]:
                 "report clearly says the opposite side should not be opened. "
                 "Use fail-open behavior when data is missing. Do not invent a direction when the "
                 "TradingAgents report is stale, unavailable, or internally mixed; lower confidence instead. "
-                "risk_multiplier may reduce risk but must remain between 0 and 1.\n\n"
+                "risk_multiplier is the target retained ratio for an existing position relative to its initial "
+                "filled amount. It does not scale initial entry size. Use 1.0 for no position reduction; values "
+                "below 1.0 may request reducing an existing position only. It must remain between 0 and 1.\n\n"
                 f"Research input:\n{json.dumps(snapshot, ensure_ascii=False)[:45000]}"
             ),
         },
@@ -709,7 +711,7 @@ def normalize_bias(raw: dict[str, Any], symbol: str, hours: int, source_counts: 
         "underweight": "underweight",
     }.get(portfolio_stance, "neutral")
 
-    raw_futures_bias = str(raw.get("futures_bias", raw.get("bias", "neutral"))).strip().lower()
+    raw_futures_bias = str(raw.get("futures_bias", "neutral")).strip().lower()
     futures_bias = {
         "bullish": "long",
         "long": "long",
@@ -718,8 +720,6 @@ def normalize_bias(raw: dict[str, Any], symbol: str, hours: int, source_counts: 
         "neutral": "neutral",
         "mixed": "mixed",
     }.get(raw_futures_bias, "neutral")
-    bias = {"long": "bullish", "short": "bearish"}.get(futures_bias, futures_bias)
-
     try:
         confidence = float(raw.get("confidence", 0.0))
     except (TypeError, ValueError):
@@ -739,7 +739,7 @@ def normalize_bias(raw: dict[str, Any], symbol: str, hours: int, source_counts: 
         allow_long = requested_allow_long
 
     try:
-        risk_multiplier = float(raw.get("risk_multiplier", raw.get("size_multiplier", 1.0)))
+        risk_multiplier = float(raw.get("risk_multiplier", 1.0))
     except (TypeError, ValueError):
         risk_multiplier = 1.0
     if not math.isfinite(risk_multiplier):
@@ -757,12 +757,10 @@ def normalize_bias(raw: dict[str, Any], symbol: str, hours: int, source_counts: 
         "time_horizon_hours": int(hours),
         "explicit_long_signal": explicit_long_signal,
         "explicit_short_signal": explicit_short_signal,
-        "bias": bias,
         "confidence": confidence,
         "allow_long": allow_long,
         "allow_short": allow_short,
         "risk_multiplier": risk_multiplier,
-        "size_multiplier": risk_multiplier,
         "reason": str(raw.get("reason", ""))[:800],
         "risk_events": list(raw.get("risk_events", []))[:10] if isinstance(raw.get("risk_events", []), list) else [],
         "news_used": list(raw.get("news_used", []))[:20] if isinstance(raw.get("news_used", []), list) else [],
@@ -793,7 +791,17 @@ def call_deepseek(snapshot: dict[str, Any], args: argparse.Namespace) -> dict[st
 
 def write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temp_path.open("w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
 
 
 def parse_args() -> argparse.Namespace:

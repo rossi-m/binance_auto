@@ -3,9 +3,9 @@
 文档状态：
 
 ```text
-更新时间：2026-07-17
+更新时间：2026-07-19
 当前运行目录：/home/ubuntu/binance/tradingAgents
-当前阶段：观察验证已完成，bian_new.py 实盘接入尚未实现
+当前阶段：Binance Demo 使用 filter_reduce 同时验证阶段 1、2、3，为期一周
 当前协议：只使用 portfolio_stance、futures_bias、risk_multiplier 等正式字段
 ```
 
@@ -33,7 +33,7 @@
   在数据缺失时强行给方向
 ```
 
-`bian_new.py` 当前没有读取 `.ai_research/latest_bias_ETHUSDT.json`，所以 AI 研究层不会影响实盘交易。
+`bian_new.py` 已接入 `.ai_research/latest_bias_ETHUSDT.json`。默认 `AI_RESEARCH_MODE=off`；当前一周 Demo 测试由运行脚本显式设置为 `filter_reduce`。
 
 ## 2. 当前文件
 
@@ -41,8 +41,7 @@
 tradingAgents/
   analyze_eth_tradingagents.py
   ai_market_bias.py
-  ai_bias_observer.py
-  test_ai_market_bias.py
+  ai_research_guard.py
   ai_research_integration_plan.md
   .env.example
 ```
@@ -96,8 +95,7 @@ Overweight / BUY / 分批买入不等于期货 long。
 |---|---|---|---|
 | `tradingAgents/analyze_eth_tradingagents.py` | 当前实现 | TradingAgents 研究入口；运行时 patch 数据源；输出多 Agent 报告 | 是 |
 | `tradingAgents/ai_market_bias.py` | 当前实现 | 读取 TradingAgents 报告，结合辅助数据，生成 bias JSON | 是 |
-| `tradingAgents/ai_bias_observer.py` | 当前实现 | 可选的手动观察/复盘工具；读取 latest bias、TradingAgents 报告和 Binance 摘要并追加 CSV | 是 |
-| `tradingAgents/test_ai_market_bias.py` | 当前实现 | 验证 JSON 协议、新闻选择、fail-open 和 CSV schema 迁移 | 是 |
+| `tradingAgents/ai_research_guard.py` | 当前实现 | 配置校验、JSON fail-open、候选过滤、目标仓位计算和 AI JSONL 审计 | 是 |
 | `tradingAgents/ai_research_integration_plan.md` | 当前实现 | 当前方案文档、运行命令、下一步计划 | 是 |
 | `tradingAgents/.env.example` | 当前实现 | 环境变量模板，只放占位符，不放真实 key | 是 |
 
@@ -108,7 +106,7 @@ Overweight / BUY / 分批买入不等于期货 long。
 | `tradingAgents/.env` | 用户手工创建 | 存真实 API key，例如 `DEEPSEEK_API_KEY` | 含密钥，不能进 git |
 | `tradingAgents/.ai_research/latest_bias_ETHUSDT.json` | `ai_market_bias.py` | 最新 AI bias 输出，未来可给观察/实盘读取 | 运行态结果，会频繁变化 |
 | `tradingAgents/.ai_research/cache/` | `ai_market_bias.py` | 新闻、FRED、Binance、TradingAgents 输入快照缓存 | 缓存数据，体积和内容会变 |
-| `tradingAgents/.ai_research/logs/` | `ai_bias_observer.py` | 手动观察或复盘日志 | 运行日志，不属于源码 |
+| `tradingAgents/.ai_research/logs/ai_research_decisions_YYYY-MM.jsonl` | `bian_new.py` | 候选、pending、持仓和减仓的结构化 AI 审计 | 运行日志，不属于源码 |
 | `tradingAgents/outputs/*_summary.md` | `analyze_eth_tradingagents.py` | 人看的 TradingAgents 研究报告 | 每次运行结果，不属于源码 |
 | `tradingAgents/outputs/*_state.json` | `analyze_eth_tradingagents.py` | TradingAgents 全流程状态，内容最全 | 文件大、运行态输出 |
 | `tradingAgents/outputs/*_decision.json` | `analyze_eth_tradingagents.py` | TradingAgents 最终决策 | 每次运行结果 |
@@ -584,83 +582,11 @@ python tradingAgents/ai_market_bias.py --symbol ETHUSDT --hours 9 --run-tradinga
 tradingAgents/.ai_research/latest_bias_ETHUSDT.json
 ```
 
-当前写出这个文件也不会影响实盘，因为 `bian_new.py` 尚未读取它。
+是否影响交易由 `AI_RESEARCH_MODE` 决定；默认 `off` 不读取，当前 Demo 测试使用 `filter_reduce`。
 
-## 9. ai_bias_observer.py 命令
+## 9. 已删除的辅助脚本
 
-目的：需要手工复盘时，把 AI bias 和当时市场状态追加到 CSV。该工具不是当前常驻任务。
-
-它解决的问题：
-
-```text
-只看 latest_bias_ETHUSDT.json 只能知道最新一次判断。
-无法复盘过去每次 AI 判断当时的价格、趋势、置信度和 TradingAgents 报告。
-
-ai_bias_observer.py 会把这些信息追加到月度 CSV。
-后面才能判断 AI bias 是否有帮助，是否经常误判，是否适合接入 bian_new.py。
-```
-
-只打印观察记录，不写 CSV：
-
-```bash
-python tradingAgents/ai_bias_observer.py --symbol ETHUSDT --dry-run
-```
-
-追加写观察日志：
-
-```bash
-python tradingAgents/ai_bias_observer.py --symbol ETHUSDT
-```
-
-输出：
-
-```text
-tradingAgents/.ai_research/logs/ai_bias_YYYY-MM.csv
-```
-
-每行记录包括：
-
-```text
-observed_at
-symbol
-bias_generated_at
-bias_expires_at
-portfolio_stance
-futures_bias
-time_horizon_hours
-explicit_long_signal
-explicit_short_signal
-confidence
-allow_long
-allow_short
-risk_multiplier
-reason
-risk_events
-news_used
-source_counts
-latest_price
-trend_1h
-pct_change_1h
-trend_4h
-pct_change_4h
-trend_1d
-pct_change_1d
-binance_errors
-tradingagents_available
-tradingagents_age_hours
-tradingagents_summary_path
-tradingagents_modified_at
-tradingagents_decision_path
-tradingagents_decision
-```
-
-边界：
-
-```text
-ai_bias_observer.py 不导入 bian_new.py。
-不下单，不撤单，不改止损，不改仓位。
-它只读 latest bias、TradingAgents 输出和 Binance 公开行情，然后追加 CSV。
-```
+`ai_bias_observer.py` 和阶段 0 使用的测试脚本已按要求从运行目录和仓库删除。运行态验证由 `bian_new.py` 的结构化 AI JSONL 审计承担。
 
 ## 10. Bias JSON 规则
 
@@ -777,7 +703,7 @@ confidence >= 0.65、futures_bias 明确、对应 explicit 信号为 true，
 
 ### 10.3 allow_long / allow_short 含义
 
-`allow_long` 和 `allow_short` 是未来接入实盘时的方向许可位。当前 `bian_new.py` 没有读取它们，所以它们只用于观察。
+`allow_long` 和 `allow_short` 是新开仓方向许可位。`bian_new.py` 已读取它们，但只有 `filter` 或 `manage` 模式、JSON 有效且全部严格过滤条件满足时才会拦截候选。
 
 | allow_long | allow_short | 含义 |
 |---|---|---|
@@ -881,7 +807,7 @@ futures_bias = short 且 confidence >= 0.65
   allow_short = false -> 跳过这次空单候选。
 
 当前阶段:
-  bian_new.py 还没有读取这些字段，所以不会影响实盘。
+  bian_new.py 已读取这些字段；默认 mode=off，filter/manage 未启用时不会过滤候选。
 ```
 
 ## 11. 当前测试结果
@@ -974,13 +900,7 @@ bearish + confidence >= 0.65 不再自动覆盖 allow_long=false。
 只有 explicit 信号、置信度和明确禁止反向开仓三项同时满足时，才可能限制方向。
 ```
 
-测试命令：
-
-```bash
-python -m unittest -v test_ai_market_bias.py
-```
-
-当前共 11 个测试通过。
+阶段 0 曾完成 31 项单元和 mock 验证；相关测试脚本随后已按要求删除，当前仓库不再提供这些测试命令。
 
 ### 11.4 历史三天观察结论
 
@@ -1072,19 +992,22 @@ TradingAgents 连续运行稳定性验证。
 portfolio_stance 与 futures_bias 语义拆分。
 旧字段 bias 和 size_multiplier 移除。
 多来源新闻汇总、评分、去重和来源配额。
-Bias JSON fail-open 与观察 CSV schema 迁移测试。
+Bias JSON fail-open 验证。
+bian_new.py 候选过滤、pending 撤单和已有仓位 reduceOnly 接入。
+JSON 原子写入、交易侧幂等和独立 AI JSONL 审计。
+阶段 0 共 31 项测试及相关 Python 静态编译验证。
 ```
 
 尚未实现：
 
 ```text
-bian_new.py 读取和校验 AI JSON。
-log / reduce / filter / manage 执行模式。
-reduceOnly 部分减仓、止损重挂和部分减仓记账。
-JSON 原子写入和交易侧幂等动作记录。
+AI 主动全量平仓。
+AI 自动反手。
+Binance 对冲持仓模式下的 AI 部分减仓。
+manage 模式独立于原策略的额外止损价格模型。
 ```
 
-下一步按第 15 节实施：先接入 `log` 模式并确保交易行为完全不变，再在 Binance Demo 验证 `reduce`，最后才评估方向过滤。观察器保留为可选的手工复盘工具，不再作为常驻定时任务运行。
+当前从 `/home/ubuntu/binance` 启动 Binance Demo 一周测试，使用 `filter_reduce` 同时验证阶段 1、2、3。仓库默认配置仍为 `off`，不会在未显式设置模式时改变交易。
 
 ## 15. bian_new.py 实盘接入方案
 
@@ -1113,17 +1036,19 @@ AI 不能修改杠杆。
 AI 文件异常时必须 fail-open。
 ~~~
 
-当前 bian_new.py 仍明确调用：
+Git 仓库中的 Demo 副本仍明确调用：
 
 ~~~python
 exchange.enable_demo_trading(True)
 ~~~
 
-因此当前是 Binance Demo 环境。AI 接入改动和切换真实资金环境必须分成两次独立发布，不能在同一次修改中同时完成。
+主网运行文件 `/home/ubuntu/binance/bian_new.py` 保持该调用关闭，Git 仓库副本 `/home/ubuntu/binance_auto/bian_new.py` 保持 Demo 开启。两者的 AI 接入逻辑相同，交易环境开关不得由 AI 修改。
 
 ### 15.2 建议配置开关
 
-新增环境变量，默认全部保持保守状态：
+以下环境变量已经接入 `bian_new.py`。默认 `off`，只有按阶段显式启用模式和独立动作开关后才会影响交易。
+
+默认全部保持保守状态：
 
 ~~~text
 AI_RESEARCH_MODE=off
@@ -1139,15 +1064,108 @@ AI_ALLOW_REVERSE=0
 AI_BIAS_FUTURE_TOLERANCE_SECONDS=300
 ~~~
 
-AI_RESEARCH_MODE：
+#### 15.2.1 字段说明
+
+| 字段 | 默认值 | 作用 |
+|---|---:|---|
+| `AI_RESEARCH_MODE` | `off` | AI 总模式。决定是否读取 JSON，以及允许进入日志、过滤、减仓或管理流程。 |
+| `AI_BIAS_FILE` | `.ai_research/latest_bias_ETHUSDT.json` | 最新 Bias JSON 路径。文件缺失、损坏、过期或校验失败时必须 fail-open。目录和文件由研究脚本运行时创建。 |
+| `AI_FILTER_MIN_CONFIDENCE` | `0.75` | 过滤新开仓候选的最低置信度。达到阈值仍不够，还必须有明确反向 futures signal 和对应 `allow_* = false`。 |
+| `AI_REDUCE_MIN_CONFIDENCE` | `0.75` | 缩紧已有仓位的最低置信度。适用于明确反向信号或 `risk_multiplier` 低于当前保留比例。 |
+| `AI_REVERSE_SIGNAL_RETAINED_POSITION_RATIO` | `0.75` | 已有仓位遇到明确反向信号时的默认目标保留比例。即使该次 `risk_multiplier=1.0`，也可以请求保留到初始仓位的 75%。 |
+| `AI_MIN_RETAINED_POSITION_RATIO` | `0.75` | AI 减仓后的绝对最低保留比例，防止 AI 直接清仓。比例基于该笔交易的实际初始成交数量。 |
+| `AI_MAX_POSITION_REDUCTION` | `0.25` | AI 相对初始成交数量允许的累计最大减仓比例。默认累计最多减掉 25%，不是每次报告都减 25%。 |
+| `AI_ALLOW_POSITION_REDUCTION` | `0` | `reduceOnly` 部分减仓独立总开关。为 `0` 时，`reduce` / `manage` 也只能记录本应减仓的结果。 |
+| `AI_ALLOW_FULL_CLOSE` | `0` | AI 全量平仓预留开关。当前实现不支持，配置成 `1` 会在启动时被拒绝，不会进入交易循环。 |
+| `AI_ALLOW_REVERSE` | `0` | 自动反手预留开关。当前实现不支持，配置成 `1` 会在启动时被拒绝，应长期保持 `0`。 |
+| `AI_BIAS_FUTURE_TOLERANCE_SECONDS` | `300` | 容忍 `generated_at` 最多比交易服务器当前时间提前 300 秒，用于处理时钟误差。它不是 JSON 有效期；有效期仍由 `expires_at` 决定。 |
+
+#### 15.2.2 AI_RESEARCH_MODE
 
 | mode | 行为 |
 |---|---|
 | off | 完全不读取 AI 文件。 |
-| log | 读取并写日志，但不改变候选、仓位或订单。 |
-| reduce | 在 log 基础上，允许按目标保留比例缩紧已有仓位，不改变初始开仓量。 |
+| log | 读取、校验并写结构化审计日志，同时计算 `would_filter` / `would_reduce`；实际不改变候选、仓位或订单。 |
+| reduce | 在 log 基础上，只允许按目标保留比例缩紧已有仓位；不改变初始开仓量，不过滤新候选，不撤销 pending。减仓后必须按剩余仓位刷新保护止损数量。 |
 | filter | 在 log 基础上，允许过滤满足全部严格条件的新开仓候选。 |
-| manage | 同时允许经过验证的 reduce、pending 撤单和保护动作；AI 全平仍需独立开关。 |
+| filter_reduce | 一周 Demo 验证模式：同时写审计、过滤严格反向候选，并允许受限的 `reduceOnly` 部分减仓；不撤销 pending，不主动收紧止损。 |
+| manage | 完整管理模式：允许已经验证的 filter、reduce、未成交 pending 撤单和止损收紧。AI 全平和自动反手当前均未实现。 |
+
+模式能力矩阵：
+
+| 动作 | off | log | reduce | filter | filter_reduce | manage |
+|---|---:|---:|---:|---:|---:|---:|
+| 读取并校验 JSON | 否 | 是 | 是 | 是 | 是 | 是 |
+| 写 AI 审计日志 | 否 | 是 | 是 | 是 | 是 | 是 |
+| 过滤新开仓候选 | 否 | 否 | 否 | 是 | 是 | 是 |
+| `reduceOnly` 减少已有仓位 | 否 | 否 | 是 | 否 | 是 | 是 |
+| 撤销明确反向的未成交 pending | 否 | 否 | 否 | 否 | 否 | 是 |
+| 主动收紧保护止损 | 否 | 否 | 否 | 否 | 否 | 是 |
+| AI 全平 | 否 | 否 | 否 | 否 | 否 | 当前未实现 |
+| 自动反手 | 否 | 否 | 否 | 否 | 否 | 否 |
+
+`log` 模式的“写日志”不是交易成交 CSV。它应为每个候选或持仓评估写结构化 AI 审计事件，至少包含：
+
+~~~text
+event / observed_at / symbol / mode
+candidate side 或 position side / amount
+AI valid / fail_open / error
+generated_at / expires_at
+portfolio_stance / futures_bias / explicit signals
+confidence / allow_long / allow_short / risk_multiplier
+actual_action = log_only
+shadow_action = would_allow / would_filter / would_reduce
+shadow_reduce_amount / reason
+~~~
+
+推荐写入独立月度 JSONL，例如 `ai_research_decisions_YYYY-MM.jsonl`，并用现有 `logging.info()` 输出简短摘要。这样未成交候选也能复盘，不应混入只记录实际成交结果的 `trades_log_YYYY-MM.csv`。
+
+#### 15.2.3 仓位比例组合规则
+
+有效最低保留比例：
+
+~~~python
+retained_ratio_floor = max(
+    AI_MIN_RETAINED_POSITION_RATIO,
+    1.0 - AI_MAX_POSITION_REDUCTION,
+)
+~~~
+
+当前默认值的结果：
+
+~~~text
+max(0.75, 1.0 - 0.25) = 0.75
+~~~
+
+初始成交 `1.00 ETH` 时：
+
+~~~text
+risk_multiplier=0.80：目标保留 0.80 ETH，最多减 0.20 ETH。
+明确反向信号且 risk_multiplier=1.00：按反向信号默认比例，目标保留 0.75 ETH。
+risk_multiplier=0.50：受最低保留比例限制，仍只能减到 0.75 ETH。
+仓位已经低于目标：不补仓，也不继续减仓。
+~~~
+
+真正执行部分减仓必须同时满足：
+
+~~~text
+AI_RESEARCH_MODE = reduce 或 manage
+AI_ALLOW_POSITION_REDUCTION = 1
+JSON 合法且未过期
+confidence >= AI_REDUCE_MIN_CONFIDENCE
+出现明确反向信号，或 risk_multiplier 低于当前持仓比例
+交易所真实仓位查询成功
+~~~
+
+#### 15.2.4 开关优先级
+
+~~~text
+AI_RESEARCH_MODE=off：覆盖其他所有 AI 开关，不读取 JSON。
+JSON 无效或过期：fail-open，只运行原策略。
+AI_ALLOW_POSITION_REDUCTION=0：禁止任何 AI 部分减仓。
+AI_ALLOW_FULL_CLOSE 只能为 0；设为 1 时启动配置校验失败。
+AI_ALLOW_REVERSE 只能为 0；设为 1 时启动配置校验失败。
+~~~
 
 真实资金和 Demo 环境建议改为独立环境变量，例如：
 
@@ -1250,7 +1268,7 @@ AI 只能评估已经由原策略产生的 candidate。
 过滤 long 候选必须同时满足：
 
 ~~~text
-AI_RESEARCH_MODE 至少为 filter。
+AI_RESEARCH_MODE = filter、filter_reduce 或 manage。
 AI guard 有效且未过期。
 futures_bias = short。
 explicit_short_signal = true。
@@ -1261,7 +1279,7 @@ allow_long = false。
 过滤 short 候选必须同时满足：
 
 ~~~text
-AI_RESEARCH_MODE 至少为 filter。
+AI_RESEARCH_MODE = filter、filter_reduce 或 manage。
 AI guard 有效且未过期。
 futures_bias = long。
 explicit_long_signal = true。
@@ -1299,7 +1317,7 @@ risk_multiplier 不应用于初始开仓数量。
 
 接入位置在 manage_pending_entry()。
 
-每次管理未成交 pending 时重新读取最新 AI guard。
+只有 `AI_RESEARCH_MODE=manage` 才允许 AI 撤销未成交 pending。每次管理未成交 pending 时重新读取最新 AI guard。
 
 只有满足全部硬过滤条件且订单尚未成交时，才能：
 
@@ -1341,22 +1359,22 @@ AI 不放宽保护止损。
 AI 只记录持仓方向与最新 futures_bias 是否一致。
 ~~~
 
-reduce / manage 模式允许的第一种持仓动作是“缩紧已有仓位”，其次才是收紧止损，不能立即反手：
+`reduce` 和 `manage` 都允许缩紧已有仓位，但只有 `manage` 允许把“主动收紧止损”作为独立 AI 保护动作。`reduce` 在减仓后刷新止损数量属于订单一致性维护，不代表 AI 可以任意改变止损价格。任何模式都不能立即反手：
 
 ~~~text
 long 持仓遇到明确 short 信号：
   即使 risk_multiplier=1.0，也按反向信号默认目标保留比例执行 reduceOnly 部分减仓。
-  可同时使用原策略 K 线和 ATR 算出的更紧 stop。
+  manage 模式可同时使用原策略 K 线和 ATR 算出的更紧 stop。
 
 short 持仓遇到明确 long 信号：
   即使 risk_multiplier=1.0，也按反向信号默认目标保留比例执行 reduceOnly 部分减仓。
-  可同时使用原策略 K 线和 ATR 算出的更紧 stop。
+  manage 模式可同时使用原策略 K 线和 ATR 算出的更紧 stop。
 
 futures_bias 没有反向，但 risk_multiplier 明确低于当前持仓比例：
   只缩紧已有仓位，不改变方向。
 ~~~
 
-必须调用现有 update_stop_if_tighter()，确保：
+`manage` 模式主动收紧止损时必须调用现有 `update_stop_if_tighter()`，确保：
 
 ~~~text
 long 的新 stop 只能更高。
@@ -1481,7 +1499,7 @@ reduce_amount = max(0.0, actual_amount - target_amount)
 共同条件：
 
 ~~~text
-AI_RESEARCH_MODE = reduce 或 manage。
+AI_RESEARCH_MODE = reduce、filter_reduce 或 manage。
 AI_ALLOW_POSITION_REDUCTION = 1。
 AI guard 有效且未过期。
 同一个 generated_at 尚未执行过减仓。
@@ -1502,9 +1520,11 @@ ai_reduce_reasons
 
 在这些记账字段完成前，不得启用主动部分减仓。
 
-### 15.9 全量平仓方案
+### 15.9 全量平仓方案（当前未实现）
 
 AI_ALLOW_FULL_CLOSE 默认必须为 0。
+
+当前配置加载器会拒绝 `AI_ALLOW_FULL_CLOSE=1`。以下内容只保留为未来评审草案，当前代码不存在 AI 全平调用路径。
 
 portfolio_stance、普通 futures_bias 或单次新闻判断都不能调用 close_position()。
 
@@ -1604,20 +1624,23 @@ reduce amount
 同一个 generated_at 对同一持仓最多执行一次减仓或保护动作。
 使用 generated_at + position side + entry_time 作为动作幂等 key。
 读取 JSON 时使用一次完整 read + json.loads，不边读边解析。
-接入前必须把 ai_market_bias.py 的 write_json() 改为同目录临时文件写入、flush/fsync 后 os.replace 原子替换，避免读取半个 JSON。
+ai_market_bias.py 的 write_json() 已使用同目录临时文件写入、flush/fsync 后 os.replace 原子替换，避免读取半个 JSON。
 AI 读取失败不得改变现有订单和仓位。
 pending 撤单、减仓、止损刷新都必须在交易所确认后更新本地状态。
 ~~~
 
 ### 15.13 分阶段上线
 
-阶段 0：单元测试和静态验证
+阶段 0：单元测试和静态验证（2026-07-19 已完成）
 
 ~~~text
 测试所有 schema 缺失、过期、未来时间、错误 symbol 和类型错误。
 测试 long / short / neutral / mixed 动作矩阵。
 测试 risk_multiplier 不改变初始开仓量、不能放大已有仓位，也不能补回已减仓数量。
 测试 AI 不能产生候选或反转 side。
+mock 验证 reduceOnly 市价减仓方向、数量、状态记账和止损数量刷新。
+mock 验证 Binance 对冲持仓模式拒绝 AI 减仓。
+共 31 项测试通过，相关 Python 文件 py_compile 通过；测试脚本随后已按要求删除。
 ~~~
 
 阶段 1：Demo + log
