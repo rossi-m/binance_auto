@@ -364,7 +364,26 @@ def append_ai_audit_event(
     observed_at = observed_at or datetime.now().astimezone()
     path = audit_log_path(config, observed_at)
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"observed_at": observed_at.isoformat(), **dict(event)}
+    event_data = dict(event)
+    guard = event_data.get("guard") if isinstance(event_data.get("guard"), Mapping) else {}
+    source_generated_at = str(guard.get("generated_at", "") or "").strip()
+    if guard and guard.get("valid") is False and guard.get("error"):
+        trace_reason = str(guard.get("error"))
+    else:
+        trace_reason = str(
+            event_data.get("reason")
+            or guard.get("reason")
+            or guard.get("error")
+            or event_data.get("event")
+            or "AI decision"
+        )
+    event_data["generated_at"] = str(
+        event_data.get("generated_at") or source_generated_at or observed_at.isoformat()
+    )
+    event_data["reason"] = trace_reason
+    event_data["source_generated_at"] = source_generated_at
+    event_data["generated_at_source"] = "ai_bias" if source_generated_at else "decision_time_fallback"
+    payload = {"observed_at": observed_at.isoformat(), **event_data}
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False, default=str, separators=(",", ":")) + "\n")
         handle.flush()
