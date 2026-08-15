@@ -80,13 +80,13 @@ class AiResearchConfig:
     # 减仓触发的最低置信度阈值
     reduce_min_confidence: float = 0.75
     # 反向信号时保留的仓位比例（1.0=不减仓, 0.0=清仓）
-    reverse_signal_retained_position_ratio: float = 0.75
+    reverse_signal_retained_position_ratio: float = 0.5
     # 最小保留仓位比例（安全底线，防止减仓过多）
-    min_retained_position_ratio: float = 0.75
+    min_retained_position_ratio: float = 0.5
     # 单次最大减仓比例（例如 0.25 表示单次最多减 25%）
     max_position_reduction: float = 0.25
     # 是否允许减仓
-    allow_position_reduction: bool = False
+    allow_position_reduction: bool = True
     # 是否允许完全平仓（当前版本不支持）
     allow_full_close: bool = False
     # 是否允许反向开仓（当前版本不支持）
@@ -119,10 +119,10 @@ def load_ai_research_config(environ: Mapping[str, str] | None = None) -> AiResea
         filter_min_confidence=_env_float(environ, "AI_FILTER_MIN_CONFIDENCE", 0.75),
         reduce_min_confidence=_env_float(environ, "AI_REDUCE_MIN_CONFIDENCE", 0.75),
         reverse_signal_retained_position_ratio=_env_float(
-            environ, "AI_REVERSE_SIGNAL_RETAINED_POSITION_RATIO", 0.75
+            environ, "AI_REVERSE_SIGNAL_RETAINED_POSITION_RATIO", 0.5
         ),
-        min_retained_position_ratio=_env_float(environ, "AI_MIN_RETAINED_POSITION_RATIO", 0.75),
-        max_position_reduction=_env_float(environ, "AI_MAX_POSITION_REDUCTION", 0.25),
+        min_retained_position_ratio=_env_float(environ, "AI_MIN_RETAINED_POSITION_RATIO", 0.5),
+        max_position_reduction=_env_float(environ, "AI_MAX_POSITION_REDUCTION", 0.5),
         allow_position_reduction=_env_bool(environ.get("AI_ALLOW_POSITION_REDUCTION"), False),
         allow_full_close=_env_bool(environ.get("AI_ALLOW_FULL_CLOSE"), False),
         allow_reverse=_env_bool(environ.get("AI_ALLOW_REVERSE"), False),
@@ -270,26 +270,26 @@ def validate_ai_bias(
         raise ValueError("source_counts must be an object")
 
     return {
-        "valid": True,
-        "fail_open": False,
-        "error": "",
-        "mode": config.mode,
-        "symbol": expected_symbol,
-        "generated_at": generated_at.isoformat(),
-        "expires_at": expires_at.isoformat(),
-        "portfolio_stance": portfolio_stance,
-        "futures_bias": futures_bias,
-        "time_horizon_hours": time_horizon_hours,
-        "explicit_long_signal": raw["explicit_long_signal"],
-        "explicit_short_signal": raw["explicit_short_signal"],
-        "confidence": float(confidence),
-        "allow_long": raw["allow_long"],
-        "allow_short": raw["allow_short"],
-        "risk_multiplier": float(risk_multiplier),
-        "reason": str(raw.get("reason", ""))[:800],  # 截断过长文本
-        "risk_events": raw.get("risk_events", [])[:10],      # 最多保留 10 条
-        "news_used": raw.get("news_used", [])[:20],           # 最多保留 20 条
-        "source_counts": raw.get("source_counts", {}),
+        "valid": True,                                    # 是否通过全部校验，可被策略使用
+        "fail_open": False,                               # 是否走 fail-open 路径（此处必为 False）
+        "error": "",                                      # 错误信息（此处必为空）
+        "mode": config.mode,                              # 生效模式：off/log/filter/reduce/filter_reduce/manage
+        "symbol": expected_symbol,                        # 校验通过的合约符号（如 ETHUSDT）
+        "generated_at": generated_at.isoformat(),         # bias 生成时间（ISO 8601 字符串）
+        "expires_at": expires_at.isoformat(),             # bias 过期时间（ISO 8601 字符串）
+        "portfolio_stance": portfolio_stance,             # 现货组合态度：LONG/SHORT/HOLD
+        "futures_bias": futures_bias,                     # 合约方向倾向：LONG/SHORT/NEUTRAL
+        "time_horizon_hours": time_horizon_hours,         # 研报建议的持仓时间窗口（小时）
+        "explicit_long_signal": raw["explicit_long_signal"],  # 研报是否给出显式做多信号
+        "explicit_short_signal": raw["explicit_short_signal"],  # 研报是否给出显式做空信号
+        "confidence": float(confidence),                  # 置信度（0~1）
+        "allow_long": raw["allow_long"],                  # 研报是否允许做多开仓
+        "allow_short": raw["allow_short"],                # 研报是否允许做空开仓
+        "risk_multiplier": float(risk_multiplier),        # 风险倍数（用于仓位调整）
+        "reason": str(raw.get("reason", ""))[:800],       # AI 给出的理由（截断至 800 字符）
+        "risk_events": raw.get("risk_events", [])[:10],   # 关键风险事件（最多保留 10 条）
+        "news_used": raw.get("news_used", [])[:20],       # 参考的新闻源（最多保留 20 条）
+        "source_counts": raw.get("source_counts", {}),    # 各数据源的信息数量统计
     }
 
 
@@ -360,9 +360,12 @@ def evaluate_entry_candidate(
     filter_enabled = config.mode in {"filter", "filter_reduce", "manage"}
     allowed = not (hard_filter and filter_enabled)
     return {
-        "allowed": allowed,
+        "allowed": allowed,  # 是否放行：被硬过滤且当前模式支持拦截时为 False
+        # 实际动作：filter=已拦截, log_only=log模式仅记录未拦截, allow=放行
         "actual_action": "filter" if not allowed else ("log_only" if config.mode == "log" else "allow"),
-        "shadow_action": "would_filter" if hard_filter else "would_allow",  # 影子动作：不受 mode 影响
+        # 影子动作：不受 mode 影响，反映硬过滤条件下本应执行的动作（用于 log 模式干跑评估）
+        "shadow_action": "would_filter" if hard_filter else "would_allow",
+        # 决策原因：硬过滤时为 AI 明确反向信号，否则为 AI 未拦截候选
         "reason": "explicit opposite AI signal" if hard_filter else "AI did not block candidate",
     }
 
@@ -402,6 +405,7 @@ def evaluate_position_reduction(
     # risk_multiplier < current_ratio 表示 AI 认为当前仓位过重
     risk_requests_reduction = risk_multiplier < current_ratio - 1e-12
     threshold_met = confidence >= config.reduce_min_confidence  # 置信度达标
+    # 策略可用，置信度达标，且满足反向信号或ai认为仓位过重
     triggered = bool(guard.get("valid") and threshold_met and (opposite or risk_requests_reduction))
 
     # 计算目标仓位比例：优先取 AI 建议的 risk_multiplier，反向信号可进一步降低
@@ -417,7 +421,7 @@ def evaluate_position_reduction(
     target_amount = initial_amount * target_ratio
     reduce_amount = max(0.0, current_amount - target_amount) if triggered else 0.0
 
-    # 去重：同一个 generated_at 已触发过减仓则跳过
+    # 去重：同一个 generated_at 已触发过减仓则跳过,为False则表示没有触发过减仓
     duplicate = bool(
         reduce_amount > 0
         and guard.get("generated_at")
@@ -432,17 +436,20 @@ def evaluate_position_reduction(
     else:
         shadow_action = "would_hold"
     return {
-        "should_reduce": should_reduce,
+        "should_reduce": should_reduce,  # 是否实际执行减仓：触发 + 非去重 + 模式与总开关允许
+        # 实际动作：reduce=已减仓, log_only=log模式仅记录未减, hold=不减仓
         "actual_action": "reduce" if should_reduce else ("log_only" if config.mode == "log" else "hold"),
+        # 影子动作：不受模式与去重影响，反映本应执行的动作（用于 log 模式干跑评估）
         "shadow_action": shadow_action,
+        # 触发原因：opposite_explicit_signal=AI明确反向信号, risk_multiplier=风险系数要求减仓, none=未触发
         "trigger": trigger,
-        "opposite_explicit_signal": opposite,
-        "current_ratio": current_ratio,
-        "target_ratio": target_ratio,
-        "target_amount": target_amount,
-        "reduce_amount": reduce_amount,
-        "duplicate": duplicate,
-        "reason": trigger if triggered else "reduction conditions not met",
+        "opposite_explicit_signal": opposite,  # 是否与 AI 明确反向信号冲突
+        "current_ratio": current_ratio,  # 当前仓位占初始仓位的比例
+        "target_ratio": target_ratio,  # 目标保留比例：不低于 retained_ratio_floor 安全底线
+        "target_amount": target_amount,  # 目标保留数量 = 初始数量 × target_ratio
+        "reduce_amount": reduce_amount,  # 应减仓数量 = 当前数量 - 目标保留数量（未触发时为 0）
+        "duplicate": duplicate,  # 同一条 bias 已触发过减仓，去重跳过
+        "reason": trigger if triggered else "reduction conditions not met",  # 决策原因：触发类型或条件未满足
     }
 
 

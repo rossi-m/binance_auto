@@ -128,7 +128,6 @@ MAIN_LOOP_ERROR_SLEEP_SECONDS = 5  # 主循环遇到顶层异常后，先休息5
 HEARTBEAT_INTERVAL_SECONDS = 15 * 60  # 每15分钟输出一次心跳日志，方便判断进程是否还活着
 MAX_SIGNAL_BAR_STALENESS_SECONDS = 45 * 60  # 15M信号K线最多允许落后45分钟，防止交易所/测试网返回旧K线
 DRY_RUN_OPEN_ORDER = False  # 运行时 dry-run 开关；开启后只走信号流程，不实际创建开仓订单。
-
 # --- TradingAgents AI research guard ---
 # 默认 off，且减仓/全平/反手都有独立关闭开关。配置错误会阻止程序启动，避免误用宽松默认值。
 AI_RESEARCH_CONFIG = load_ai_research_config()
@@ -357,13 +356,13 @@ trade_state = {
     'max_seen_bar_15m': '',       # 运行期间见过的最大15M信号时间，防止接口回跳旧K线后被当成新信号
     'position_miss_count': 0,  # 连续几轮未在交易所查到仓位，用于避免误判“外部平仓”
     'ai_snapshot_json': '',  # 最近一次与该仓位关联的AI快照
-    'ai_last_reduce_generated_at': '',  # 上一次成功AI减仓对应的generated_at，用于幂等
-    'ai_last_reduce_target_ratio': 1.0,
-    'ai_partial_reduce_count': 0,
-    'ai_partial_reduce_amount': 0.0,
-    'ai_partial_reduce_realized_pnl': 0.0,
-    'ai_partial_reduce_fee': 0.0,
-    'ai_reduce_reasons': []
+    'ai_last_reduce_generated_at': '',       # 上一次成功 AI 减仓对应的 bias generated_at，用于去重（同一条 bias 不重复触发）
+    'ai_last_reduce_target_ratio': 1.0,      # 上一次 AI 建议的目标仓位比例（1.0=不减仓）
+    'ai_partial_reduce_count': 0,            # 本次持仓期间已执行的 AI 减仓次数
+    'ai_partial_reduce_amount': 0.0,         # 累计已减仓数量
+    'ai_partial_reduce_realized_pnl': 0.0,   # 累计减仓产生的平仓盈亏点数
+    'ai_partial_reduce_fee': 0.0,            # 累计减仓手续费（USDT）
+    'ai_reduce_reasons': []                  # 每次减仓的原因记录列表（AI 反向信号/风险系数等）
 }
 sr_breakout_failure_cooldowns = {
     'side': {},
@@ -413,7 +412,7 @@ AI_GUARD_SNAPSHOT_FIELDS = (
     'valid', 'fail_open', 'error', 'symbol', 'generated_at', 'expires_at',
     'portfolio_stance', 'futures_bias', 'time_horizon_hours',
     'explicit_long_signal', 'explicit_short_signal', 'confidence',
-    'allow_long', 'allow_short', 'risk_multiplier', 'reason'
+    'allo_wlong', 'allow_short', 'risk_multiplier', 'reason'
 )
 
 
@@ -3080,9 +3079,11 @@ def manage_pending_entry(context, signal_bar_15m='', perf=None):
         # 订单已死亡且未成交，直接清空本地pending状态
         clear_pending_entry_state(f"pending 入场单已结束: status={status}")
         return f'pending_entry_{status}'
-
+    # AI评估pending入场
     ai_guard = get_current_ai_guard()
+    # AI评估结果
     ai_pending_decision = evaluate_entry_candidate(side, ai_guard, AI_RESEARCH_CONFIG)
+    # AI是否建议取消pending
     ai_pending_should_cancel = bool(
         AI_RESEARCH_CONFIG.mode == 'manage'
         and ai_pending_decision.get('shadow_action') == 'would_filter'
@@ -3186,229 +3187,6 @@ def sync_pending_entry_fill_if_needed(signal_bar_15m=''):
 # ==========================================
 # 3. 核心逻辑：趋势、入场、监控
 # ==========================================
-
-def open_order(side, price, sl_price, state_4h, state_1h, state_15m, signal_bar_15m, entry_reason='trend', entry_trigger_tf='', entry_meta=None):
-    """执行开仓指令"""
-    global trade_state
-    entry_meta = entry_meta or {}
-    if DRY_RUN_OPEN_ORDER:
-        logging.warning(
-            "DRY_RUN_OPEN_ORDER: 已拦截开仓 side=%s, price=%s, stop=%s, signal_bar_15m=%s, "
-            "reason=%s, trigger_tf=%s, entry_meta=%s",
-            side,
-            price,
-            sl_price,
-            signal_bar_15m,
-            entry_reason,
-            entry_trigger_tf,
-            entry_meta
-        )
-        return False
-
-    amount = calculate_amount(price)
-    amount = float(amount)
-    if amount == 0:
-        return False
-    open_order_id = ''
-
-    # 开仓前先用“保守估算强平价”预校验止损，防止止损本来就落到强平外面
-    estimated_safe_stop, estimated_stop_meta = ensure_stop_price_safe(price, sl_price, side, liquidation_price=None)
-    if not stop_price_is_still_valid(price, estimated_safe_stop, side):
-        logging.warning(
-            f"拒绝开仓：预估强平价过近，止损无效 side={side}, "
-            f"entry={price}, stop={sl_price}, adjusted_stop={estimated_safe_stop}, meta={estimated_stop_meta}"
-        )
-        send_msg(
-            "ETH交易: ⚠️开仓已拒绝",
-            f"原因: 止损价可能落在强平价外侧\n方向: {side}\n原始止损: {sl_price}\n"
-            f"修正后止损: {estimated_safe_stop}\n估算强平价: {estimated_stop_meta.get('liquidation_price')}"
-        )
-        return False
-
-    try:
-        # 获取开仓前的可用余额，用于后续平仓时计算精确净利润
-        balance_before = exchange.fetch_balance({'type': 'future'})
-        initial_usdt = float(balance_before['total']['USDT'])
-        
-        # 设置杠杆
-        exchange.set_leverage(LEVERAGE, SYMBOL)
-
-        # 市价单开仓
-        order_side = 'buy' if side == 'long' else 'sell'
-        order = exchange.create_market_order(SYMBOL, order_side, amount)
-        open_order_id = extract_order_id(order)
-
-        # 记录实际成交均价 (如有滑点以实际为准)
-        actual_price = order.get('average', price)
-        if actual_price is None or actual_price == 0:
-            actual_price = price
-
-        # 成交后再拿交易所真实仓位风险信息，获取真正的强平价
-        position_risk = get_position_risk(side=side)
-        actual_liquidation_price = None
-        actual_filled_amount = amount
-        if position_risk and not position_risk.get('fetch_failed'):
-            actual_liquidation_price = position_risk['liquidation_price']
-            confirmed_amount = abs(price_to_float(position_risk.get('position_amt')))
-            if confirmed_amount > POSITION_AMT_EPSILON:
-                actual_filled_amount = confirmed_amount
-        actual_safe_stop, actual_stop_meta = ensure_stop_price_safe(actual_price, estimated_safe_stop, side, liquidation_price=actual_liquidation_price)
-        if not stop_price_is_still_valid(actual_price, actual_safe_stop, side):
-            logging.error(
-                f"开仓后发现真实强平价过近，立即撤退 side={side}, entry={actual_price}, "
-                f"stop={actual_safe_stop}, liq={actual_liquidation_price}, meta={actual_stop_meta}"
-            )
-            # 先反向市价平掉刚开的仓位，避免把仓位裸露在强平附近
-            panic_side = 'sell' if side == 'long' else 'buy'
-            panic_close_order = exchange.create_market_order(SYMBOL, panic_side, amount)
-            panic_close_order_id = extract_order_id(panic_close_order)
-            order_id_lines = format_order_id_lines(
-                open_order_id=open_order_id,
-                close_order_id=panic_close_order_id
-            )
-            order_id_suffix = f"\n{order_id_lines}" if order_id_lines else ''
-            send_msg(
-                "ETH交易: ⚠️开仓后立即撤退",
-                f"原因: 真实强平价过近，止损无安全空间\n方向: {side}\n"
-                f"入场价: {actual_price}\n真实强平价: {actual_liquidation_price}\n修正后止损: {actual_safe_stop}"
-                f"{order_id_suffix}"
-            )
-            return False
-
-        target = price_to_float(entry_meta.get('sr_target'))
-        profit_check_atr = price_to_float(entry_meta.get('profit_check_atr'))
-        target_ok, target_reason = target_profit_still_valid(side, actual_price, actual_safe_stop, target, profit_check_atr)
-        if not target_ok:
-            logging.error(f"开仓后发现目标位对实际成交价无效，立即撤退: {target_reason}")
-            panic_side = 'sell' if side == 'long' else 'buy'
-            panic_close_order = exchange.create_market_order(SYMBOL, panic_side, amount)
-            panic_close_order_id = extract_order_id(panic_close_order)
-            order_id_lines = format_order_id_lines(
-                open_order_id=open_order_id,
-                close_order_id=panic_close_order_id
-            )
-            order_id_suffix = f"\n{order_id_lines}" if order_id_lines else ''
-            send_msg(
-                "ETH交易: ⚠️开仓后立即撤退",
-                f"原因: 目标位对实际成交价已无有效利润空间\n方向: {side}\n"
-                f"入场价: {actual_price}\n止损: {actual_safe_stop}\n目标位: {target}\n{target_reason}"
-                f"{order_id_suffix}"
-            )
-            return False
-
-        # 计算开仓手续费 (参考 test.py 方式)
-        taker_fee_rate = get_trading_fee_rate()
-        open_fee = actual_price * actual_filled_amount * taker_fee_rate
-        logging.info(f"开仓手续费估算: {open_fee}")
-
-        # 提取各个级别的具体成立条件字符串
-        def format_cond(state, side_dir):
-            return format_entry_condition_for_mail(state, side_dir, entry_reason)
-
-        def build_cond_str(state, side_dir):
-            condensed = format_cond(state, side_dir)
-            return f"原因:{entry_reason} | {condensed}" if condensed else f"原因:{entry_reason}"
-                
-        # 这三段字符串后面会一起写进 trade_state 和 CSV，方便复盘每次进场的上下文
-        cond_4h_str = build_cond_str(state_4h, side)
-        cond_1h_str = build_cond_str(state_1h, side)
-        cond_15m_str = build_cond_str(state_15m, side)
-        entry_trigger_tf_display = entry_trigger_tf or '4H+1H+15M'
-
-        open_condition_lines = []
-        if format_cond(state_4h, side):
-            open_condition_lines.append(f"4H({state_4h.get('signal_bar_time', '')}): {cond_4h_str}")
-        if format_cond(state_1h, side):
-            open_condition_lines.append(f"1H({state_1h.get('signal_bar_time', '')}): {cond_1h_str}")
-        if format_cond(state_15m, side):
-            open_condition_lines.append(f"15M({state_15m.get('signal_bar_time', '')}): {cond_15m_str}")
-        open_condition_details = '\n'.join(open_condition_lines) if open_condition_lines else f"原因:{entry_reason}"
-        
-        entry_time = get_server_time_str()
-
-        trade_state.update({
-            'has_position': True,
-            'side': side,
-            'entry_price': actual_price,
-            'entry_trigger_price': price_to_float(price),
-            'stop_loss_price': actual_safe_stop,
-            'highest_price': actual_price,
-            'lowest_price': actual_price,
-            'amount': actual_filled_amount,
-            'entry_initial_amount': actual_filled_amount,
-            'entry_time': entry_time,
-            'cond_4h': cond_4h_str,
-            'cond_1h': cond_1h_str,
-            'cond_15m': cond_15m_str,
-            'close_cond_4h': '',
-            'close_cond_1h': '',
-            'close_cond_15m': '',
-            'entry_reason': entry_reason,
-            'entry_trigger_tf': entry_trigger_tf_display,
-            'entry_strategy_tf': entry_meta.get('strategy_tf', ''),
-            'entry_exit_tf': entry_meta.get('exit_tf', ''),
-            'entry_module': entry_meta.get('module', ''),
-            'entry_sr_breakout_key': entry_meta.get('sr_breakout_key', ''),
-            'entry_sr_target': float(entry_meta.get('sr_target', 0.0) or 0.0),
-            'entry_initial_risk': abs(float(actual_price) - float(actual_safe_stop)),
-            'initial_balance': initial_usdt,
-            'open_fee': open_fee,
-            'open_order_id': open_order_id,
-            'close_order_id': '',
-            'liquidation_price': actual_liquidation_price or 0.0,
-            'stop_order_id': '',
-            'stop_order_price': 0.0,
-            'stop_order_refresh_fail_count': 0,
-            'last_stop_order_refresh_error': '',
-            'entry_signal_bar_15m': signal_bar_15m,
-            'last_entry_bar_15m': signal_bar_15m,
-            'position_miss_count': 0,
-            'ai_snapshot_json': entry_meta.get('ai_snapshot_json', ''),
-            'ai_last_reduce_generated_at': '',
-            'ai_last_reduce_target_ratio': 1.0,
-            'ai_partial_reduce_count': 0,
-            'ai_partial_reduce_amount': 0.0,
-            'ai_partial_reduce_realized_pnl': 0.0,
-            'ai_partial_reduce_fee': 0.0,
-            'ai_reduce_reasons': []
-        })
-
-        # 开仓成功后立刻把服务端止损单挂上，真正的触发由交易所负责，不依赖本地轮询
-        if not refresh_protective_stop_order(actual_safe_stop):
-            logging.error("服务端止损单挂单失败，立即主动平仓避免裸奔风险")
-            close_position("服务端止损挂单失败，主动平仓", curr_price=actual_price, signal_bar_15m=signal_bar_15m, trigger_label="服务端止损挂单失败")
-            return False
-
-        order_id_lines = format_order_id_lines(
-            open_order_id=open_order_id,
-            stop_order_id=trade_state.get('stop_order_id', '')
-        )
-        order_id_suffix = f"\n{order_id_lines}" if order_id_lines else ''
-        msg = (f"🚀 【已开仓】\n方向: {side}\n入场价: {actual_price}\n"
-               f"入场触发价: {trade_state.get('entry_trigger_price', 0)}\n"
-               f"止损价: {actual_safe_stop}\n强平价: {actual_liquidation_price}\n数量: {actual_filled_amount}\n"
-               f"杠杆: {LEVERAGE}x\n开仓前账户资金(USDT): {initial_usdt:.4f}\n入场原因: {entry_reason}\n触发周期: {entry_trigger_tf_display}\n15M信号时间: {signal_bar_15m}\n"
-               f"开仓条件明细:\n{open_condition_details}"
-               f"{order_id_suffix}")
-        send_msg(f"ETH交易: 开仓 {side}", msg)
-        logging.info(
-            f"开仓成功: {side} at {actual_price}, SL: {actual_safe_stop}, "
-            f"liq={actual_liquidation_price}, reason={entry_reason}, "
-            f"open_order_id={open_order_id}, stop_order_id={trade_state.get('stop_order_id', '')}, stop_meta={actual_stop_meta}"
-        )
-        return True
-
-    except Exception as e:
-        error_msg = f"开仓失败: {e}"
-        order_id_lines = format_order_id_lines(open_order_id=open_order_id)
-        if order_id_lines:
-            error_msg = f"{error_msg}\n{order_id_lines}"
-        logging.error(error_msg)
-        logging.error(traceback.format_exc())
-        # 可以加上邮件通知
-        send_msg("ETH交易: ⚠️开仓失败警告", error_msg)
-        return False
-
 
 def close_position(reason, curr_price=None, signal_bar_15m='', trigger_label=''):
     """执行平仓指令"""
@@ -5492,6 +5270,8 @@ def ai_reduce_existing_position(position_risk, decision, guard, signal_bar_15m='
     current_amount = abs(price_to_float(position_risk.get('position_amt')))
     info = position_risk.get('info') if isinstance(position_risk.get('info'), dict) else {}
     raw_position_side = str(info.get('positionSide', 'BOTH') or 'BOTH').upper()
+    # 单边模式（BOTH）：账户只有多头 OR 空头，reduceOnly: True 会正确减少现有方向仓位
+    # 对冲模式（LONG/SHORT）：账户可同时有双向仓位，Binance API 对 reduceOnly 的行为不同步——可能"只允许平仓不允许部分减仓"，或者需要额外参数指定减少哪个方向的仓位
     if raw_position_side in ('LONG', 'SHORT'):
         logging.warning("AI减仓暂不支持Binance对冲持仓模式，本轮跳过: positionSide=%s", raw_position_side)
         write_ai_audit(
@@ -5510,10 +5290,12 @@ def ai_reduce_existing_position(position_risk, decision, guard, signal_bar_15m='
 
     requested_amount = min(current_amount, price_to_float(decision.get('reduce_amount')))
     try:
+        # 精度处理
         reduce_amount = float(exchange.amount_to_precision(SYMBOL, requested_amount))
     except Exception as e:
         logging.warning(f"AI减仓数量精度处理失败，本轮跳过: {e}")
         return position_risk
+    # 检查减仓数量是否低于交易所最小值
     min_amount = exchange_min_amount()
     if reduce_amount <= POSITION_AMT_EPSILON or (min_amount > 0 and reduce_amount < min_amount):
         logging.info(
@@ -5553,23 +5335,29 @@ def ai_reduce_existing_position(position_risk, decision, guard, signal_bar_15m='
         )
         return position_risk
 
+    
     order_id = extract_order_id(order)
+    # 获取减仓数量
     reported_fill = extract_order_filled_amount(order)
     fallback_reduced_amount = reported_fill if reported_fill > POSITION_AMT_EPSILON else reduce_amount
+    # 计算减仓后剩余仓位
     expected_remaining = max(0.0, current_amount - fallback_reduced_amount)
     confirmed_position = None
     position_confirmed = False
-    for confirm_delay in (0.0, 0.2, 0.5):
+    # 等待减仓确认
+    for confirm_delay in (0.0, 0.5, 1):
         if confirm_delay > 0:
             time.sleep(confirm_delay)
         candidate_position = get_position_risk(side=side)
         if not candidate_position or candidate_position.get('fetch_failed'):
             continue
+        # 检查仓位是否减少
         candidate_amount = abs(price_to_float(candidate_position.get('position_amt')))
         if POSITION_AMT_EPSILON < candidate_amount < current_amount - POSITION_AMT_EPSILON:
             confirmed_position = candidate_position
             position_confirmed = True
             break
+    # 获取减仓后剩余仓位
     remaining_amount = (
         abs(price_to_float(confirmed_position.get('position_amt')))
         if position_confirmed
@@ -5580,29 +5368,40 @@ def ai_reduce_existing_position(position_risk, decision, guard, signal_bar_15m='
         actual_reduced_amount = fallback_reduced_amount
         remaining_amount = expected_remaining
 
+    # 计算减仓价格和手续费
     reduce_price = price_to_float(order.get('average')) if isinstance(order, dict) else 0.0
     if reduce_price <= 0:
         reduce_price = price_to_float(position_risk.get('mark_price'))
     if reduce_price <= 0:
         reduce_price = price_to_float(trade_state.get('entry_price'))
     fee_rate = get_trading_fee_rate()
+    # 计算减仓手续费
     reduce_fee = reduce_price * actual_reduced_amount * fee_rate
     entry_price = price_to_float(trade_state.get('entry_price'))
+    # 计算减仓已实现盈亏
     if side == 'long':
         realized_pnl = (reduce_price - entry_price) * actual_reduced_amount
     else:
         realized_pnl = (entry_price - reduce_price) * actual_reduced_amount
 
+    # 更新仓位信息
     trade_state['amount'] = remaining_amount
+    # 累加减仓手续费
     trade_state['open_fee'] = price_to_float(trade_state.get('open_fee')) + reduce_fee
+    # 更新AI保护止损快照
     trade_state['ai_snapshot_json'] = json.dumps(ai_guard_snapshot(guard), ensure_ascii=False, default=str)
     trade_state['ai_last_reduce_generated_at'] = guard.get('generated_at', '')
+    # 更新AI减仓目标比例
     trade_state['ai_last_reduce_target_ratio'] = price_to_float(decision.get('target_ratio'))
+    # 更新AI减仓次数
     trade_state['ai_partial_reduce_count'] = int(trade_state.get('ai_partial_reduce_count', 0) or 0) + 1
+    # 累加减仓数量
     trade_state['ai_partial_reduce_amount'] = price_to_float(trade_state.get('ai_partial_reduce_amount')) + actual_reduced_amount
+    # 累加减仓已实现盈亏
     trade_state['ai_partial_reduce_realized_pnl'] = (
         price_to_float(trade_state.get('ai_partial_reduce_realized_pnl')) + realized_pnl
     )
+    # 累加减仓手续费
     trade_state['ai_partial_reduce_fee'] = price_to_float(trade_state.get('ai_partial_reduce_fee')) + reduce_fee
     reasons = list(trade_state.get('ai_reduce_reasons') or [])
     reasons.append({
@@ -5617,6 +5416,7 @@ def ai_reduce_existing_position(position_risk, decision, guard, signal_bar_15m='
     stop_price = price_to_float(trade_state.get('stop_loss_price'))
     stop_refreshed = False
     if stop_price > 0:
+        # 刷新保护止损订单
         stop_refreshed = refresh_protective_stop_order(stop_price)
         if not stop_refreshed:
             handle_stop_order_refresh_failure(
@@ -5705,6 +5505,7 @@ def apply_ai_position_guard(position_risk, signal_bar_15m=''):
             f"{decision.get('shadow_action')}:{decision.get('target_ratio')}"
         )
     )
+    # 不需要减仓
     if not decision.get('should_reduce'):
         return position_risk
     return ai_reduce_existing_position(position_risk, decision, guard, signal_bar_15m=signal_bar_15m)
