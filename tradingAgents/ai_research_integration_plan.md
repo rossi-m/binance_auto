@@ -1131,18 +1131,18 @@ retained_ratio_floor = max(
 )
 ~~~
 
-当前默认值的结果：
+当前默认值的结果（所有参数都是 0.5）：
 
 ~~~text
-max(0.75, 1.0 - 0.25) = 0.75
+max(0.5, 1.0 - 0.5) = 0.5
 ~~~
 
 初始成交 `1.00 ETH` 时：
 
 ~~~text
 risk_multiplier=0.80：目标保留 0.80 ETH，最多减 0.20 ETH。
-明确反向信号且 risk_multiplier=1.00：按反向信号默认比例，目标保留 0.75 ETH。
-risk_multiplier=0.50：受最低保留比例限制，仍只能减到 0.75 ETH。
+明确反向信号且 risk_multiplier=1.00：按反向信号默认比例，目标保留 0.50 ETH。
+risk_multiplier=0.50：受最低保留比例限制，仍可减到 0.50 ETH。
 仓位已经低于目标：不补仓，也不继续减仓。
 ~~~
 
@@ -1155,6 +1155,7 @@ JSON 合法且未过期
 confidence >= AI_REDUCE_MIN_CONFIDENCE
 出现明确反向信号，或 risk_multiplier 低于当前持仓比例
 交易所真实仓位查询成功
+同一个 generated_at 尚未执行过减仓
 ~~~
 
 #### 15.2.4 开关优先级
@@ -1393,20 +1394,28 @@ AI 不能直接提供任意 stop 价格。
 reduce_position_fraction(fraction, reason, ai_guard)
 ~~~
 
-安全流程：
+安全流程（Binance 单边走仓模式）：
 
 ~~~text
 1. 重新调用 get_position_risk() 获取交易所真实仓位。
-2. 获取实际 side 和实际 position amount，不能只信本地 trade_state。
-3. fraction 限制在 0 到 AI_MAX_POSITION_REDUCTION。
-4. reduce amount 按交易所精度处理并检查最小数量。
-5. 使用持仓反方向 MARKET 订单。
-6. params 必须包含 reduceOnly=true。
-7. hedge 模式下必须沿用交易所真实仓位的 positionSide。
-8. 不允许 closePosition 和 reduceOnly 混用。
-9. 成交后重新读取真实剩余仓位。
-10. 撤销旧保护止损，并按剩余数量重新挂 STOP_MARKET。
-11. 更新 trade_state.amount、手续费、累计已减仓数量和通知日志。
+2. 获取实际 side 和 actual position amount，不能只信本地 trade_state。
+3. raw_position_side = info.get('positionSide', 'BOTH').upper()
+   * raw_position_side == 'BOTH': 单边走仓模式，可执行 reduceOnly。
+   * raw_position_side in ('LONG', 'SHORT'): **对冲持仓模式，当前不支持！**
+4. fraction 限制在 0 到 AI_MAX_POSITION_REDUCTION。
+5. reduce amount 按交易所精度处理并检查最小数量。
+6. 使用持仓反方向 MARKET 订单。
+7. params 必须包含 reduceOnly=true。
+8. ⚠️ **对冲模式跳过**：raw_position_side in ('LONG', 'SHORT') 时直接返回，不执行减仓。
+9. 不允许 closePosition 和 reduceOnly 混用。
+10. 成交后重新读取真实剩余仓位。
+11. 撤销旧保护止损，并按剩余数量重新挂 STOP_MARKET。
+12. 更新 trade_state.amount、手续费、累计已减仓数量和通知日志。
+
+⚠️ 重要限制：
+  * Binance 对冲模式下，reduceOnly 的行为不同步，可能需要额外参数指定减少哪个方向的仓位。
+  * 当前实现仅支持单边走仓模式（positionSide=BOTH），对冲模式下一律跳过并记录日志。
+  * 如需支持对冲模式，需重构减仓逻辑，明确指定 LONG/SHORT 方向分别处理。
 ~~~
 
 示例：
@@ -1491,34 +1500,171 @@ reduce_amount = max(0.0, actual_amount - target_amount)
   目标比例取 risk_multiplier 与 AI_REVERSE_SIGNAL_RETAINED_POSITION_RATIO 中更小者。
 
 触发 B：AI 明确要求缩紧持仓
-  risk_multiplier < current_ratio。
+  risk_multiplier < current_ratio（当前仓位超过 AI 建议的目标保留比例）。
   confidence >= AI_REDUCE_MIN_CONFIDENCE。
   不解析 reason 文本，只读取结构化 risk_multiplier。
+
+共同条件（必须同时满足 ALL）：
+  AI guard 有效且未过期（valid=True，未超过 expires_at）。
+  JSON 解析成功，required fields 齐全。
+  AI_RESEARCH_MODE = reduce、filter_reduce 或 manage。
+  AI_ALLOW_POSITION_REDUCTION = 1。
+  triggered = valid AND threshold_met AND (opposite OR risk_requests_reduction) 为 True。
+  同一个 generated_at 尚未执行过减仓（去重检查通过）。
+  交易所仓位查询成功（position_amt > 0）。
+  reduce_amount = max(0.0, current_amount - target_amount) > POSITION_AMT_EPSILON。
+  reduce_amount < current_amount - POSITION_AMT_EPSILON（不会导致全平）。
+
+注意：
+  * triggered 必须同时满足三个子条件，缺一不可。
+  * 同一个 generated_at 只能触发一次减仓，即使后续 bias 的 risk_multiplier 更激进。
+  * 减仓后不会自动补仓，risk_multiplier 回升时维持低位不变。
 ~~~
 
-共同条件：
+当前默认配置：
 
 ~~~text
-AI_RESEARCH_MODE = reduce、filter_reduce 或 manage。
-AI_ALLOW_POSITION_REDUCTION = 1。
-AI guard 有效且未过期。
-同一个 generated_at 尚未执行过减仓。
-交易所仓位和本地仓位同步成功。
-~~~
+AI_REVERSE_SIGNAL_RETAINED_POSITION_RATIO=0.5
+AI_MIN_RETAINED_POSITION_RATIO=0.5
+AI_MAX_POSITION_REDUCTION=0.5
+→ retained_ratio_floor = max(0.5, 1-0.5) = 0.5
 
-首次启用 AI_MIN_RETAINED_POSITION_RATIO=0.75，即累计最多减掉初始仓位的 25%，不能因为 AI 直接清仓。
+初始成交 1.00 ETH 时：
+  risk_multiplier=0.80：目标保留 0.80 ETH，最多减 0.20 ETH。
+  明确反向信号且 risk_multiplier=1.00：按反向信号默认比例，目标保留 0.50 ETH。
+  risk_multiplier=0.50：受最低保留比例限制，仍可减到 0.50 ETH。
+  仓位已经低于目标：不补仓，也不继续减仓。
 
-当前交易 CSV 是在完整平仓时计算总余额差。加入部分减仓后必须新增字段：
+真正执行部分减仓必须同时满足：
 
 ~~~text
-partial_reduce_count
-partial_reduce_amount
-partial_reduce_realized_pnl
-partial_reduce_fee
-ai_reduce_reasons
-~~~
+AI_RESEARCH_MODE = reduce 或 manage
+AI_ALLOW_POSITION_REDUCTION = 1
+JSON 合法且未过期
+confidence >= AI_REDUCE_MIN_CONFIDENCE
+出现明确反向信号，或 risk_multiplier 低于当前持仓比例
+交易所真实仓位查询成功
+同一个 generated_at 尚未执行过减仓
 
-在这些记账字段完成前，不得启用主动部分减仓。
+首次启用 AI_MIN_RETAINED_POSITION_RATIO=0.5，即累计最多减掉初始仓位的 50%，不能因为 AI 直接清仓。
+
+### 15.8.1 ai_reduce_existing_position 函数实现细节
+
+这是实际执行 reduceOnly 市价减仓的核心函数，位于 `bian_new.py` L5266-5390。
+
+#### 完整执行流程
+
+~~~text
+输入参数：
+  position_risk: 当前持仓信息（含 side、position_amt、info.positionSide）
+  decision: AI 决策结果（含 reduce_amount、target_ratio 等）
+  guard: AI bias JSON 原始数据
+  signal_bar_15m: 15 分钟 K 线信号条（可选）
+
+步骤 1：校验持仓模式
+  raw_position_side = info.get('positionSide', 'BOTH').upper()
+  if raw_position_side in ('LONG', 'SHORT'):
+    记录日志 "AI 减仓暂不支持 Binance 对冲持仓模式"
+    跳过本轮减仓，返回 position_risk
+
+步骤 2：计算实际减仓数量
+  current_amount = abs(price_to_float(position_risk.get('position_amt')))
+  requested_amount = min(current_amount, price_to_float(decision.get('reduce_amount')))
+  
+  try:
+    reduce_amount = float(exchange.amount_to_precision(SYMBOL, requested_amount))
+  except Exception as e:
+    记录精度处理失败日志，跳过
+  
+  min_amount = exchange_min_amount()  # 读取交易对最小下单量
+  if reduce_amount <= POSITION_AMT_EPSILON or reduce_amount < min_amount:
+    记录 "数量低于最小值" 日志，跳过
+  
+  if reduce_amount >= current_amount - POSITION_AMT_EPSILON:
+    记录 "可能导致全平" 错误日志，拒绝执行
+
+步骤 3：执行 reduceOnly 市价单
+  order_side = 'sell' if side == 'long' else 'buy'
+  try:
+    order = exchange.create_order(
+      SYMBOL,
+      'market',
+      order_side,
+      reduce_amount,
+      None,
+      {'reduceOnly': True}
+    )
+  except Exception as e:
+    记录订单失败日志，写 audit event，返回
+
+步骤 4：快速确认成交（最多等待 1 秒）
+  reported_fill = extract_order_filled_amount(order)  # 从订单响应中获取成交数量
+  fallback_reduced_amount = reported_fill if reported_fill > EPSILON else reduce_amount
+  expected_remaining = max(0.0, current_amount - fallback_reduced_amount)
+  confirmed_position = None
+  position_confirmed = False
+  
+  for confirm_delay in (0.0, 0.5, 1):
+    if confirm_delay > 0: time.sleep(confirm_delay)
+    candidate_position = get_position_risk(side=side)
+    if not candidate_position: continue
+    candidate_amount = abs(price_to_float(candidate_position.get('position_amt')))
+    if EPSILON < candidate_amount < current_amount - EPSILON:
+      confirmed_position = candidate_position
+      position_confirmed = True
+      break
+
+步骤 5：确定实际减仓数量和剩余仓位
+  remaining_amount = (
+    abs(price_to_float(confirmed_position.get('position_amt')))
+    if position_confirmed else expected_remaining
+  )
+  actual_reduced_amount = max(0.0, current_amount - remaining_amount)
+  
+  if actual_reduced_amount <= POSITION_AMT_EPSILON:
+    actual_reduced_amount = fallback_reduced_amount  # fallback 到订单响应
+    remaining_amount = expected_remaining
+
+步骤 6：计算减仓价格和手续费
+  reduce_price = price_to_float(order.get('average')) if order.average else mark_price or entry_price
+  fee_rate = get_trading_fee_rate()
+  reduce_fee = reduce_price * actual_reduced_amount * fee_rate
+
+步骤 7：计算减仓已实现盈亏
+  entry_price = price_to_float(trade_state.get('entry_price'))
+  if side == 'long':
+    realized_pnl = (reduce_price - entry_price) * actual_reduced_amount
+  else:
+    realized_pnl = (entry_price - reduce_price) * actual_reduced_amount
+
+步骤 8：更新 trade_state 字段
+  trade_state['amount'] = remaining_amount  # 剩余仓位
+  trade_state['open_fee'] += reduce_fee     # 累加手续费
+  trade_state['ai_snapshot_json'] = json.dumps(ai_guard_snapshot(guard))
+  trade_state['ai_last_reduce_generated_at'] = guard.get('generated_at', '')
+  trade_state['ai_last_reduce_target_ratio'] = price_to_float(decision.get('target_ratio'))
+  trade_state['ai_partial_reduce_count'] += 1
+  trade_state['ai_partial_reduce_amount'] += actual_reduced_amount
+  trade_state['ai_partial_reduce_realized_pnl'] += realized_pnl
+  trade_state['ai_partial_reduce_fee'] += reduce_fee
+  trade_state['ai_reduce_reasons'].append({...})
+
+步骤 9：刷新保护止损订单
+  stop_price = price_to_float(trade_state.get('stop_loss_price'))
+  if stop_price > 0:
+    refresh_protective_stop_order(stop_price)  # 按剩余仓位重新挂单
+
+输出：
+  返回更新后的 position_risk（含最新仓位信息）
+
+关键特性：
+  * 只支持单边走仓模式（BOTH），对冲模式直接跳过
+  * 精度处理和最小量检查保证订单合法性
+  * 快速确认流程最多等待 1 秒，不阻塞主循环
+  * Fallback 机制：如果 1 秒内没读到新仓位，用订单响应的成交数量推算
+  * 记账字段累加：每次减仓都更新 count、amount、pnl、fee
+  * 止损重挂：减仓后必须按剩余数量刷新保护止损
+~~~
 
 ### 15.9 全量平仓方案（当前未实现）
 
