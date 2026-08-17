@@ -393,6 +393,49 @@ body::before {
     gap: 1rem;
 }
 
+.stats-source-filter {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 0.9rem 1rem;
+    border: 1px solid var(--border-inner);
+    border-radius: var(--radius-lg);
+    background: var(--bg-inner);
+}
+
+.stats-source-title {
+    color: var(--text-primary);
+    font-weight: 700;
+}
+
+.source-filter-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.55rem;
+    color: var(--text-muted);
+    font-size: 0.8rem;
+    font-weight: 600;
+}
+
+.source-filter-label select {
+    min-width: 8rem;
+    min-height: 2.75rem;
+    padding: 0.5rem 0.75rem;
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    background: var(--bg-stat);
+    color: var(--text-primary);
+    cursor: pointer;
+    outline: none;
+}
+
+.source-filter-label select:focus-visible {
+    border-color: #3b82f6;
+    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.22);
+}
+
 .stat-item {
     padding: 1rem;
     border-radius: var(--radius-lg);
@@ -786,6 +829,33 @@ tbody tr:hover {
     color: #fca5a5;
 }
 
+.trade-badge.source-strategy {
+    background: rgba(59, 130, 246, 0.14);
+    border-color: rgba(59, 130, 246, 0.28);
+    color: #93c5fd;
+}
+
+.trade-badge.source-manual {
+    background: rgba(245, 158, 11, 0.14);
+    border-color: rgba(245, 158, 11, 0.3);
+    color: #fcd34d;
+}
+
+.trade-badge.symbol {
+    background: var(--bg-inner);
+    border-color: var(--border-strong);
+    color: var(--text-secondary);
+    font-variant-numeric: tabular-nums;
+}
+
+[data-theme="light"] .trade-badge.source-strategy {
+    color: #1d4ed8;
+}
+
+[data-theme="light"] .trade-badge.source-manual {
+    color: #92400e;
+}
+
 .trade-pnl {
     text-align: right;
     font-size: 1.2rem;
@@ -1116,6 +1186,21 @@ tbody tr:hover {
 
     .stats {
         gap: 0.65rem;
+    }
+
+    .stats-source-filter {
+        align-items: flex-start;
+        flex-direction: column;
+        gap: 0.7rem;
+    }
+
+    .source-filter-label {
+        width: 100%;
+        justify-content: space-between;
+    }
+
+    .source-filter-label select {
+        min-width: 9rem;
     }
 
     .stat-item {

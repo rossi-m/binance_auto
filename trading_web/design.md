@@ -9,7 +9,7 @@
 - **图表**: Chart.js v4 (CDN)
 - **进程管理**: `subprocess.Popen` + `threading`
 - **实时日志**: Server-Sent Events (SSE)
-- **数据源**: `trades_log_YYYY-MM.csv` + `trade_stats.db`（SQLite 日收益汇总）
+- **数据源**: `trades_log_YYYY-MM.csv`（策略）+ `manual_trades_log_YYYY-MM.csv`（手动）+ `trade_stats.db`
 
 ## 3. 功能模块
 
@@ -20,6 +20,7 @@
 - 日志面板自动滚动，鼠标悬停可暂停
 
 ### 3.2 收益统计
+- **来源筛选**: 全部 / 策略 / 手动，收益卡片、汇总、曲线和交易记录保持同一口径
 - **当天收益**: 从 SQLite 日收益汇总读取今日 `净利润(USDT)` 聚合值
 - **本月折线图**: 按日聚合当月净利润，Chart.js 渲染
 - **整体收益**: 跨所有历史日收益数据的净利润累计
@@ -28,7 +29,8 @@
 - **交易笔数**: 总笔数 / 今日笔数
 
 ### 3.3 交易记录表格
-- 展示当月 CSV 数据，按平仓时间倒序排列
+- 合并展示当月策略与手动 CSV，按平仓时间倒序排列
+- 展示交易来源与交易对，支持只查看策略或手动交易
 - 列: 建仓时间、趋势方向、入场原因、平仓时间、平仓原因、点数盈亏、手续费、净利润(USDT)、是否盈利、持仓秒数
 - 每2小时自动刷新（前端轮询）
 
@@ -53,8 +55,8 @@
 | GET | `/` | 首页 |
 | GET | `/api/status` | 策略运行状态 JSON |
 | GET | `/api/logs` | SSE 日志流 |
-| GET | `/api/trades` | 当月交易数据 JSON |
-| GET | `/api/stats` | 统计数据 JSON（今日 / 本月 / 本年 / 整体 / 年月汇总 / 曲线） |
+| GET | `/api/trades?source=all\|strategy\|manual` | 当月交易数据 JSON |
+| GET | `/api/stats?source=all\|strategy\|manual` | 统计数据 JSON（今日 / 本月 / 本年 / 整体 / 年月汇总 / 曲线） |
 | POST | `/api/start` | 启动策略 |
 | POST | `/api/pause-request` | 请求暂停验证码 |
 | POST | `/api/pause-verify` | 验证并暂停 |
@@ -69,6 +71,7 @@
 binance/
 ├── bian_auto.py                    # 原策略脚本（不动）
 ├── trades_log_2026-04.csv          # 交易记录 CSV（按月）
+├── manual_trades_log_2026-04.csv   # 手动交易记录 CSV（按月）
 ├── trade_stats.db                  # SQLite 日收益汇总
 ├── .env.local                      # 环境变量（不动）
 └── trading_web/                    # Web 监控台目录
@@ -97,10 +100,11 @@ binance/
 
 ## 8. 数据流
 ```
-trades_log_2026-04.csv  ->  bian_auto.py 平仓时写入
-trade_stats.db          ->  bian_auto.py 同步更新日收益
-CSV 历史文件            ->  trader_web.py 启动/查询时补齐同步到 SQLite
-trade_stats.db          ->  /api/stats 返回今日、本月、本年、整体、年/月汇总和曲线
-当月 CSV                ->  /api/trades 返回原始行
+trades_log_2026-04.csv         ->  bian_new.py 策略平仓时写入
+manual_trades_log_2026-04.csv  ->  bian_new.py 手动仓位确认全平时写入
+trade_stats.db                 ->  bian_new.py 按策略/手动来源更新日收益，并保存未平手动仓位快照
+CSV 历史文件                   ->  trader_web.py 查询时补齐同步到 SQLite
+trade_stats.db                 ->  /api/stats 按来源返回收益、笔数、汇总和曲线
+当月两类 CSV                   ->  /api/trades 合并并按来源筛选
 前端                    ->  渲染表格、汇总列表和 Chart.js 折线图
 ```

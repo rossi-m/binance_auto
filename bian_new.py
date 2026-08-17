@@ -439,6 +439,7 @@ runtime_state = {
 
 # 手动仓位不复用单一 ETH trade_state；每个 symbol + positionSide 独立管理。
 manual_position_states = {}
+manual_position_states_loaded = False
 
 
 # ==========================================
@@ -708,6 +709,12 @@ TRADE_CSV_HEADERS = [
     '平仓时间', '平仓原因', '点数盈亏', '手续费', '净利润(USDT)', '是否盈利',
     '入场15M信号时间', '平仓15M信号时间', '平仓触发周期', '持仓秒数',
     '开仓订单ID', '平仓订单ID'
+]
+MANUAL_TRADE_CSV_HEADERS = [
+    '交易ID', '交易来源', '交易对', '建仓时间', '趋势方向', '仓位模式', '入场原因',
+    '入场触发价', '初始数量', '最大数量', '平仓时间', '平仓均价', '平仓原因',
+    '点数盈亏', '已实现盈亏(USDT)', '手续费', '净利润(USDT)', '是否盈利',
+    '减仓次数', '持仓秒数', '开仓订单ID', '平仓订单ID', '盈亏数据来源'
 ]
 # 旧版 CSV 表头缺少订单ID字段/入场触发价字段，用它识别历史文件并自动补齐新列。
 TRADE_CSV_HEADERS_WITHOUT_TRIGGER_PRICE = [
@@ -1293,16 +1300,16 @@ def calculate_candidate_amount(entry_price, stop_price, candidate=None, account_
     }
 
 
-def get_trading_fee_rate():
+def get_trading_fee_rate(symbol=SYMBOL):
     """获取指定交易对的交易手续费率"""
     try:
         # 使用CCXT标准方法获取指定交易对的费率
-        fee_info = exchange.fetch_trading_fee(SYMBOL)
+        fee_info = exchange.fetch_trading_fee(symbol)
        
         taker_fee_rate = fee_info.get('taker', 0)
         return taker_fee_rate
     except Exception as e:
-        logging.error(f"获取 {SYMBOL} 手续费率失败: {e}，使用默认费率 Maker 0.02%, Taker 0.04%")
+        logging.error(f"获取 {symbol} 手续费率失败: {e}，使用默认费率 Maker 0.02%, Taker 0.04%")
         return  0.0004
 
 
@@ -1639,32 +1646,131 @@ def ensure_stats_db():
             )
             """
         )
+        existing_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(daily_pnl)").fetchall()
+        }
+        for column_name, column_sql in (
+            ('strategy_pnl', 'REAL NOT NULL DEFAULT 0'),
+            ('strategy_trade_count', 'INTEGER NOT NULL DEFAULT 0'),
+            ('manual_pnl', 'REAL NOT NULL DEFAULT 0'),
+            ('manual_trade_count', 'INTEGER NOT NULL DEFAULT 0'),
+        ):
+            if column_name not in existing_columns:
+                conn.execute(f"ALTER TABLE daily_pnl ADD COLUMN {column_name} {column_sql}")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS manual_open_positions (
+                position_key TEXT PRIMARY KEY,
+                state_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
 
 
-def update_daily_pnl_stats(exit_time, net_pnl_usdt):
+def update_daily_pnl_stats(exit_time, net_pnl_usdt, source='strategy'):
     """按平仓日期更新 SQLite 日收益汇总。"""
     if not exit_time or len(exit_time) < 10:
         return
 
     trade_day = exit_time[:10]
     updated_at = datetime.datetime.now().isoformat(timespec='seconds')
+    normalized_source = 'manual' if source == 'manual' else 'strategy'
+    strategy_pnl = float(net_pnl_usdt) if normalized_source == 'strategy' else 0.0
+    strategy_count = 1 if normalized_source == 'strategy' else 0
+    manual_pnl = float(net_pnl_usdt) if normalized_source == 'manual' else 0.0
+    manual_count = 1 if normalized_source == 'manual' else 0
 
     try:
         ensure_stats_db()
         with sqlite3.connect(STATS_DB_PATH) as conn:
             conn.execute(
                 """
-                INSERT INTO daily_pnl (trade_day, pnl, trade_count, updated_at)
-                VALUES (?, ?, 1, ?)
+                INSERT INTO daily_pnl (
+                    trade_day, pnl, trade_count,
+                    strategy_pnl, strategy_trade_count,
+                    manual_pnl, manual_trade_count, updated_at
+                )
+                VALUES (?, ?, 1, ?, ?, ?, ?, ?)
                 ON CONFLICT(trade_day) DO UPDATE SET
                     pnl = daily_pnl.pnl + excluded.pnl,
                     trade_count = daily_pnl.trade_count + 1,
+                    strategy_pnl = daily_pnl.strategy_pnl + excluded.strategy_pnl,
+                    strategy_trade_count = daily_pnl.strategy_trade_count + excluded.strategy_trade_count,
+                    manual_pnl = daily_pnl.manual_pnl + excluded.manual_pnl,
+                    manual_trade_count = daily_pnl.manual_trade_count + excluded.manual_trade_count,
                     updated_at = excluded.updated_at
                 """,
-                (trade_day, float(net_pnl_usdt), updated_at)
+                (
+                    trade_day, float(net_pnl_usdt),
+                    strategy_pnl, strategy_count, manual_pnl, manual_count, updated_at
+                )
             )
     except Exception as e:
         logging.warning(f"写入 SQLite 日收益失败: {e}")
+
+
+def persist_manual_position_state(state):
+    """持久化未平手动仓位，保证脚本重启后仍能补记最终交易。"""
+    position_key_value = str(state.get('key') or '')
+    if not position_key_value:
+        return False
+    try:
+        ensure_stats_db()
+        updated_at = datetime.datetime.now().isoformat(timespec='seconds')
+        state_json = json.dumps(state, ensure_ascii=False, default=str)
+        with sqlite3.connect(STATS_DB_PATH) as conn:
+            conn.execute(
+                """
+                INSERT INTO manual_open_positions (position_key, state_json, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(position_key) DO UPDATE SET
+                    state_json = excluded.state_json,
+                    updated_at = excluded.updated_at
+                """,
+                (position_key_value, state_json, updated_at)
+            )
+        return True
+    except Exception as e:
+        logging.warning(f"持久化手动仓位失败: key={position_key_value}, error={e}")
+        return False
+
+
+def load_persisted_manual_position_states():
+    """加载脚本上次退出前仍未平仓的手动仓位快照。"""
+    restored = {}
+    try:
+        ensure_stats_db()
+        with sqlite3.connect(STATS_DB_PATH) as conn:
+            rows = conn.execute(
+                "SELECT position_key, state_json FROM manual_open_positions"
+            ).fetchall()
+        for position_key_value, state_json in rows:
+            try:
+                state = json.loads(state_json)
+            except Exception:
+                logging.warning(f"忽略无法解析的手动仓位快照: key={position_key_value}")
+                continue
+            if isinstance(state, dict):
+                state['key'] = state.get('key') or position_key_value
+                restored[position_key_value] = state
+    except Exception as e:
+        logging.warning(f"加载手动仓位快照失败: {e}")
+    return restored
+
+
+def delete_persisted_manual_position_state(position_key_value):
+    try:
+        ensure_stats_db()
+        with sqlite3.connect(STATS_DB_PATH) as conn:
+            conn.execute(
+                "DELETE FROM manual_open_positions WHERE position_key = ?",
+                (str(position_key_value),)
+            )
+        return True
+    except Exception as e:
+        logging.warning(f"删除手动仓位快照失败: key={position_key_value}, error={e}")
+        return False
 
 
 def normalize_futures_symbol(symbol):
@@ -5667,6 +5773,338 @@ def build_manual_dynamic_stop(state, position, dfs, now_dt):
     return choose_tightest_stop(side, valid_candidates)
 
 
+def manual_trade_timestamp_ms(trade):
+    if not isinstance(trade, dict):
+        return 0
+    info = trade.get('info', {})
+    if not isinstance(info, dict):
+        info = {}
+    for value in (trade.get('timestamp'), info.get('time'), info.get('T')):
+        try:
+            if value not in (None, ''):
+                return int(value)
+        except Exception:
+            continue
+    return 0
+
+
+def manual_trade_position_matches(state, trade):
+    if not isinstance(trade, dict):
+        return False
+    info = trade.get('info', {})
+    if not isinstance(info, dict):
+        info = {}
+    trade_position_side = str(
+        trade.get('positionSide') or info.get('positionSide') or ''
+    ).strip().upper()
+    expected_position_side = str(state.get('position_side') or 'BOTH').strip().upper()
+    if not trade_position_side:
+        return True
+    if expected_position_side == 'BOTH':
+        return trade_position_side == 'BOTH'
+    return trade_position_side == expected_position_side
+
+
+def manual_trade_fee_usdt(trade):
+    if not isinstance(trade, dict):
+        return 0.0
+    info = trade.get('info', {})
+    if not isinstance(info, dict):
+        info = {}
+    commission = price_to_float(info.get('commission'))
+    if commission:
+        return abs(commission)
+    fee = trade.get('fee', {})
+    if isinstance(fee, dict):
+        return abs(price_to_float(fee.get('cost')))
+    return 0.0
+
+
+def manual_trade_realized_pnl(trade):
+    if not isinstance(trade, dict):
+        return 0.0
+    info = trade.get('info', {})
+    if not isinstance(info, dict):
+        info = {}
+    return price_to_float(info.get('realizedPnl', info.get('realizedProfit', 0)))
+
+
+def manual_trade_order_id(trade):
+    if not isinstance(trade, dict):
+        return ''
+    info = trade.get('info', {})
+    if not isinstance(info, dict):
+        info = {}
+    for value in (trade.get('order'), trade.get('orderId'), info.get('orderId')):
+        if value not in (None, ''):
+            return str(value)
+    return ''
+
+
+def manual_trade_amount(trade):
+    if not isinstance(trade, dict):
+        return 0.0
+    info = trade.get('info', {})
+    if not isinstance(info, dict):
+        info = {}
+    return abs(price_to_float(trade.get('amount', info.get('qty', info.get('quantity', 0)))))
+
+
+def manual_trade_price(trade):
+    if not isinstance(trade, dict):
+        return 0.0
+    info = trade.get('info', {})
+    if not isinstance(info, dict):
+        info = {}
+    return price_to_float(trade.get('price', info.get('price', 0)))
+
+
+def unique_nonempty(values):
+    result = []
+    seen = set()
+    for value in values:
+        normalized = str(value or '')
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(normalized)
+    return result
+
+
+def accumulate_manual_reduction_estimate(state, reduced_amount, reduce_price):
+    reduced_amount = price_to_float(reduced_amount)
+    reduce_price = price_to_float(reduce_price)
+    entry_price = price_to_float(state.get('entry_price'))
+    if reduced_amount <= POSITION_AMT_EPSILON or reduce_price <= 0 or entry_price <= 0:
+        return
+    if state.get('side') == 'long':
+        realized_pnl = (reduce_price - entry_price) * reduced_amount
+    else:
+        realized_pnl = (entry_price - reduce_price) * reduced_amount
+    fee_rate = price_to_float(state.get('fee_rate')) or 0.0004
+    state['estimated_realized_pnl'] = (
+        price_to_float(state.get('estimated_realized_pnl')) + realized_pnl
+    )
+    state['estimated_fee_cost'] = (
+        price_to_float(state.get('estimated_fee_cost')) + reduce_price * reduced_amount * fee_rate
+    )
+    state['reduced_amount'] = price_to_float(state.get('reduced_amount')) + reduced_amount
+    state['reduce_count'] = int(state.get('reduce_count', 0) or 0) + 1
+
+
+def build_manual_trade_fallback_settlement(state, closed_time):
+    exit_price = (
+        price_to_float(state.get('last_mark_price'))
+        or price_to_float(state.get('stop_order_price'))
+        or price_to_float(state.get('entry_price'))
+    )
+    remaining_amount = price_to_float(state.get('amount'))
+    entry_price = price_to_float(state.get('entry_price'))
+    realized_pnl = price_to_float(state.get('estimated_realized_pnl'))
+    fee_cost = price_to_float(state.get('estimated_fee_cost'))
+    if remaining_amount > POSITION_AMT_EPSILON and exit_price > 0 and entry_price > 0:
+        if state.get('side') == 'long':
+            realized_pnl += (exit_price - entry_price) * remaining_amount
+        else:
+            realized_pnl += (entry_price - exit_price) * remaining_amount
+        fee_rate = price_to_float(state.get('fee_rate')) or 0.0004
+        fee_cost += exit_price * remaining_amount * fee_rate
+    pnl_points = (
+        exit_price - entry_price if state.get('side') == 'long'
+        else entry_price - exit_price
+    )
+    return {
+        'exit_time': closed_time,
+        'exit_price': exit_price,
+        'pnl_points': pnl_points,
+        'realized_pnl_usdt': realized_pnl,
+        'fee_cost': fee_cost,
+        'net_pnl_usdt': realized_pnl - fee_cost,
+        'open_order_ids': [],
+        'close_order_ids': [],
+        'data_source': '持仓快照估算',
+    }
+
+
+def fetch_manual_trade_settlement(state, closed_time):
+    """优先用 Binance 成交明细结算手动交易，失败时回退到持仓快照估算。"""
+    detected_dt = parse_bar_time(state.get('detected_time') or state.get('entry_time'))
+    if detected_dt is None:
+        return build_manual_trade_fallback_settlement(state, closed_time)
+    detected_ms = int(detected_dt.timestamp() * 1000)
+    since_ms = max(0, detected_ms - 5 * 60 * 1000)
+    try:
+        trades = exchange.fetch_my_trades(state['symbol'], since_ms, 1000)
+    except Exception as e:
+        logging.warning(f"读取手动仓位成交明细失败，改用估算结算: key={state['key']}, error={e}")
+        return build_manual_trade_fallback_settlement(state, closed_time)
+
+    matching_trades = [
+        trade for trade in trades or []
+        if manual_trade_position_matches(state, trade)
+    ]
+    open_side = 'buy' if state.get('side') == 'long' else 'sell'
+    close_side = 'sell' if state.get('side') == 'long' else 'buy'
+    closing_trades = [
+        trade for trade in matching_trades
+        if str(trade.get('side') or '').lower() == close_side
+        and manual_trade_timestamp_ms(trade) >= detected_ms
+    ]
+    closing_amount = sum(manual_trade_amount(trade) for trade in closing_trades)
+    if closing_amount <= POSITION_AMT_EPSILON:
+        logging.warning(f"手动仓位未找到平仓成交明细，改用估算结算: key={state['key']}")
+        return build_manual_trade_fallback_settlement(state, closed_time)
+
+    pre_detection_opening = sorted(
+        (
+            trade for trade in matching_trades
+            if str(trade.get('side') or '').lower() == open_side
+            and manual_trade_timestamp_ms(trade) <= detected_ms
+        ),
+        key=manual_trade_timestamp_ms,
+        reverse=True,
+    )
+    initial_amount = price_to_float(state.get('initial_amount')) or price_to_float(state.get('amount'))
+    remaining_initial = initial_amount
+    initial_open_fee = 0.0
+    initial_open_orders = []
+    for trade in pre_detection_opening:
+        if remaining_initial <= POSITION_AMT_EPSILON:
+            break
+        trade_amount = manual_trade_amount(trade)
+        if trade_amount <= POSITION_AMT_EPSILON:
+            continue
+        used_amount = min(remaining_initial, trade_amount)
+        initial_open_fee += manual_trade_fee_usdt(trade) * used_amount / trade_amount
+        remaining_initial -= used_amount
+        initial_open_orders.append(manual_trade_order_id(trade))
+
+    fee_rate = price_to_float(state.get('fee_rate')) or 0.0004
+    opening_fee_estimated = remaining_initial > POSITION_AMT_EPSILON
+    if opening_fee_estimated:
+        initial_open_fee += (
+            remaining_initial * price_to_float(state.get('initial_entry_price')) * fee_rate
+        )
+
+    later_opening_trades = [
+        trade for trade in matching_trades
+        if str(trade.get('side') or '').lower() == open_side
+        and manual_trade_timestamp_ms(trade) > detected_ms
+    ]
+    fee_cost = initial_open_fee
+    fee_cost += sum(manual_trade_fee_usdt(trade) for trade in later_opening_trades)
+    fee_cost += sum(manual_trade_fee_usdt(trade) for trade in closing_trades)
+    realized_pnl = sum(manual_trade_realized_pnl(trade) for trade in closing_trades)
+    exit_value = sum(
+        manual_trade_price(trade) * manual_trade_amount(trade) for trade in closing_trades
+    )
+    exit_price = exit_value / closing_amount if closing_amount > 0 else 0.0
+    entry_price = price_to_float(state.get('entry_price'))
+    pnl_points = (
+        exit_price - entry_price if state.get('side') == 'long'
+        else entry_price - exit_price
+    )
+    latest_close_ms = max(manual_trade_timestamp_ms(trade) for trade in closing_trades)
+    exit_time = datetime.datetime.fromtimestamp(
+        latest_close_ms / 1000.0, tz=EXCHANGE_TZ
+    ).strftime(BAR_TIME_FORMAT)
+    return {
+        'exit_time': exit_time or closed_time,
+        'exit_price': exit_price,
+        'pnl_points': pnl_points,
+        'realized_pnl_usdt': realized_pnl,
+        'fee_cost': fee_cost,
+        'net_pnl_usdt': realized_pnl - fee_cost,
+        'open_order_ids': unique_nonempty(
+            initial_open_orders + [manual_trade_order_id(trade) for trade in later_opening_trades]
+        ),
+        'close_order_ids': unique_nonempty(
+            manual_trade_order_id(trade) for trade in closing_trades
+        ),
+        'data_source': (
+            'Binance平仓成交明细（开仓手续费估算）'
+            if opening_fee_estimated else 'Binance成交明细'
+        ),
+    }
+
+
+def manual_trade_csv_contains_id(filename, trade_id):
+    if not os.path.exists(filename):
+        return False
+    try:
+        with open(filename, 'r', newline='', encoding='utf-8-sig') as csv_file:
+            return any(
+                row.get('交易ID') == trade_id for row in csv.DictReader(csv_file)
+            )
+    except Exception as e:
+        logging.warning(f"检查手动交易CSV去重失败: file={filename}, error={e}")
+        return False
+
+
+def log_manual_trade_to_csv(state, settlement, close_reason):
+    exit_time = settlement.get('exit_time') or get_server_time_str()
+    filename = os.path.join(BASE_DIR, f"manual_trades_log_{exit_time[:7]}.csv")
+    trade_id = str(state.get('manual_trade_id') or uuid.uuid4().hex)
+    state['manual_trade_id'] = trade_id
+    if manual_trade_csv_contains_id(filename, trade_id):
+        return True
+    file_exists = os.path.isfile(filename)
+    if file_exists:
+        try:
+            with open(filename, 'r', newline='', encoding='utf-8-sig') as csv_file:
+                header = next(csv.reader(csv_file), [])
+            if header != MANUAL_TRADE_CSV_HEADERS:
+                logging.error(f"手动交易CSV表头不兼容，拒绝追加: {filename}")
+                return False
+        except Exception as e:
+            logging.error(f"读取手动交易CSV表头失败: file={filename}, error={e}")
+            return False
+
+    net_pnl_usdt = price_to_float(settlement.get('net_pnl_usdt'))
+    entry_time = state.get('detected_time') or state.get('entry_time') or ''
+    row = {
+        '交易ID': trade_id,
+        '交易来源': 'manual',
+        '交易对': state.get('symbol', ''),
+        '建仓时间': entry_time,
+        '趋势方向': state.get('side', ''),
+        '仓位模式': state.get('position_side', 'BOTH'),
+        '入场原因': '手动开仓（脚本检测并接管）',
+        '入场触发价': round(price_to_float(state.get('initial_entry_price')), 8),
+        '初始数量': round(price_to_float(state.get('initial_amount')), 12),
+        '最大数量': round(price_to_float(state.get('max_amount')), 12),
+        '平仓时间': exit_time,
+        '平仓均价': round(price_to_float(settlement.get('exit_price')), 8),
+        '平仓原因': close_reason,
+        '点数盈亏': round(price_to_float(settlement.get('pnl_points')), 8),
+        '已实现盈亏(USDT)': round(price_to_float(settlement.get('realized_pnl_usdt')), 8),
+        '手续费': round(price_to_float(settlement.get('fee_cost')), 8),
+        '净利润(USDT)': round(net_pnl_usdt, 8),
+        '是否盈利': net_pnl_usdt > 0,
+        '减仓次数': int(state.get('reduce_count', 0) or 0),
+        '持仓秒数': compute_holding_seconds(entry_time, exit_time),
+        '开仓订单ID': '|'.join(settlement.get('open_order_ids') or []),
+        '平仓订单ID': '|'.join(settlement.get('close_order_ids') or []),
+        '盈亏数据来源': settlement.get('data_source', ''),
+    }
+    try:
+        with open(filename, mode='a', newline='', encoding='utf-8-sig') as csv_file:
+            writer = csv.DictWriter(csv_file, fieldnames=MANUAL_TRADE_CSV_HEADERS)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(row)
+        update_daily_pnl_stats(exit_time, net_pnl_usdt, source='manual')
+        logging.warning(
+            "手动交易已写入CSV: trade_id=%s symbol=%s net=%s source=%s file=%s",
+            trade_id, state.get('symbol'), round(net_pnl_usdt, 8),
+            settlement.get('data_source', ''), filename,
+        )
+        return True
+    except Exception as e:
+        logging.error(f"写入手动交易CSV失败: trade_id={trade_id}, error={e}")
+        return False
+
+
 def initialize_manual_position_state(position):
     """首次发现手动仓位时选择并锁定周期，同时立即创建保护单。"""
     symbol = position['symbol']
@@ -5685,17 +6123,30 @@ def initialize_manual_position_state(position):
         logging.error(f"手动仓位两套周期都无法生成有效止损: symbol={symbol}, side={position['side']}")
         return None
 
+    detected_time = get_server_time_str()
+    fee_rate = get_trading_fee_rate(symbol)
+    initial_amount = price_to_float(position.get('amount'))
     state = {
         'key': position['key'],
+        'manual_trade_id': uuid.uuid4().hex,
         'symbol': symbol,
         'position_side': position['position_side'],
         'side': position['side'],
         'entry_price': entry,
-        'amount': position['amount'],
+        'initial_entry_price': entry,
+        'amount': initial_amount,
+        'initial_amount': initial_amount,
+        'max_amount': initial_amount,
         'last_order_amount': 0.0,
         'liquidation_price': position.get('liquidation_price'),
         'highest_price': highest,
         'lowest_price': lowest,
+        'last_mark_price': mark,
+        'fee_rate': fee_rate,
+        'estimated_realized_pnl': 0.0,
+        'estimated_fee_cost': entry * initial_amount * fee_rate,
+        'reduced_amount': 0.0,
+        'reduce_count': 0,
         'profile_name': selected['profile_name'],
         'background_tf': selected['background_tf'],
         'exit_tf': selected['exit_tf'],
@@ -5704,7 +6155,7 @@ def initialize_manual_position_state(position):
         'stop_order_price': 0.0,
         'stop_order_id': '',
         'stop_client_order_id': '',
-        'detected_time': get_server_time_str(),
+        'detected_time': detected_time,
         'miss_count': 0,
         'last_stop_order_error': '',
         'background_summary': selected.get('background_summary', ''),
@@ -5853,6 +6304,8 @@ def apply_manual_ai_position_guard(state, position, mark):
         logging.error(f"手动仓位AI减仓返回异常剩余数量，保留旧状态等待交易所复核: key={state['key']}")
         return False
 
+    reduce_price = extract_order_average_price(order) or price_to_float(mark)
+    accumulate_manual_reduction_estimate(state, actual_reduced, reduce_price)
     state['amount'] = remaining_amount
     state['ai_last_reduce_generated_at'] = guard.get('generated_at', '')
     state['ai_partial_reduce_count'] = int(state.get('ai_partial_reduce_count', 0) or 0) + 1
@@ -5904,9 +6357,22 @@ def manage_manual_position(state, position):
     else:
         previous_low = price_to_float(state.get('lowest_price'))
         state['lowest_price'] = mark if previous_low <= 0 else min(previous_low, mark)
+    state['last_mark_price'] = mark
 
     old_amount = price_to_float(state.get('amount'))
     new_amount = price_to_float(position.get('amount'))
+    new_entry_price = price_to_float(position.get('entry_price'))
+    if new_amount > old_amount + POSITION_AMT_EPSILON:
+        added_amount = new_amount - old_amount
+        fee_rate = price_to_float(state.get('fee_rate')) or 0.0004
+        state['estimated_fee_cost'] = (
+            price_to_float(state.get('estimated_fee_cost')) + mark * added_amount * fee_rate
+        )
+        state['max_amount'] = max(price_to_float(state.get('max_amount')), new_amount)
+    elif old_amount > new_amount + POSITION_AMT_EPSILON:
+        accumulate_manual_reduction_estimate(state, old_amount - new_amount, mark)
+    if new_entry_price > 0:
+        state['entry_price'] = new_entry_price
     state['amount'] = new_amount
     quantity_changed = abs(new_amount - old_amount) > POSITION_AMT_EPSILON
     apply_manual_ai_position_guard(state, position, mark)
@@ -5934,6 +6400,15 @@ def manage_manual_position(state, position):
 
 def manage_all_manual_positions(account_positions):
     """发现、更新并确认关闭全部手动仓位，返回当前是否仍需暂停ETH开仓。"""
+    global manual_position_states_loaded
+    if not manual_position_states_loaded:
+        restored_states = load_persisted_manual_position_states()
+        for key, state in restored_states.items():
+            state['miss_count'] = 0
+            manual_position_states.setdefault(key, state)
+        manual_position_states_loaded = True
+        if restored_states:
+            logging.warning(f"已恢复未平手动仓位快照: keys={sorted(restored_states)}")
     reap_manual_ai_jobs()
     visible_manual = {}
     for position in account_positions:
@@ -5956,12 +6431,15 @@ def manage_all_manual_positions(account_positions):
                 manual_position_states[key] = state
         else:
             manage_manual_position(state, position)
+        if state is not None:
+            persist_manual_position_state(state)
 
     for key, state in list(manual_position_states.items()):
         if key in visible_manual:
             continue
         state['miss_count'] = int(state.get('miss_count', 0) or 0) + 1
         if state['miss_count'] < MANUAL_POSITION_MISS_CONFIRM_COUNT:
+            persist_manual_position_state(state)
             logging.warning(
                 "手动仓位暂未查到，等待连续确认: key=%s miss=%s/%s",
                 key, state['miss_count'], MANUAL_POSITION_MISS_CONFIRM_COUNT,
@@ -5969,16 +6447,27 @@ def manage_all_manual_positions(account_positions):
             continue
         if not confirm_manual_position_fully_closed(state):
             state['miss_count'] = 0
+            persist_manual_position_state(state)
             continue
         cleanup_ok = cleanup_closed_position_exit_orders(state)
         if not cleanup_ok:
             state['miss_count'] = MANUAL_POSITION_MISS_CONFIRM_COUNT
+            persist_manual_position_state(state)
             logging.warning(f"手动仓位已全平但出场条件单尚未清理完成，下轮继续重试: key={key}")
             continue
         closed_time = get_server_time_str()
+        settlement = fetch_manual_trade_settlement(state, closed_time)
+        close_reason = '交易所仓位已全平（人工平仓或条件单触发）'
+        if not log_manual_trade_to_csv(state, settlement, close_reason):
+            state['miss_count'] = MANUAL_POSITION_MISS_CONFIRM_COUNT
+            persist_manual_position_state(state)
+            logging.warning(f"手动仓位已全平但交易账本写入失败，下轮继续重试: key={key}")
+            continue
+        effective_closed_time = settlement.get('exit_time') or closed_time
         if normalize_futures_symbol(state['symbol']) == normalize_futures_symbol(SYMBOL):
             # 手动ETH平仓仍执行20分钟冷却；BTC/SOL等非ETH平仓不写入ETH冷却时间。
-            trade_state['last_exit_time'] = closed_time
+            trade_state['last_exit_time'] = effective_closed_time
+        delete_persisted_manual_position_state(key)
         manual_position_states.pop(key, None)
         logging.warning(
             "手动仓位已确认全平并完成出场单清理: key=%s cooldown=%s",

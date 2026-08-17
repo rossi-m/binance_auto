@@ -81,21 +81,44 @@ stats_sync_state = {
     'lock': threading.Lock()
 }
 
+TRADE_SOURCE_LABELS = {
+    'strategy': '策略',
+    'manual': '手动',
+}
+
 # ---------- 工具函数 ----------
 
-def get_current_csv_path():
+def normalize_trade_source(source):
+    return source if source in ('strategy', 'manual') else 'all'
+
+
+def get_current_csv_paths(source='all'):
     now = datetime.datetime.now()
     month_str = now.strftime('%Y-%m')
-    return os.path.join(PROJECT_ROOT, f'trades_log_{month_str}.csv')
+    paths = []
+    normalized_source = normalize_trade_source(source)
+    if normalized_source in ('all', 'strategy'):
+        paths.append((os.path.join(PROJECT_ROOT, f'trades_log_{month_str}.csv'), 'strategy'))
+    if normalized_source in ('all', 'manual'):
+        paths.append((os.path.join(PROJECT_ROOT, f'manual_trades_log_{month_str}.csv'), 'manual'))
+    return paths
 
-def list_all_csv_files():
+
+def list_all_csv_files(source='all'):
     files = []
+    normalized_source = normalize_trade_source(source)
     for fname in os.listdir(PROJECT_ROOT):
+        file_source = None
         if fname.startswith('trades_log_') and fname.endswith('.csv'):
-            files.append(os.path.join(PROJECT_ROOT, fname))
-    return sorted(files)
+            file_source = 'strategy'
+        elif fname.startswith('manual_trades_log_') and fname.endswith('.csv'):
+            file_source = 'manual'
+        if file_source and normalized_source in ('all', file_source):
+            files.append((os.path.join(PROJECT_ROOT, fname), file_source))
+    return sorted(files, key=lambda item: item[0])
 
-def read_csv_rows(filepath):
+
+def read_csv_rows(filepath, source='strategy'):
     rows = []
     if not os.path.exists(filepath):
         return rows
@@ -103,6 +126,9 @@ def read_csv_rows(filepath):
         with open(filepath, 'r', newline='', encoding='utf-8-sig') as f:
             reader = csv.DictReader(f)
             for row in reader:
+                row['交易来源'] = row.get('交易来源') or source
+                row['交易来源名称'] = TRADE_SOURCE_LABELS.get(row['交易来源'], row['交易来源'])
+                row['交易对'] = row.get('交易对') or ('ETH/USDT' if source == 'strategy' else '')
                 rows.append(row)
     except Exception as e:
         print(f"读取 CSV 出错: {e}")
@@ -126,26 +152,48 @@ def ensure_stats_db():
             )
             """
         )
+        existing_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(daily_pnl)").fetchall()
+        }
+        for column_name, column_sql in (
+            ('strategy_pnl', 'REAL NOT NULL DEFAULT 0'),
+            ('strategy_trade_count', 'INTEGER NOT NULL DEFAULT 0'),
+            ('manual_pnl', 'REAL NOT NULL DEFAULT 0'),
+            ('manual_trade_count', 'INTEGER NOT NULL DEFAULT 0'),
+        ):
+            if column_name not in existing_columns:
+                conn.execute(f"ALTER TABLE daily_pnl ADD COLUMN {column_name} {column_sql}")
 
 def build_csv_signature(filepaths):
     signature = []
-    for filepath in filepaths:
+    for filepath, source in filepaths:
         try:
             stat = os.stat(filepath)
-            signature.append((filepath, stat.st_mtime_ns, stat.st_size))
+            signature.append((filepath, source, stat.st_mtime_ns, stat.st_size))
         except FileNotFoundError:
             continue
     return tuple(signature)
 
 def aggregate_daily_stats_from_rows(rows):
-    daily_stats = defaultdict(lambda: {'pnl': 0.0, 'trade_count': 0})
+    daily_stats = defaultdict(lambda: {
+        'pnl': 0.0,
+        'trade_count': 0,
+        'strategy_pnl': 0.0,
+        'strategy_trade_count': 0,
+        'manual_pnl': 0.0,
+        'manual_trade_count': 0,
+    })
     for row in rows:
         exit_time = row.get('平仓时间', '')
         if not exit_time or len(exit_time) < 10:
             continue
         trade_day = exit_time[:10]
-        daily_stats[trade_day]['pnl'] += parse_pnl(row.get('净利润(USDT)', '0'))
+        pnl = parse_pnl(row.get('净利润(USDT)', '0'))
+        source = 'manual' if row.get('交易来源') == 'manual' else 'strategy'
+        daily_stats[trade_day]['pnl'] += pnl
         daily_stats[trade_day]['trade_count'] += 1
+        daily_stats[trade_day][f'{source}_pnl'] += pnl
+        daily_stats[trade_day][f'{source}_trade_count'] += 1
     return daily_stats
 
 def sync_daily_stats_from_csv(force=False):
@@ -158,8 +206,8 @@ def sync_daily_stats_from_csv(force=False):
             return
 
         all_rows = []
-        for filepath in all_csv:
-            all_rows.extend(read_csv_rows(filepath))
+        for filepath, source in all_csv:
+            all_rows.extend(read_csv_rows(filepath, source=source))
 
         daily_stats = aggregate_daily_stats_from_rows(all_rows)
         now_iso = datetime.datetime.now().isoformat(timespec='seconds')
@@ -168,31 +216,47 @@ def sync_daily_stats_from_csv(force=False):
             for trade_day, stats in daily_stats.items():
                 conn.execute(
                     """
-                    INSERT INTO daily_pnl (trade_day, pnl, trade_count, updated_at)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO daily_pnl (
+                        trade_day, pnl, trade_count,
+                        strategy_pnl, strategy_trade_count,
+                        manual_pnl, manual_trade_count, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(trade_day) DO UPDATE SET
                         pnl = excluded.pnl,
                         trade_count = excluded.trade_count,
+                        strategy_pnl = excluded.strategy_pnl,
+                        strategy_trade_count = excluded.strategy_trade_count,
+                        manual_pnl = excluded.manual_pnl,
+                        manual_trade_count = excluded.manual_trade_count,
                         updated_at = excluded.updated_at
                     """,
                     (
                         trade_day,
                         round(stats['pnl'], 8),
                         stats['trade_count'],
+                        round(stats['strategy_pnl'], 8),
+                        stats['strategy_trade_count'],
+                        round(stats['manual_pnl'], 8),
+                        stats['manual_trade_count'],
                         now_iso
                     )
                 )
 
         stats_sync_state['signature'] = signature
 
-def fetch_daily_pnl_rows():
+def fetch_daily_pnl_rows(source='all'):
     sync_daily_stats_from_csv()
+    normalized_source = normalize_trade_source(source)
+    pnl_column = 'pnl' if normalized_source == 'all' else f'{normalized_source}_pnl'
+    count_column = 'trade_count' if normalized_source == 'all' else f'{normalized_source}_trade_count'
     with sqlite3.connect(STATS_DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            """
-            SELECT trade_day, pnl, trade_count
+            f"""
+            SELECT trade_day, {pnl_column} AS pnl, {count_column} AS trade_count
             FROM daily_pnl
+            WHERE {count_column} > 0
             ORDER BY trade_day ASC
             """
         ).fetchall()
@@ -234,8 +298,9 @@ def build_period_summaries(daily_rows):
 
     return yearly_summary, monthly_summary_by_year
 
-def compute_stats():
-    daily_rows = fetch_daily_pnl_rows()
+def compute_stats(source='all'):
+    normalized_source = normalize_trade_source(source)
+    daily_rows = fetch_daily_pnl_rows(normalized_source)
     now = datetime.datetime.now()
     today_str = datetime.datetime.now().strftime('%Y-%m-%d')
     current_month_prefix = now.strftime('%Y-%m')
@@ -279,7 +344,8 @@ def compute_stats():
         'available_years': [item['year'] for item in yearly_summary],
         'yearly_summary': yearly_summary,
         'monthly_summary_by_year': monthly_summary_by_year,
-        'daily_chart': daily_chart
+        'daily_chart': daily_chart,
+        'source': normalized_source
     }
 
 def send_verification_email(code, subject='ETH策略暂停验证码'):
@@ -442,19 +508,26 @@ def api_logs():
 
 @app.route('/api/trades')
 def api_trades():
-    filepath = get_current_csv_path()
-    rows = read_csv_rows(filepath)
-    # 最新在前
-    rows.reverse()
+    source = normalize_trade_source(request.args.get('source', 'all'))
+    current_files = get_current_csv_paths(source)
+    rows = []
+    existing_files = []
+    for filepath, file_source in current_files:
+        if os.path.exists(filepath):
+            existing_files.append(os.path.basename(filepath))
+        rows.extend(read_csv_rows(filepath, source=file_source))
+    rows.sort(key=lambda row: row.get('平仓时间', ''), reverse=True)
     return jsonify({
         'trades': rows,
-        'file': os.path.basename(filepath),
+        'file': ' + '.join(existing_files) or '暂无当月交易文件',
+        'source': source,
         'updated_at': datetime.datetime.now().isoformat()
     })
 
 @app.route('/api/stats')
 def api_stats():
-    return jsonify(compute_stats())
+    source = normalize_trade_source(request.args.get('source', 'all'))
+    return jsonify(compute_stats(source))
 
 @app.route('/api/start-request', methods=['POST'])
 def api_start_request():

@@ -16,6 +16,7 @@
         totalPnl: document.getElementById('total-pnl'),
         tradeCount: document.getElementById('trade-count'),
         todayCount: document.getElementById('today-count'),
+        tradeSourceFilter: document.getElementById('trade-source-filter'),
         summaryYear: document.getElementById('summary-year'),
         yearlySummary: document.getElementById('yearly-summary'),
         monthlySummary: document.getElementById('monthly-summary'),
@@ -56,6 +57,7 @@
     let logTimer = null;
     let lastTradesFetch = 0;
     let latestStats = null;
+    let selectedTradeSource = 'all';
     const TRADES_REFRESH_MS = 2 * 60 * 60 * 1000; // 2 hours
     const LOG_REFRESH_MS = 3000; // 3秒刷新日志
     const MAX_LOG_LINES = 500;
@@ -423,7 +425,7 @@
 
     async function updateStats() {
         try {
-            const data = await apiGet('/api/stats');
+            const data = await apiGet(`/api/stats?source=${encodeURIComponent(selectedTradeSource)}`);
             setPnlEl(els.todayPnl, data.today_pnl);
             setPnlEl(els.monthPnl, data.month_pnl);
             setPnlEl(els.yearPnl, data.year_pnl);
@@ -514,7 +516,7 @@
         lastTradesFetch = now;
 
         try {
-            const data = await apiGet('/api/trades');
+            const data = await apiGet(`/api/trades?source=${encodeURIComponent(selectedTradeSource)}`);
             els.tradesFile.textContent = data.file || '';
             els.tradesUpdated.textContent = formatDateTime(data.updated_at);
             renderTrades(data.trades || []);
@@ -525,7 +527,7 @@
 
     function renderTrades(rows) {
         if (!rows || rows.length === 0) {
-            els.tradesTbody.innerHTML = '<tr><td colspan="10" class="empty">暂无数据</td></tr>';
+            els.tradesTbody.innerHTML = '<tr><td colspan="12" class="empty">暂无数据</td></tr>';
             els.tradesMobileList.innerHTML = '<div class="trade-mobile-empty">暂无数据</div>';
             return;
         }
@@ -533,7 +535,11 @@
             const pnl = parseFloat(r['净利润(USDT)'] || 0);
             const pnlClass = pnl > 0 ? 'positive' : (pnl < 0 ? 'negative' : '');
             const profitText = r['是否盈利'] === 'True' ? '是' : (r['是否盈利'] === 'False' ? '否' : r['是否盈利']);
+            const source = r['交易来源'] || 'strategy';
+            const sourceName = r['交易来源名称'] || (source === 'manual' ? '手动' : '策略');
             return `<tr>
+                <td><span class="trade-badge source-${esc(source)}">${esc(sourceName)}</span></td>
+                <td>${esc(r['交易对']||'')}</td>
                 <td>${esc(r['建仓时间']||'')}</td>
                 <td>${esc(r['趋势方向']||'')}</td>
                 <td>${esc(r['入场原因']||'')}</td>
@@ -557,11 +563,15 @@
         const directionClass = getDirectionClass(row['趋势方向'] || '');
         const outcomeClass = getOutcomeClass(row['是否盈利'] || '');
         const outcomeText = row['是否盈利'] === 'True' ? '盈利' : (row['是否盈利'] === 'False' ? '亏损' : (row['是否盈利'] || '未标记'));
+        const source = row['交易来源'] || 'strategy';
+        const sourceName = row['交易来源名称'] || (source === 'manual' ? '手动' : '策略');
 
         return `<article class="trade-card">
             <div class="trade-card-head">
                 <div class="trade-card-title">
                     <div class="trade-badges">
+                        <span class="trade-badge source-${esc(source)}">${esc(sourceName)}</span>
+                        <span class="trade-badge symbol">${esc(row['交易对'] || 'ETH/USDT')}</span>
                         <span class="trade-badge ${directionClass}">${esc(row['趋势方向'] || '未知方向')}</span>
                         <span class="trade-badge ${outcomeClass}">${esc(outcomeText)}</span>
                     </div>
@@ -577,6 +587,7 @@
                 ${renderTradeField('持仓秒数', row['持仓秒数'])}
                 ${renderTradeField('点数盈亏', row['点数盈亏'])}
                 ${renderTradeField('手续费', row['手续费'])}
+                ${renderTradeField('盈亏数据来源', row['盈亏数据来源'] || (source === 'manual' ? 'Binance成交明细/估算' : '策略账户结算'))}
                 ${renderTradeField('入场原因', row['入场原因'], true)}
                 ${renderTradeField('平仓原因', row['平仓原因'], true)}
             </div>
@@ -710,6 +721,12 @@
         if (latestStats) {
             renderPerformanceSummary(latestStats);
         }
+    });
+
+    els.tradeSourceFilter.addEventListener('change', async () => {
+        selectedTradeSource = els.tradeSourceFilter.value || 'all';
+        lastTradesFetch = 0;
+        await Promise.all([updateStats(), updateTrades(true)]);
     });
 
     // ---------- Init ----------

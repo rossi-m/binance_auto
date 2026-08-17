@@ -42,6 +42,20 @@
 
         <!-- Stats -->
         <section class="stats card">
+            <div class="stats-source-filter">
+                <div>
+                    <div class="section-kicker">数据口径</div>
+                    <div class="stats-source-title">收益与交易来源</div>
+                </div>
+                <label class="source-filter-label" for="trade-source-filter">
+                    <span>来源</span>
+                    <select id="trade-source-filter">
+                        <option value="all">全部交易</option>
+                        <option value="strategy">策略交易</option>
+                        <option value="manual">手动交易</option>
+                    </select>
+                </label>
+            </div>
             <div class="stat-item">
                 <div class="stat-label">当天收益 (USDT)</div>
                 <div id="today-pnl" class="stat-value">--</div>
@@ -179,6 +193,8 @@
                 <table id="trades-table">
                     <thead>
                         <tr>
+                            <th>来源</th>
+                            <th>交易对</th>
                             <th>建仓时间</th>
                             <th>趋势方向</th>
                             <th>入场原因</th>
@@ -192,7 +208,7 @@
                         </tr>
                     </thead>
                     <tbody id="trades-tbody">
-                        <tr><td colspan="10" class="empty">暂无数据</td></tr>
+                        <tr><td colspan="12" class="empty">暂无数据</td></tr>
                     </tbody>
                 </table>
             </div>
