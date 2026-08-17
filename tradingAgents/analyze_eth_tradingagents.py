@@ -55,7 +55,6 @@ load_env_files()
 
 REQUEST_TIMEOUT = 30
 NO_YFINANCE_VENDOR = "no_yfinance"
-CRYPTO_BASES = {"BTC", "ETH", "SOL", "XRP", "ADA", "DOGE", "LTC", "BCH", "DOT", "AVAX", "LINK"}
 CRYPTO_QUOTES = ("USDT", "USDC", "USD")
 SEC_COMPANY_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_COMPANYFACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
@@ -94,22 +93,23 @@ def import_tradingagents() -> tuple[Any, dict[str, Any]]:
 
 
 def is_crypto_symbol(symbol: str) -> bool:
-    compact = symbol.upper().replace("-", "").replace("/", "").replace(":", "")
+    raw_symbol = symbol.upper().split(":", 1)[0]
+    compact = raw_symbol.replace("-", "").replace("/", "")
     for quote in CRYPTO_QUOTES:
-        if compact.endswith(quote) and compact[: -len(quote)] in CRYPTO_BASES:
+        # 手动仓位没有币种白名单；常见加密报价币前只要有基础币就按加密资产处理。
+        if compact.endswith(quote) and bool(compact[: -len(quote)]):
             return True
-    return compact in CRYPTO_BASES
+    return False
 
 
 def crypto_base(symbol: str) -> str:
-    compact = symbol.upper().replace("-", "").replace("/", "").replace(":", "")
+    raw_symbol = symbol.upper().split(":", 1)[0]
+    compact = raw_symbol.replace("-", "").replace("/", "")
     for quote in CRYPTO_QUOTES:
         if compact.endswith(quote):
             base = compact[: -len(quote)]
-            if base in CRYPTO_BASES:
+            if base:
                 return base
-    if compact in CRYPTO_BASES:
-        return compact
     return compact
 
 
@@ -751,10 +751,11 @@ def get_news_no_yfinance(ticker: str, start_date: str, end_date: str) -> str:
             end_dt = datetime.strptime(end_date, "%Y-%m-%d")
             lookback_hours = max(24, int((end_dt - start_dt).total_seconds() // 3600))
             items = select_news_items(
-                fetch_finnhub_crypto_news(lookback_hours, limit=MAX_NEWS_ITEMS)
-                + fetch_rss_news(lookback_hours, limit_per_feed=4)
-                + fetch_gdelt_news(lookback_hours, limit=MAX_NEWS_ITEMS),
+                fetch_finnhub_crypto_news(lookback_hours, limit=MAX_NEWS_ITEMS, symbol=ticker)
+                + fetch_rss_news(lookback_hours, limit_per_feed=4, symbol=ticker)
+                + fetch_gdelt_news(lookback_hours, limit=MAX_NEWS_ITEMS, symbol=ticker),
                 limit=MAX_NEWS_ITEMS,
+                symbol=ticker,
             )
         except Exception as exc:
             return data_unavailable_message("crypto news", ticker, "Finnhub/RSS/GDELT", exc)

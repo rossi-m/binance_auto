@@ -298,12 +298,14 @@ def load_ai_research_guard(
     *,
     expected_symbol: str = "ETHUSDT",
     now: datetime | None = None,
+    bias_file: str | None = None,
 ) -> dict[str, Any]:
-    """加载 AI 研报 bias 文件并进行校验。模式为 off 时直接返回 fail_open 结果。"""
+    """加载指定交易对的 AI bias；未传路径时保持原有ETH配置兼容。"""
     if config.mode == "off":
         return fail_open_guard("AI research mode is off", mode=config.mode, symbol=expected_symbol)
     try:
-        raw = json.loads(Path(config.bias_file).read_text(encoding="utf-8"))
+        target_bias_file = bias_file or config.bias_file
+        raw = json.loads(Path(target_bias_file).read_text(encoding="utf-8"))
         return validate_ai_bias(raw, config, expected_symbol=expected_symbol, now=now)
     except Exception as exc:
         # 任何异常都 fail-open：不拦截信号，确保 AI 故障不影响交易

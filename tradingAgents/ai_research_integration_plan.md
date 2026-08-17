@@ -1,608 +1,294 @@
-# TradingAgents AI 研究层方案
+# TradingAgents AI 研究与手动仓位接管方案
 
 文档状态：
 
 ```text
-更新时间：2026-07-19
-当前运行目录：/home/ubuntu/binance/tradingAgents
-当前阶段：Binance Demo 使用 filter_reduce 同时验证阶段 1、2、3，为期一周
-当前协议：只使用 portfolio_stance、futures_bias、risk_multiplier 等正式字段
+更新时间：2026-08-17
+运行目录：/home/ubuntu/binance
+交易环境：Binance USD-M Demo
+当前 AI 模式：manage
+当前状态：多交易对手动仓位接管和逐交易对 TradingAgents 研究已接入 bian_new.py
 ```
 
-## 1. 目标和边界
+## 1. 当前结论
 
-当前实盘交易主程序仍然是仓库根目录的 `bian_new.py`。它负责 ETHUSDT 的实时行情、技术信号、入场、止损、目标、订单和仓位管理。
+`ai_market_bias.py` 仍然是独立的研究结果生产脚本，本身不下单，也不直接管理仓位。
 
-`tradingAgents/` 目录下的代码只做低频研究，不直接参与实盘执行。
+现在已经存在完整连接：`bian_new.py` 发现手动仓位后，会异步启动 `run_symbol_research.py`；后者按实际交易对运行 TradingAgents 和 `ai_market_bias.py`，生成该交易对自己的 bias 文件，再由 `bian_new.py` 校验并使用。
 
-核心边界：
+例如：
 
 ```text
-可以做：
-  生成 TradingAgents 多 Agent 研究报告
-  汇总新闻、宏观、行情摘要
-  生成方向偏见 JSON
-  做观察和复盘
-
-不能做：
-  直接下单
-  撤单
-  修改止损
-  扩大杠杆
-  绕过 bian_new.py 风控
-  在数据缺失时强行给方向
+手动 BTCUSDT 仓位
+  -> run_symbol_research.py --symbol BTCUSDT
+  -> analyze_eth_tradingagents.py --ticker BTC-USD
+  -> ai_market_bias.py --symbol BTCUSDT
+  -> .ai_research/latest_bias_BTCUSDT.json
+  -> bian_new.py 校验后最多执行受限的部分减仓
 ```
 
-`bian_new.py` 已接入 `.ai_research/latest_bias_ETHUSDT.json`。默认 `AI_RESEARCH_MODE=off`；当前一周 Demo 测试由运行脚本显式设置为 `filter_reduce`。
+这套实现没有手动仓位币种白名单。只要 Binance USD-M 账户返回的是有效非零仓位，BTC、SOL、PEPE 等交易对都可以进入接管流程。
 
-## 2. 当前文件
+## 2. 安全边界
+
+职责分工：
 
 ```text
-tradingAgents/
-  analyze_eth_tradingagents.py
-  ai_market_bias.py
-  ai_research_guard.py
-  ai_research_integration_plan.md
-  .env.example
+TradingAgents / ai_market_bias.py：
+  生成研究报告和结构化 bias。
+  不持有交易所执行权。
+
+bian_new.py：
+  读取账户仓位。
+  计算和更新动态止损。
+  校验 bias。
+  决定是否执行受控减仓。
+  负责所有交易所订单操作和最终安全约束。
 ```
 
-### analyze_eth_tradingagents.py
-
-职责：
+AI 的硬限制：
 
 ```text
-1. 启动 TradingAgents 多 Agent 工作流。
-2. 在当前 Python 进程里 patch TradingAgents vendor 路由。
-3. 避免默认 yfinance / Alpha Vantage 路径造成限流或数据不可控。
-4. 生成完整研究报告和状态文件。
+不能凭空开仓。
+不能增加已有仓位。
+不能完全平仓。
+不能自动反手。
+不能放宽已经生效的动态止损。
+不能修改杠杆。
+bias 缺失、损坏、过期或不匹配时必须 fail-open。
 ```
 
-输出：
+这里的 fail-open 是指 AI 不影响原策略或 ATR 止损管理，不是指取消保护单，也不是指强制开仓。
 
-```text
-outputs/ETH-USD_YYYY-MM-DD_summary.md
-outputs/ETH-USD_YYYY-MM-DD_state.json
-outputs/ETH-USD_YYYY-MM-DD_decision.json
-```
-
-### ai_market_bias.py
-
-职责：
-
-```text
-1. 读取最新 TradingAgents summary。
-2. 拉取辅助上下文：Finnhub / RSS / GDELT / FRED / Binance。
-3. 调 DeepSeek，把 TradingAgents 报告拆分为 portfolio_stance 与短周期 futures_bias，并生成结构化 JSON。
-4. 校验 fail-open 规则。
-5. 写 .ai_research/latest_bias_ETHUSDT.json。
-```
-
-重要：`ai_market_bias.py` 是 TradingAgents-first。它默认要求有新鲜 TradingAgents summary，不应该退化成单 DeepSeek 模型自己判断行情。
-
-重要语义边界：
-
-```text
-Underweight / SELL / 减仓不等于期货 short。
-Overweight / BUY / 分批买入不等于期货 long。
-没有明确短周期期货信号时必须使用 futures_bias=neutral 或 mixed。
-```
-
-### 文件清单和用途
-
-#### 仓库内应该上传的文件
-
-| 文件 | 由谁产生 | 用途 | 是否上传 git |
-|---|---|---|---|
-| `tradingAgents/analyze_eth_tradingagents.py` | 当前实现 | TradingAgents 研究入口；运行时 patch 数据源；输出多 Agent 报告 | 是 |
-| `tradingAgents/ai_market_bias.py` | 当前实现 | 读取 TradingAgents 报告，结合辅助数据，生成 bias JSON | 是 |
-| `tradingAgents/ai_research_guard.py` | 当前实现 | 配置校验、JSON fail-open、候选过滤、目标仓位计算和 AI JSONL 审计 | 是 |
-| `tradingAgents/ai_research_integration_plan.md` | 当前实现 | 当前方案文档、运行命令、下一步计划 | 是 |
-| `tradingAgents/.env.example` | 当前实现 | 环境变量模板，只放占位符，不放真实 key | 是 |
-
-#### 运行后会产生但不上传的文件和目录
-
-| 路径 | 由谁产生 | 用途 | 为什么不上传 |
-|---|---|---|---|
-| `tradingAgents/.env` | 用户手工创建 | 存真实 API key，例如 `DEEPSEEK_API_KEY` | 含密钥，不能进 git |
-| `tradingAgents/.ai_research/latest_bias_ETHUSDT.json` | `ai_market_bias.py` | 最新 AI bias 输出，未来可给观察/实盘读取 | 运行态结果，会频繁变化 |
-| `tradingAgents/.ai_research/cache/` | `ai_market_bias.py` | 新闻、FRED、Binance、TradingAgents 输入快照缓存 | 缓存数据，体积和内容会变 |
-| `tradingAgents/.ai_research/logs/ai_research_decisions_YYYY-MM.jsonl` | `bian_new.py` | 候选、pending、持仓和减仓的结构化 AI 审计 | 运行日志，不属于源码 |
-| `tradingAgents/outputs/*_summary.md` | `analyze_eth_tradingagents.py` | 人看的 TradingAgents 研究报告 | 每次运行结果，不属于源码 |
-| `tradingAgents/outputs/*_state.json` | `analyze_eth_tradingagents.py` | TradingAgents 全流程状态，内容最全 | 文件大、运行态输出 |
-| `tradingAgents/outputs/*_decision.json` | `analyze_eth_tradingagents.py` | TradingAgents 最终决策 | 每次运行结果 |
-| `tradingAgents/.tradingagents/cache/` | TradingAgents 框架 | TradingAgents 数据缓存 | 缓存数据 |
-| `tradingAgents/.tradingagents/logs/` | TradingAgents 框架 | TradingAgents 内部运行日志 | 日志文件 |
-| `tradingAgents/.tradingagents/memory/` | TradingAgents 框架 | TradingAgents memory log | 运行态记忆，不适合提交 |
-| `tradingAgents/__pycache__/` | Python | Python 字节码缓存 | 可再生成，无需提交 |
-
-### 环境变量加载顺序
-
-当前工作目录是 `/home/ubuntu/binance/tradingAgents/`，Git 仓库副本位于 `/home/ubuntu/binance_auto/tradingAgents/`。
-
-为了兼容当前服务器已有配置，TradingAgents 研究脚本会按下面顺序加载环境变量，先加载到的 key 优先：
-
-```text
-1. TRADINGAGENTS_ENV_FILE 指定的文件
-2. /home/ubuntu/binance_auto/tradingAgents/.env
-3. /home/ubuntu/binance/tradingAgents/.env
-4. /home/ubuntu/binance_auto/.ai_env.local
-5. /home/ubuntu/binance_auto/.env.local
-6. 当前执行目录下的 .env
-```
-
-当前服务器实际使用的是：
-
-```text
-/home/ubuntu/binance/tradingAgents/.env
-```
-
-这个文件里放 `DEEPSEEK_API_KEY`、`FINNHUB_API_KEY`、`FRED_API_KEY` 等真实密钥，不上传 git。
-
-
-## 3. 当前数据流
-
-```text
-analyze_eth_tradingagents.py
-        |
-        v
-outputs/ETH-USD_YYYY-MM-DD_summary.md
-outputs/ETH-USD_YYYY-MM-DD_state.json
-outputs/ETH-USD_YYYY-MM-DD_decision.json
-        |
-        v
-ai_market_bias.py
-        |
-        v
-.ai_research/latest_bias_ETHUSDT.json
-```
-
-当前没有这一步：
-
-```text
-.ai_research/latest_bias_ETHUSDT.json -> bian_new.py
-```
-
-也就是说，bias 文件目前只用于观察和测试。
-
-## 4. TradingAgents 数据源替换方式
-
-没有修改 `site-packages/tradingagents` 源码。
-
-替换方式是在 `analyze_eth_tradingagents.py` 运行时 patch：
+当前脚本明确调用：
 
 ```python
-install_no_yfinance_adapters(TradingAgentsGraph)
+exchange.enable_demo_trading(True)
 ```
 
-这个函数会在当前 Python 进程里替换 TradingAgents 的 vendor 方法：
+AI 代码不能修改 Demo/正式环境开关。
 
-```text
-get_stock_data
-get_indicators
-get_fundamentals
-get_balance_sheet
-get_cashflow
-get_income_statement
-get_news
-get_global_news
-get_insider_transactions
-```
+## 3. 文件职责
 
-影响范围：
-
-```text
-通过 analyze_eth_tradingagents.py 启动 TradingAgents：
-  使用本方案的数据源。
-
-直接使用 TradingAgents 原始 CLI 或其他脚本：
-  不受影响，仍用 TradingAgents 默认数据源。
-```
-
-换服务器时，只要带上 `tradingAgents/` 目录并安装 TradingAgents 包即可，不需要改 TradingAgents 源码。
-
-## 5. 当前使用的数据源
-
-只列当前已经接入并测试过的数据源。
-
-### 5.1 Crypto 行情和技术
-
-```text
-Binance USD-M Futures public klines
-```
-
-用途：
-
-```text
-ETHUSDT OHLCV
-TradingAgents market analyst
-TradingAgents technical indicators
-ai_market_bias.py Binance 多周期摘要
-```
-
-### 5.2 Crypto 新闻
-
-```text
-Finnhub crypto news
-RSS feeds
-GDELT
-```
-
-用途：
-
-```text
-TradingAgents news/sentiment 输入
-ai_market_bias.py 新闻上下文
-```
-
-#### 5.2.1 新闻时间窗口和使用方
-
-ETH 资产新闻默认使用最近约 7 天的滚动窗口。一天运行 3 次时，每次都会重新读取最近 7 天，不是只读取上次运行之后的新新闻，因此相邻两次运行的新闻会有较高重合度。
-
-新闻主要提供给：
-
-```text
-资产新闻 -> Sentiment Analyst -> sentiment_report
-资产新闻 / 全球新闻 -> News Analyst -> news_report
-news_report + sentiment_report -> Bull / Bear Researchers 和 Risk Agents
-```
-
-`--max-news-items 12` 是单次新闻工具返回上限：
-
-```text
-ETH 资产新闻最多 12 条。
-News Analyst 如果另外调用全球新闻工具，全球新闻可以再返回最多 12 条。
-它不是整个 TradingAgents 流程绝对只能读取 12 条新闻。
-```
-
-#### 5.2.2 新闻候选汇总
-
-ETH 新闻选择前先汇总当前已经抓到的候选：
-
-```text
-Finnhub crypto：当前最多抓取 max-news-items 条候选。
-RSS：CoinDesk、Cointelegraph、Decrypt、Ethereum Blog，每个 feed 当前最多抓取 4 条候选。
-GDELT：当前最多抓取 max-news-items 条候选。
-```
-
-候选必须满足时间窗口和 crypto/ETH 关键词条件。GDELT 自身使用 Ethereum、ETH、Bitcoin、crypto、spot ETF、stablecoin 等查询条件。
-
-汇总后不再按 `Finnhub -> RSS -> GDELT` 的固定顺序直接取前 12 条，而是统一去重、评分和分配来源配额。
-
-#### 5.2.3 去重规则
-
-```text
-1. 标题转为小写。
-2. 删除标点、空格等非单词字符。
-3. 使用标准化结果的前 120 个字符作为去重 key。
-4. 相同 key 只保留综合评分更高的版本。
-5. DATA_UNAVAILABLE 等错误占位项不计入新闻数量。
-```
-
-同一事件但标题文字明显不同的报道，当前仍可能同时保留。后续可以增加 URL canonicalization、标题相似度和事件聚类。
-
-#### 5.2.4 综合评分
-
-每条候选新闻按四个维度计算确定性分数。这里不调用额外 LLM 预筛选，评分规则可以测试和复现。
-
-##### A. 时效性，最高 40 分
-
-| 发布时间距离当前时间 | 分数 |
-|---|---:|
-| 6 小时以内 | 40 |
-| 6 到 24 小时 | 34 |
-| 24 到 72 小时 | 26 |
-| 72 到 168 小时 | 16 |
-| 168 到 336 小时 | 6 |
-| 无法解析发布时间 | 4 |
-| 超过 336 小时 | 0 |
-
-##### B. ETH 相关度，最高 30 分
-
-直接 ETH 词包括：
-
-```text
-Ethereum、Ether、ETH、staking、Pectra、Layer 2、rollup、EIP
-```
-
-广义 crypto 词包括：
-
-```text
-Bitcoin、BTC、crypto、stablecoin、DeFi、token、Binance
-```
-
-| 命中位置和类型 | 分数 |
-|---|---:|
-| 标题命中直接 ETH 词 | 30 |
-| 摘要或全文命中直接 ETH 词 | 24 |
-| 标题只命中广义 crypto 词 | 12 |
-| 摘要或全文只命中广义 crypto 词 | 7 |
-| 都未命中 | 0 |
-
-##### C. 来源可信度，最高 15 分
-
-来源分数来自新闻 `source` 字段中的发布机构或域名。若同时命中多个规则，取最高分，例如 `finnhub:Reuters` 取 Reuters 的 14 分，而不是 Finnhub 的 10 分。
-
-| 来源 | 分数 |
-|---|---:|
-| Ethereum 官方博客 | 15 |
-| Reuters / Bloomberg | 14 |
-| CoinDesk | 13 |
-| Decrypt | 12 |
-| Cointelegraph | 11 |
-| Finnhub 中未识别具体媒体的内容 | 10 |
-| 普通 RSS | 8 |
-| GDELT | 7 |
-| 无法识别 | 5 |
-
-这个分数只代表预设的来源基础权重，不代表已验证文章事实。当前不会自动检查记者署名、转载关系、匿名消息、历史准确率或多来源交叉验证。
-
-##### D. 事件影响力，最高 25 分
-
-标题和摘要按事件类别匹配，每命中一个不同类别加 5 分：
-
-| 事件类别 | 关键词示例 |
+| 文件 | 当前职责 |
 |---|---|
-| ETF 与资金流 | ETF、inflow、outflow |
-| 监管与法律 | SEC、regulation、approval、lawsuit |
-| 宏观与利率 | Fed、interest rate、inflation、CPI、yield |
-| 安全与故障 | hack、exploit、breach、attack、outage |
-| 协议与质押 | upgrade、hard fork、EIP、staking |
-| 衍生品与大额资金 | liquidation、whale、open interest、funding rate |
-| 地缘政治 | war、conflict、sanction、geopolitical |
+| `bian_new.py` | ETH 原策略、全账户手动仓位发现、动态止损、订单归属、逐交易对 AI 调度和受限减仓 |
+| `tradingAgents/run_symbol_research.py` | 单交易对后台任务入口；负责 symbol 转换和 `flock` 防重入 |
+| `tradingAgents/analyze_eth_tradingagents.py` | TradingAgents 多 Agent 研究入口；文件名保留历史名称，但已支持任意有效 USD/USDT/USDC 加密交易对 |
+| `tradingAgents/ai_market_bias.py` | 读取 TradingAgents 报告和辅助数据，生成 `latest_bias_SYMBOL.json` |
+| `tradingAgents/ai_research_guard.py` | 配置校验、bias 校验、fail-open、候选过滤、部分减仓计算和 JSONL 审计 |
+| `test_bian_manual_takeover.py` | 手动仓位、保护单归属、冷却和 AI 减仓测试 |
+| `test_tradingagents_multi_symbol.py` | 任意币种、逐 symbol 文件和 runner 转换测试 |
 
-计算规则：
+## 4. 实际运行链路
 
-```text
-正文事件类别分：每类 5 分，先限制到最高 21 分。
-只要标题直接命中任意事件类别，再加 4 分。
-最终事件影响力最高 25 分。
-```
-
-事件影响力只表示“可能影响市场”，不判断利多、利空，也不判断新闻真假。
-
-#### 5.2.5 来源配额和最终选择
-
-在 `max-news-items=12` 且 Finnhub、RSS、GDELT 都有有效候选时：
+### 4.1 自动链路
 
 ```text
-1. 每个可用来源组先保留该组评分最高的 2 条。
-2. 剩余名额按所有候选的综合评分竞争。
-3. 正常填充阶段单一来源组最多占 6 条，即总上限的一半。
-4. 其他来源没有足够候选时，允许高分来源突破软上限补足 12 条。
-5. 最终结果按综合评分从高到低返回给 Agent。
+bian_new.py 每轮读取 Binance USD-M 全账户非零仓位
+  |
+  +-- 原策略创建的 ETH 仓位 -> 原 ETH trade_state 管理
+  |
+  +-- 其他仓位 -> manual_position_states 独立管理
+          |
+          +-- 先选择周期并创建 TAM_ 动态保护止损
+          |
+          +-- bias 缺失或接近过期时，异步启动 run_symbol_research.py
+                  |
+                  +-- 每个 symbol 使用独立 flock
+                  |
+                  +-- ai_market_bias.py --run-tradingagents
+                          |
+                          +-- analyze_eth_tradingagents.py --ticker BASE-USD
+                          +-- symbol 相关的新闻、宏观和 Binance 行情
+                          +-- latest_bias_SYMBOL.json 原子写入
+          |
+          +-- bian_new.py 下轮读取并严格校验该 symbol 的 bias
+          +-- 满足条件时最多执行受限的部分减仓
+          +-- ATR/结构动态止损始终独立运行
 ```
 
-该规则解决 Finnhub 先返回 12 条时 RSS 和 GDELT 完全无法进入的问题，同时保留质量不足时由其他来源补位的能力。
+后台研究不会阻塞每秒交易循环。首次发现手动仓位时，脚本先尝试创建保护止损，然后才启动研究任务。
 
-#### 5.2.6 当前局限
+### 4.2 分交易对隔离
+
+以 BTC 和 SOL 同时存在为例：
 
 ```text
-来源可信度是静态表，不是实时媒体质量评估。
-事件影响力依赖关键词，可能有误命中或漏命中。
-GDELT source 当前有时只有国家信息，无法精确识别原始媒体。
-不同标题描述同一事件时，简单标题去重无法完全合并。
-没有执行正文抓取、事实核查或多个独立来源交叉确认。
-没有判断新闻是首发、转载、评论还是旧事件重复报道。
+.ai_research/latest_bias_BTCUSDT.json
+.ai_research/latest_bias_SOLUSDT.json
+.ai_research/jobs/BTCUSDT.lock
+.ai_research/jobs/SOLUSDT.lock
+.ai_research/logs/manual_ai_BTCUSDT.log
+.ai_research/logs/manual_ai_SOLUSDT.log
 ```
 
-### 5.3 宏观数据
+同一交易对同一时间只允许一个研究任务。`flock` 随进程退出自动释放，锁文件本身保留不代表任务仍在运行。
+
+## 5. 手动仓位接管规则
+
+### 5.1 发现范围
+
+`bian_new.py` 通过 Binance USD-M position-risk/positions 接口读取账户内全部非零仓位，不配置 symbol 白名单。
+
+每笔状态按交易对、持仓模式和方向隔离，避免 BTC、SOL、ETH 或 hedge-mode 多空仓相互覆盖。
+
+如果脚本已有策略 ETH 仓位，同时又手动建立 BTC 仓位：
 
 ```text
-FRED
+ETH 继续由原策略管理。
+BTC 由 manual_position_states 接管并动态更新 TAM_ 止损。
+两笔仓位可以同时被管理。
 ```
 
-当前 series：
+只要账户存在任何仓位，脚本暂停寻找新的 ETH 开仓条件，并撤销脚本自己的未成交 ETH 入场单，避免在管理现有风险时继续加新仓。
+
+### 5.2 初始周期选择
+
+手动仓位首次被发现时同时评估两套配置：
+
+| 配置 | 背景趋势 | 开仓/平仓及动态止损周期 |
+|---|---|---|
+| `4h_1h` | 4H | 1H |
+| `1h_15m` | 1H | 15M |
+
+两套配置都必须先产生有效且位于当前价格安全一侧的止损候选。
+
+选择规则：
 
 ```text
-FEDFUNDS
-CPIAUCSL
-UNRATE
-DGS10
-DGS2
+多单：选择更高的有效止损，因为距离当前价更近、预期亏损更小。
+空单：选择更低的有效止损，因为距离当前价更近、预期亏损更小。
 ```
 
-用途：
+选中后，该笔仓位生命周期内锁定对应的出场周期。选中 `1h_15m` 后继续使用 15M 动态止损；选中 `4h_1h` 后继续使用 1H 动态止损，不会每轮来回切换。
+
+### 5.3 ATR 盈利保护
+
+首次接管时会把入场价、当前标记价、最高价/最低价带入两套止损计算。
+
+如果手动仓位在被发现时已经盈利超过 1 ATR，不会从最宽的初始亏损止损重新开始，而是立即应用现有利润锁定阶梯：
+
+| 最大浮盈 | 默认保留利润比例 |
+|---|---:|
+| `>= 1 ATR` | 30% |
+| `>= 2 ATR` | 50% |
+| `>= 3 ATR` | 70% |
+| `>= 4 ATR` | 90% |
+
+利润锁定、强 K 结构和 4H 支撑阻力只能继续收紧止损，不能把止损向亏损方向放宽。
+
+## 6. 保护单归属和清理
+
+### 6.1 Client Order ID 前缀
 
 ```text
-ai_market_bias.py 宏观上下文
+TAS_：原 ETH 策略创建的保护单。
+TAM_：手动仓位接管模块创建的保护单。
 ```
 
-### 5.4 美股行情
+持仓仍存在时，刷新动态止损或同步部分平仓后的数量，只撤销和重建脚本自己带前缀的保护单。用户手工创建的止损、止盈和其他条件委托会保留。
 
-用于股票研究，不接入 ETHUSDT 实盘。
-
-fallback 顺序：
+部分平仓示例：
 
 ```text
-Finnhub stock candle
-Nasdaq historical
-Yahoo chart direct
-Stooq daily CSV
+BTC 多单从 2 BTC 减到 1 BTC：
+  脚本只把 TAM_ 止损数量刷新为剩余 1 BTC。
+  用户自己的条件止损/止盈不被撤销。
 ```
 
-### 5.5 美股基本面
+### 6.2 完全平仓后的清理
+
+当手动平仓或任一条件委托使仓位归零时，脚本不会仅凭一次查询缺失立即清理。流程是：
 
 ```text
-SEC companyfacts
+连续 3 轮未发现该仓位
+  -> 再调用标准 positions 接口复查
+  -> 确认该 symbol/side 数量确实为 0
+  -> 清理该 symbol/side 的全部止损和止盈出场条件单
 ```
 
-用途：
+这里的“全部出场条件单”包括用户创建和脚本创建的止损/止盈，目的是避免无仓位后残留条件单以后误触发。普通限价开仓委托不在这次清理范围内。
+
+区别必须明确：
 
 ```text
-company overview
-balance sheet
-cashflow
-income statement
+持仓存在期间：只撤脚本自己的 TAS_/TAM_ 保护单。
+确认完全平仓后：清理该交易对该方向的全部止损/止盈出场条件单。
 ```
 
-### 5.6 美股 insider
+## 7. 平仓后的 20 分钟冷却
+
+`POST_EXIT_COOLDOWN_SECONDS` 当前等于 4 根 5M K 线，即 20 分钟。
+
+| 场景 | 是否写入 ETH 开仓冷却 |
+|---|---|
+| 原策略 ETH 平仓 | 是 |
+| 手动 ETH 平仓或条件单平仓 | 是 |
+| 手动 BTC/SOL/其他非 ETH 平仓 | 否 |
+
+非 ETH 手动仓位关闭后不会让 ETH 策略额外等待 20 分钟；但是只要账户里还有其他活跃仓位，新的 ETH 开仓扫描仍然保持暂停。
+
+## 8. TradingAgents 多交易对支持
+
+### 8.1 Symbol 转换
+
+常见输入会转换为统一目标：
+
+| 输入 | TradingAgents ticker | Bias symbol |
+|---|---|---|
+| `BTC/USDT:USDT` | `BTC-USD` | `BTCUSDT` |
+| `SOLUSDT` | `SOL-USD` | `SOLUSDT` |
+| `PEPE/USDT` | `PEPE-USD` | `PEPEUSDT` |
+
+`analyze_eth_tradingagents.py` 的历史文件名没有改，但代码已取消基础币白名单。只要有有效基础币和 USD/USDT/USDC 报价格式，就按加密资产处理。
+
+### 8.2 新闻相关性
+
+新闻关键词和 GDELT 查询会跟随实际 symbol：
 
 ```text
-SEC submissions
+BTC -> BTC / bitcoin + 通用 crypto 宏观词
+SOL -> SOL / solana + 通用 crypto 宏观词
+未知币种 -> 直接使用其基础币代码 + 通用 crypto 宏观词
 ```
 
-用途：
+别名表用于提高召回率，不是交易对白名单。未知币种仍然可以运行研究，只是新闻源可能较少，最终 confidence 应相应降低。
+
+当前数据源包括：
 
 ```text
-Form 3 / Form 4 / Form 5 filing list
+Binance USD-M 公共 K 线和多周期摘要
+Finnhub crypto news
+RSS
+GDELT
+FRED 宏观数据
+TradingAgents 多 Agent 报告
 ```
 
-## 6. 环境变量
+`Underweight` 或 `SELL` 只表示投资组合立场，不自动等于期货做空；`Overweight` 或 `BUY` 也不自动等于期货做多。
 
-从 `.env` 读取。仓库只上传 `.env.example`，真实 `.env` 不上传。
+## 9. Bias JSON 协议
 
-`.env.example`：
-
-```env
-DEEPSEEK_API_KEY=your_deepseek_key_here
-FINNHUB_API_KEY=
-FRED_API_KEY=
-ALPHA_VANTAGE_API_KEY=
-```
-
-当前默认 no_yfinance 路径不依赖 Alpha Vantage。`ALPHA_VANTAGE_API_KEY` 保留只是为了兼容手动选择原生 vendor 的情况。
-
-必需：
+每个交易对写独立文件：
 
 ```text
-DEEPSEEK_API_KEY
+tradingAgents/.ai_research/latest_bias_SYMBOL.json
 ```
 
-建议配置：
-
-```text
-FINNHUB_API_KEY
-FRED_API_KEY
-```
-
-## 7. TradingAgents 运行命令
-
-当前推荐命令：
-
-```bash
-python tradingAgents/analyze_eth_tradingagents.py \
-  --ticker ETH-USD \
-  --asset-type crypto \
-  --provider deepseek \
-  --deep deepseek-v4-pro \
-  --quick deepseek-v4-flash \
-  --offline \
-  --llm-timeout 300 \
-  --llm-max-retries 1 \
-  --max-data-rows 60 \
-  --max-news-items 12 \
-  --max-news-summary-chars 500
-```
-
-如果在 `tradingAgents/` 目录内运行：
-
-```bash
-python analyze_eth_tradingagents.py \
-  --ticker ETH-USD \
-  --asset-type crypto \
-  --provider deepseek \
-  --deep deepseek-v4-pro \
-  --quick deepseek-v4-flash \
-  --offline \
-  --llm-timeout 300 \
-  --llm-max-retries 1 \
-  --max-data-rows 60 \
-  --max-news-items 12 \
-  --max-news-summary-chars 500
-```
-
-参数说明：
-
-```text
---deep deepseek-v4-pro
-  深度分析模型，用于更重要的 TradingAgents agent。
-
---quick deepseek-v4-flash
-  快速模型，用于轻量 agent。
-
---offline
-  关闭 TradingAgents 原生 online tools。
-  注意：这不等于完全断网。本方案的 adapter 仍会访问 Binance/Finnhub/RSS/GDELT/FRED/SEC 等数据源。
-
---llm-timeout 300
-  单次 LLM 请求最多等待 300 秒。
-
---llm-max-retries 1
-  LLM 超时或失败后最多重试 1 次。
-
---max-data-rows 60
-  返回给 LLM 的 OHLCV 最多 60 行。
-  技术指标内部仍可使用完整拉取数据。
-
---max-news-items 12
-  单次新闻工具最多返回 12 条。
-  ETH 资产新闻和全球新闻工具分别计算上限。
-
---max-news-summary-chars 500
-  每条新闻摘要最多 500 字符。
-```
-
-为什么要限制数据量：
-
-```text
-TradingAgents 会把工具输出拼进多个 LLM agent prompt。
-OHLCV CSV 和新闻过长时，DeepSeek V4 容易在响应读取阶段变慢或超时。
-限制输出体积后，TradingAgents 仍保留多 Agent 流程，但稳定性明显提高。
-```
-
-## 8. ai_market_bias.py 命令
-
-只抓数据，不调用 DeepSeek：
-
-```bash
-python tradingAgents/ai_market_bias.py --symbol ETHUSDT --hours 9 --fetch-only
-```
-
-调用 DeepSeek 归一化，但不写 latest bias：
-
-```bash
-python tradingAgents/ai_market_bias.py --symbol ETHUSDT --hours 9 --dry-run
-```
-
-写研究层 bias 文件：
-
-```bash
-python tradingAgents/ai_market_bias.py --symbol ETHUSDT --hours 9
-```
-
-先跑 TradingAgents，完成后再写研究层 bias 文件：
-
-```bash
-python tradingAgents/ai_market_bias.py --symbol ETHUSDT --hours 9 --run-tradingagents --tradingagents-ticker ETH-USD --asset-type crypto --tradingagents-provider deepseek --tradingagents-deep deepseek-v4-pro --tradingagents-quick deepseek-v4-flash --tradingagents-offline --tradingagents-llm-timeout 300 --tradingagents-llm-max-retries 1 --tradingagents-max-data-rows 60 --tradingagents-max-news-items 12 --tradingagents-max-news-summary-chars 500
-```
-
-输出：
-
-```text
-tradingAgents/.ai_research/latest_bias_ETHUSDT.json
-```
-
-是否影响交易由 `AI_RESEARCH_MODE` 决定；默认 `off` 不读取，当前 Demo 测试使用 `filter_reduce`。
-
-## 9. 已删除的辅助脚本
-
-`ai_bias_observer.py` 和阶段 0 使用的测试脚本已按要求从运行目录和仓库删除。运行态验证由 `bian_new.py` 的结构化 AI JSONL 审计承担。
-
-## 10. Bias JSON 规则
-
-schema：
+示例：
 
 ```json
 {
-  "symbol": "ETHUSDT",
-  "generated_at": "2026-07-07T21:02:22+08:00",
-  "expires_at": "2026-07-08T05:02:22+08:00",
-  "portfolio_stance": "overweight|neutral|underweight",
-  "futures_bias": "long|short|neutral|mixed",
+  "symbol": "BTCUSDT",
+  "generated_at": "2026-08-17T12:00:00+08:00",
+  "expires_at": "2026-08-17T21:00:00+08:00",
+  "portfolio_stance": "neutral",
+  "futures_bias": "mixed",
   "time_horizon_hours": 9,
   "explicit_long_signal": false,
   "explicit_short_signal": false,
-  "confidence": 0.0,
+  "confidence": 0.55,
   "allow_long": true,
   "allow_short": true,
   "risk_multiplier": 1.0,
@@ -613,1267 +299,199 @@ schema：
 }
 ```
 
-每个 key 的作用：
-
-| key | 类型 | 作用 | 当前是否用于实盘 |
-|---|---|---|---|
-| `symbol` | string | bias 对应的交易标的。当前固定为 `ETHUSDT`。 | 否 |
-| `generated_at` | ISO datetime | bias 生成时间，统一使用实盘交易时区：北京时间/UTC+8，必须带时区偏移，例如 `+08:00`。 | 否 |
-| `expires_at` | ISO datetime | bias 过期时间，统一使用实盘交易时区：北京时间/UTC+8，必须带时区偏移。未来接入时，过期必须 fail-open。 | 否 |
-| `portfolio_stance` | string | 投资组合观点：`overweight`、`neutral`、`underweight`。减仓观点不等于期货做空。 | 否 |
-| `futures_bias` | string | 未来时间窗口内的期货方向：`long`、`short`、`neutral`、`mixed`。 | 否 |
-| `time_horizon_hours` | integer | 期货方向对应的时间窗口，当前为 9 小时。 | 否 |
-| `explicit_long_signal` | boolean | 报告是否明确支持当前时间窗口做多，而不只是 Overweight 或分批买入。 | 否 |
-| `explicit_short_signal` | boolean | 报告是否明确支持当前时间窗口做空，而不只是 Underweight、SELL 或减仓。 | 否 |
-| `confidence` | number | 置信度，范围 `0.0` 到 `1.0`。越高代表证据越一致、方向越明确；它不是胜率，也不代表保证盈利。 | 否 |
-| `allow_long` | boolean | 只有明确 short 信号、足够置信度并明确要求禁止多单时才可能为 `false`。 | 否 |
-| `allow_short` | boolean | 只有明确 long 信号、足够置信度并明确要求禁止空单时才可能为 `false`。 | 否 |
-| `risk_multiplier` | number | 已有仓位相对初始成交量的目标保留比例，范围 `0.0` 到 `1.0`；不参与初始开仓量计算。 | 否 |
-| `reason` | string | 简短解释，说明为什么给出该 bias。用于人工复盘。 | 否 |
-| `risk_events` | array[string] | 需要关注的风险事件，例如宏观事件、监管、重大新闻。 | 否 |
-| `news_used` | array[string] | DeepSeek 归一化时认为关键的新闻标题或主题。用于追溯来源。 | 否 |
-| `source_counts` | object | 本次输入里各数据源数量，例如 Finnhub/RSS/GDELT。用于判断数据覆盖度。 | 否 |
-
-### 10.1 portfolio_stance / futures_bias
-
-`portfolio_stance` 和 `futures_bias` 必须分开：
+执行层会验证：
 
 ```text
-Underweight / SELL / 减少现货多头:
-  portfolio_stance 可以是 underweight
-  不能仅凭这些词得到 futures_bias = short
-
-Overweight / BUY / 分批买入:
-  portfolio_stance 可以是 overweight
-  不能仅凭这些词得到 futures_bias = long
+symbol 必须和当前持仓交易对一致。
+generated_at / expires_at 必须是带时区的 ISO 时间。
+文件不能来自超出容差的未来，也不能已经过期。
+枚举、布尔、数组和数值范围必须合法。
+confidence 和 risk_multiplier 必须在 0 到 1 之间。
+任何异常都返回 fail-open guard。
 ```
 
-`futures_bias` 是研究层对未来 9 小时期货环境的方向偏见，不是交易信号，也不是订单指令。
+`risk_multiplier` 是目标保留比例，只能用于缩小已有仓位，不能参与扩大仓位或补回已经减掉的数量。
 
-| futures_bias | 含义 | 未来接入时的默认态度 |
-|---|---|---|
-| `long` | 明确支持未来 9 小时期货偏多。 | 仍需 explicit long 信号和明确禁止空单才能限制做空。 |
-| `short` | 明确支持未来 9 小时期货偏空。 | 仍需 explicit short 信号和明确禁止多单才能限制做多。 |
-| `neutral` | 中性。没有足够证据支持明确方向，或者市场处于等待状态。 | 不拦截多空，交给原策略判断。 |
-| `mixed` | 分歧。不同证据互相冲突，例如技术偏多但新闻/宏观偏空，或 TradingAgents 内部观点不一致。 | 不拦截多空，交给原策略判断。 |
+## 10. manage 模式
 
-重要区别：
+当前 `.env.local` 的 AI 相关配置是：
 
-```text
-futures_bias=long 不等于立刻开多。
-futures_bias=short 不等于立刻开空。
-neutral/mixed 不等于禁止交易。
-
-AI bias 未来最多只能做过滤、降仓或观察提示。
-真正入场、止损、止盈仍由 bian_new.py 的原策略决定。
+```env
+AI_RESEARCH_MODE=manage
+AI_ALLOW_POSITION_REDUCTION=1
+MANUAL_AI_RESEARCH_ENABLED=1
 ```
 
-### 10.2 confidence 置信度含义
+未显式覆盖时，关键默认值由 `ai_research_guard.py` 加载：
 
-`confidence` 表示这次研究结论的证据一致性和方向明确程度。
-
-它不是胜率，不是收益率，也不是“越高越一定赚钱”。它只回答一个问题：
-
-```text
-这次 TradingAgents 多 Agent 报告 + 新闻 + 宏观 + 行情摘要，对同一个方向的支持有多一致？
-```
-
-取值解释：
-
-| confidence 范围 | 含义 | 未来接入时的处理原则 |
-|---|---|---|
-| `0.00 - 0.54` | 低置信度。证据不足、数据缺失、观点冲突或方向不明确。 | 必须 fail-open，不拦截多空。 |
-| `0.55 - 0.64` | 中等置信度。有一定方向，但还不足以影响实盘交易方向。 | 默认不拦截，可用于观察和复盘。 |
-| `0.65 - 0.79` | 较高置信度。方向较明确，多个输入互相支持。 | 未来才可能用于过滤反向开仓或降低反向仓位。 |
-| `0.80 - 1.00` | 高置信度。证据高度一致，风险事件也相对明确。 | 仍不能直接下单，只能更强地参与过滤或降仓规则。 |
-
-当前阈值：
-
-```text
-confidence < 0.55:
-  低置信度，不允许影响交易。
-
-confidence >= 0.65、futures_bias 明确、对应 explicit 信号为 true，
-并且模型明确要求禁止反向开仓:
-  未来才可能影响 allow_long/allow_short。
-
-0.55 <= confidence < 0.65:
-  可以记录，但不应用来拦截方向。
-```
-
-### 10.3 allow_long / allow_short 含义
-
-`allow_long` 和 `allow_short` 是新开仓方向许可位。`bian_new.py` 已读取它们，但只有 `filter` 或 `manage` 模式、JSON 有效且全部严格过滤条件满足时才会拦截候选。
-
-| allow_long | allow_short | 含义 |
-|---|---|---|
-| `true` | `true` | 多空都允许。AI 不干预原策略。 |
-| `true` | `false` | 只允许做多。必须同时有高置信度、明确 long 信号和明确禁止空单。 |
-| `false` | `true` | 只允许做空。必须同时有高置信度、明确 short 信号和明确禁止多单。 |
-| `false` | `false` | 当前规则不主动生成这种状态。未来即使出现，也应按 fail-open 或禁止新开仓单独评估，不能未经验证直接接实盘。 |
-
-### 10.4 risk_multiplier 含义
-
-`risk_multiplier` 是未来接入实盘后用于已有仓位的目标保留比例，当前观察程序不影响任何实盘仓位。
-
-```text
-1.0 = 保留初始成交仓位，不减仓。
-0.8 = 已有仓位最多保留到初始成交量的 80%。
-0.5 = 已有仓位最多保留到初始成交量的 50%，但仍受执行层最低保留比例限制。
-```
-
-使用原则：
-
-```text
-risk_multiplier 不参与初始开仓数量计算。
-候选通过方向过滤后，仍按原策略计算的完整数量开仓。
-risk_multiplier 只能缩紧已有仓位，不能放大仓位，也不能补回已经减掉的仓位。
-不能因为 AI 高置信度就把 risk_multiplier 设成大于 1.0。
-实盘接入前必须单独测试 reduceOnly 减仓、止损重挂和记账逻辑。
-```
-
-### 10.5 reason / risk_events / news_used / source_counts 含义
-
-| key | 详细说明 |
-|---|---|
-| `reason` | 给人看的短解释。重点写为什么是这个 bias，以及哪些证据最关键。不能作为程序交易条件直接解析。 |
-| `risk_events` | 风险事件列表，例如美联储、CPI、ETF、监管、交易所故障、重大安全事件。用于人工复盘和未来风控提示。 |
-| `news_used` | DeepSeek 认为影响判断的新闻标题或主题。用于追溯判断来源，不代表这些新闻一定真实完整，需要结合原始链接复核。 |
-| `source_counts` | 本次输入中各类数据源数量，例如 `{"finnhub": 8, "rss": 12, "gdelt": 20}`。数量低说明覆盖不足，应降低信任。 |
-
-注意：
-
-```text
-当前这些 key 都不会被 bian_new.py 读取。
-它们是研究输出字段和未来接入时的协议定义。
-时间字段只保留一套口径：和 `bian_new.py` 的 `EXCHANGE_TZ` 一致，使用北京时间/UTC+8 ISO 时间。
-未来实盘读取时必须按 timezone-aware datetime 解析，不能去掉 `+08:00` 后用字符串或 naive datetime 比较。
-```
-
-### 10.6 fail-open 和方向过滤规则
-
-#### fail-open 规则
-
-fail-open 的意思是：AI 不拦截，不改变 `bian_new.py` 原策略。它不是“不开仓”，而是“AI 放行，是否开仓仍由原策略决定”。
-
-```text
-数据异常、过期、缺字段、解析失败:
-  allow_long = true
-  allow_short = true
-
-confidence < 0.55:
-  allow_long = true
-  allow_short = true
-
-futures_bias = neutral 或 mixed:
-  allow_long = true
-  allow_short = true
-```
-
-#### 高置信度方向过滤规则
-
-下面两条不是 fail-open，而是未来可能接入的方向过滤。
-
-它们不会让 AI 主动开仓，只会在 `bian_new.py` 原策略已经出现开仓候选后，决定是否允许这个方向继续。
-
-```text
-futures_bias = long 且 confidence >= 0.65
-且 explicit_long_signal = true
-且模型明确返回 allow_short = false:
-  allow_short = false
-
-futures_bias = short 且 confidence >= 0.65
-且 explicit_short_signal = true
-且模型明确返回 allow_long = false:
-  allow_long = false
-
-其他情况:
-  allow_long = true
-  allow_short = true
-```
-
-未来接入后的含义：
-
-```text
-如果原策略没有开仓信号:
-  AI bias 不能自己开仓。
-
-如果原策略给出多单候选:
-  allow_long = true  -> 允许继续走原策略下单流程。
-  allow_long = false -> 跳过这次多单候选。
-
-如果原策略给出空单候选:
-  allow_short = true  -> 允许继续走原策略下单流程。
-  allow_short = false -> 跳过这次空单候选。
-
-当前阶段:
-  bian_new.py 已读取这些字段；默认 mode=off，filter/manage 未启用时不会过滤候选。
-```
-
-## 11. 当前测试结果
-
-### 11.1 数据源测试
-
-已通过：
-
-```text
-ETH OHLCV / Binance
-ETH 新闻 / Finnhub + RSS + GDELT
-AAPL OHLCV / Nasdaq fallback
-AAPL SEC income statement
-AAPL SEC balance sheet
-AAPL SEC cashflow
-AAPL SEC insider filings
-FRED macro cache
-Binance 多周期摘要
-```
-
-### 11.2 TradingAgents 完整流程
-
-已成功生成：
-
-```text
-outputs/ETH-USD_2026-07-08_*
-outputs/ETH-USD_2026-07-09_*
-outputs/ETH-USD_2026-07-10_*
-outputs/ETH-USD_2026-07-11_*
-```
-
-使用参数：
-
-```bash
---deep deepseek-v4-pro
---quick deepseek-v4-flash
---llm-timeout 300
---max-data-rows 60
---max-news-items 12
---max-news-summary-chars 500
-```
-
-截至 2026-07-11 05:58 的结果：
-
-```text
-完整任务：10
-成功：10
-Underweight：9
-Overweight：1
-LLM timeout：0
-```
-
-### 11.3 ai_market_bias.py
-
-已通过：
-
-```text
---fetch-only
---dry-run
-正常写 latest_bias_ETHUSDT.json
-JSON schema 校验
-fail-open 规则校验
-旧字段忽略校验
-观察 CSV schema 自动迁移
-```
-
-基于 2026-07-11 TradingAgents Underweight 报告的新协议 dry-run 输出：
-
-```json
-{
-  "portfolio_stance": "underweight",
-  "futures_bias": "neutral",
-  "time_horizon_hours": 9,
-  "explicit_long_signal": false,
-  "explicit_short_signal": false,
-  "confidence": 0.55,
-  "allow_long": true,
-  "allow_short": true,
-  "risk_multiplier": 0.7
-}
-```
-
-这次 TradingAgents 的投资组合观点是 Underweight，但没有明确的 9 小时期货做空信号，因此期货方向为 neutral，双向放行。
-
-已修复旧协议中的问题：
-
-```text
-Underweight / SELL 不再自动映射成 futures short。
-bearish + confidence >= 0.65 不再自动覆盖 allow_long=false。
-只有 explicit 信号、置信度和明确禁止反向开仓三项同时满足时，才可能限制方向。
-```
-
-阶段 0 曾完成 31 项单元和 mock 验证；相关测试脚本随后已按要求删除，当前仓库不再提供这些测试命令。
-
-### 11.4 历史三天观察结论
-
-截至 2026-07-11 05:58，北京时间共记录 10 轮完整任务：
-
-```text
-TradingAgents 成功：10 / 10
-任务退出码 0：10 / 10
-平均耗时：约 460 秒
-最短耗时：411 秒
-最长耗时：515 秒
-Binance 摘要错误：0
-```
-
-观察期内每天均成功生成 ETH-USD summary、state 和 decision；对应运行产物已清理，不属于当前源码。
-
-历史旧协议方向字段与 Binance ETHUSDT 5 分钟 K 线对齐后的结果：
-
-| 预测窗口 | 方向样本 | 正确率 | 平均方向收益 |
-|---|---:|---:|---:|
-| 1 小时 | 8 | 25.0% | -0.110% |
-| 4 小时 | 8 | 50.0% | -0.127% |
-| 9 小时 | 7 | 42.9% | -0.423% |
-
-结论：
-
-```text
-运行稳定性已验证。
-历史方向字段没有表现出可直接用于开多/开空的优势。
-不能把 TradingAgents 的 Underweight 直接理解为期货 short。
-当前仍不接入 bian_new.py，不影响实盘交易行为。
-```
-
-## 12. 运行产物目录
-
-这些目录是运行产物，不属于方案源码。
-
-### .ai_research/
-
-`ai_market_bias.py` 的运行目录。
-
-```text
-.ai_research/latest_bias_ETHUSDT.json
-.ai_research/cache/
-.ai_research/logs/
-.ai_research/logs/ai_bias_YYYY-MM.csv
-```
-
-### outputs/
-
-`analyze_eth_tradingagents.py` 导出的报告目录。
-
-```text
-outputs/ETH-USD_YYYY-MM-DD_summary.md
-outputs/ETH-USD_YYYY-MM-DD_state.json
-outputs/ETH-USD_YYYY-MM-DD_decision.json
-```
-
-### .tradingagents/
-
-TradingAgents 框架自己的缓存、日志和 memory。
-
-```text
-.tradingagents/cache/
-.tradingagents/logs/
-.tradingagents/memory/
-```
-
-## 13. 当前调度
-
-当前没有 TradingAgents 或 AI bias 的 cron 定时任务。
-
-三天观察任务已经结束，相关临时脚本、独立运行日志和定时条目均已删除。需要生成研究结果时使用第 7、8 节的命令手工运行；未来接入 `bian_new.py` 后，再单独设计生产调度、锁和告警。
-
-保留的运行原则：
-
-```text
-ai_market_bias.py 默认要求存在新鲜的 TradingAgents summary。
-summary 缺失或过期时应失败，不能退化成单模型自行判断。
-AI JSON 缺失、过期或损坏时，交易执行层必须 fail-open。
-```
-
-## 14. 当前状态与下一步
-
-已完成：
-
-```text
-TradingAgents 连续运行稳定性验证。
-portfolio_stance 与 futures_bias 语义拆分。
-旧字段 bias 和 size_multiplier 移除。
-多来源新闻汇总、评分、去重和来源配额。
-Bias JSON fail-open 验证。
-bian_new.py 候选过滤、pending 撤单和已有仓位 reduceOnly 接入。
-JSON 原子写入、交易侧幂等和独立 AI JSONL 审计。
-阶段 0 共 31 项测试及相关 Python 静态编译验证。
-```
-
-尚未实现：
-
-```text
-AI 主动全量平仓。
-AI 自动反手。
-Binance 对冲持仓模式下的 AI 部分减仓。
-manage 模式独立于原策略的额外止损价格模型。
-```
-
-当前从 `/home/ubuntu/binance` 启动 Binance Demo 一周测试，使用 `filter_reduce` 同时验证阶段 1、2、3。仓库默认配置仍为 `off`，不会在未显式设置模式时改变交易。
-
-## 15. bian_new.py 实盘接入方案
-
-### 15.1 接入结论
-
-AI 研究层可以接入 bian_new.py，但首次接入不应同时启用所有交易动作。
-
-推荐顺序：
-
-~~~text
-第 1 步：读取 + 校验 + 日志，不改变交易。
-第 2 步：原策略保持原开仓数量，AI 不缩放初始开仓。
-第 3 步：出现明确反向信号或 risk_multiplier 要求缩紧时，对已有仓位执行 reduceOnly 部分减仓。
-第 4 步：经过额外样本验证后，才允许硬过滤新开仓候选方向。
-第 5 步：AI 主动全平默认长期关闭。
-~~~
-
-任何阶段都必须保持：
-
-~~~text
-AI 不能凭空创建开仓候选。
-AI 不能把 long 候选反转成 short，或把 short 反转成 long。
-AI 不能增加仓位。
-AI 不能放宽止损。
-AI 不能修改杠杆。
-AI 文件异常时必须 fail-open。
-~~~
-
-Git 仓库中的 Demo 副本仍明确调用：
-
-~~~python
-exchange.enable_demo_trading(True)
-~~~
-
-主网运行文件 `/home/ubuntu/binance/bian_new.py` 保持该调用关闭，Git 仓库副本 `/home/ubuntu/binance_auto/bian_new.py` 保持 Demo 开启。两者的 AI 接入逻辑相同，交易环境开关不得由 AI 修改。
-
-### 15.2 建议配置开关
-
-以下环境变量已经接入 `bian_new.py`。默认 `off`，只有按阶段显式启用模式和独立动作开关后才会影响交易。
-
-默认全部保持保守状态：
-
-~~~text
-AI_RESEARCH_MODE=off
+```env
 AI_BIAS_FILE=/home/ubuntu/binance/tradingAgents/.ai_research/latest_bias_ETHUSDT.json
 AI_FILTER_MIN_CONFIDENCE=0.75
 AI_REDUCE_MIN_CONFIDENCE=0.75
-AI_REVERSE_SIGNAL_RETAINED_POSITION_RATIO=0.75
-AI_MIN_RETAINED_POSITION_RATIO=0.75
-AI_MAX_POSITION_REDUCTION=0.25
+AI_REVERSE_SIGNAL_RETAINED_POSITION_RATIO=0.5
+AI_MIN_RETAINED_POSITION_RATIO=0.5
+AI_MAX_POSITION_REDUCTION=0.5
 AI_ALLOW_POSITION_REDUCTION=0
 AI_ALLOW_FULL_CLOSE=0
 AI_ALLOW_REVERSE=0
 AI_BIAS_FUTURE_TOLERANCE_SECONDS=300
-~~~
-
-#### 15.2.1 字段说明
-
-| 字段 | 默认值 | 作用 |
-|---|---:|---|
-| `AI_RESEARCH_MODE` | `off` | AI 总模式。决定是否读取 JSON，以及允许进入日志、过滤、减仓或管理流程。 |
-| `AI_BIAS_FILE` | `.ai_research/latest_bias_ETHUSDT.json` | 最新 Bias JSON 路径。文件缺失、损坏、过期或校验失败时必须 fail-open。目录和文件由研究脚本运行时创建。 |
-| `AI_FILTER_MIN_CONFIDENCE` | `0.75` | 过滤新开仓候选的最低置信度。达到阈值仍不够，还必须有明确反向 futures signal 和对应 `allow_* = false`。 |
-| `AI_REDUCE_MIN_CONFIDENCE` | `0.75` | 缩紧已有仓位的最低置信度。适用于明确反向信号或 `risk_multiplier` 低于当前保留比例。 |
-| `AI_REVERSE_SIGNAL_RETAINED_POSITION_RATIO` | `0.75` | 已有仓位遇到明确反向信号时的默认目标保留比例。即使该次 `risk_multiplier=1.0`，也可以请求保留到初始仓位的 75%。 |
-| `AI_MIN_RETAINED_POSITION_RATIO` | `0.75` | AI 减仓后的绝对最低保留比例，防止 AI 直接清仓。比例基于该笔交易的实际初始成交数量。 |
-| `AI_MAX_POSITION_REDUCTION` | `0.25` | AI 相对初始成交数量允许的累计最大减仓比例。默认累计最多减掉 25%，不是每次报告都减 25%。 |
-| `AI_ALLOW_POSITION_REDUCTION` | `0` | `reduceOnly` 部分减仓独立总开关。为 `0` 时，`reduce` / `manage` 也只能记录本应减仓的结果。 |
-| `AI_ALLOW_FULL_CLOSE` | `0` | AI 全量平仓预留开关。当前实现不支持，配置成 `1` 会在启动时被拒绝，不会进入交易循环。 |
-| `AI_ALLOW_REVERSE` | `0` | 自动反手预留开关。当前实现不支持，配置成 `1` 会在启动时被拒绝，应长期保持 `0`。 |
-| `AI_BIAS_FUTURE_TOLERANCE_SECONDS` | `300` | 容忍 `generated_at` 最多比交易服务器当前时间提前 300 秒，用于处理时钟误差。它不是 JSON 有效期；有效期仍由 `expires_at` 决定。 |
-
-#### 15.2.2 AI_RESEARCH_MODE
-
-| mode | 行为 |
-|---|---|
-| off | 完全不读取 AI 文件。 |
-| log | 读取、校验并写结构化审计日志，同时计算 `would_filter` / `would_reduce`；实际不改变候选、仓位或订单。 |
-| reduce | 在 log 基础上，只允许按目标保留比例缩紧已有仓位；不改变初始开仓量，不过滤新候选，不撤销 pending。减仓后必须按剩余仓位刷新保护止损数量。 |
-| filter | 在 log 基础上，允许过滤满足全部严格条件的新开仓候选。 |
-| filter_reduce | 一周 Demo 验证模式：同时写审计、过滤严格反向候选，并允许受限的 `reduceOnly` 部分减仓；不撤销 pending，不主动收紧止损。 |
-| manage | 完整管理模式：允许已经验证的 filter、reduce、未成交 pending 撤单和止损收紧。AI 全平和自动反手当前均未实现。 |
-
-模式能力矩阵：
-
-| 动作 | off | log | reduce | filter | filter_reduce | manage |
-|---|---:|---:|---:|---:|---:|---:|
-| 读取并校验 JSON | 否 | 是 | 是 | 是 | 是 | 是 |
-| 写 AI 审计日志 | 否 | 是 | 是 | 是 | 是 | 是 |
-| 过滤新开仓候选 | 否 | 否 | 否 | 是 | 是 | 是 |
-| `reduceOnly` 减少已有仓位 | 否 | 否 | 是 | 否 | 是 | 是 |
-| 撤销明确反向的未成交 pending | 否 | 否 | 否 | 否 | 否 | 是 |
-| 主动收紧保护止损 | 否 | 否 | 否 | 否 | 否 | 是 |
-| AI 全平 | 否 | 否 | 否 | 否 | 否 | 当前未实现 |
-| 自动反手 | 否 | 否 | 否 | 否 | 否 | 否 |
-
-`log` 模式的“写日志”不是交易成交 CSV。它应为每个候选或持仓评估写结构化 AI 审计事件，至少包含：
-
-~~~text
-event / observed_at / symbol / mode
-candidate side 或 position side / amount
-AI valid / fail_open / error
-generated_at / expires_at
-portfolio_stance / futures_bias / explicit signals
-confidence / allow_long / allow_short / risk_multiplier
-actual_action = log_only
-shadow_action = would_allow / would_filter / would_reduce
-shadow_reduce_amount / reason
-~~~
-
-推荐写入独立月度 JSONL，例如 `ai_research_decisions_YYYY-MM.jsonl`，并用现有 `logging.info()` 输出简短摘要。这样未成交候选也能复盘，不应混入只记录实际成交结果的 `trades_log_YYYY-MM.csv`。
-
-#### 15.2.3 仓位比例组合规则
-
-有效最低保留比例：
-
-~~~python
-retained_ratio_floor = max(
-    AI_MIN_RETAINED_POSITION_RATIO,
-    1.0 - AI_MAX_POSITION_REDUCTION,
-)
-~~~
-
-当前默认值的结果（所有参数都是 0.5）：
-
-~~~text
-max(0.5, 1.0 - 0.5) = 0.5
-~~~
-
-初始成交 `1.00 ETH` 时：
-
-~~~text
-risk_multiplier=0.80：目标保留 0.80 ETH，最多减 0.20 ETH。
-明确反向信号且 risk_multiplier=1.00：按反向信号默认比例，目标保留 0.50 ETH。
-risk_multiplier=0.50：受最低保留比例限制，仍可减到 0.50 ETH。
-仓位已经低于目标：不补仓，也不继续减仓。
-~~~
-
-真正执行部分减仓必须同时满足：
-
-~~~text
-AI_RESEARCH_MODE = reduce 或 manage
-AI_ALLOW_POSITION_REDUCTION = 1
-JSON 合法且未过期
-confidence >= AI_REDUCE_MIN_CONFIDENCE
-出现明确反向信号，或 risk_multiplier 低于当前持仓比例
-交易所真实仓位查询成功
-同一个 generated_at 尚未执行过减仓
-~~~
-
-#### 15.2.4 开关优先级
-
-~~~text
-AI_RESEARCH_MODE=off：覆盖其他所有 AI 开关，不读取 JSON。
-JSON 无效或过期：fail-open，只运行原策略。
-AI_ALLOW_POSITION_REDUCTION=0：禁止任何 AI 部分减仓。
-AI_ALLOW_FULL_CLOSE 只能为 0；设为 1 时启动配置校验失败。
-AI_ALLOW_REVERSE 只能为 0；设为 1 时启动配置校验失败。
-~~~
-
-真实资金和 Demo 环境建议改为独立环境变量，例如：
-
-~~~text
-BINANCE_DEMO_TRADING=1
-~~~
-
-只有人工确认后才能设为 0。AI 代码不得修改该值。
-
-### 15.3 AI bias 读取与校验
-
-新增统一入口：
-
-~~~python
-load_ai_research_guard(now_dt) -> dict
-~~~
-
-建议返回：
-
-~~~json
-{
-  "valid": true,
-  "fail_open": false,
-  "symbol": "ETHUSDT",
-  "generated_at": "...",
-  "expires_at": "...",
-  "portfolio_stance": "underweight",
-  "futures_bias": "neutral",
-  "time_horizon_hours": 9,
-  "explicit_long_signal": false,
-  "explicit_short_signal": false,
-  "confidence": 0.55,
-  "allow_long": true,
-  "allow_short": true,
-  "risk_multiplier": 0.8,
-  "reason": "...",
-  "error": ""
-}
-~~~
-
-必须校验：
-
-~~~text
-文件存在且是合法 JSON。
-symbol 必须等于 ETHUSDT。
-generated_at / expires_at 必须带时区。
-generated_at 不能超过当前时间 5 分钟以上。
-当前时间必须早于 expires_at。
-futures_bias 只能是 long / short / neutral / mixed。
-portfolio_stance 只能是 overweight / neutral / underweight。
-confidence 必须在 0 到 1。
-risk_multiplier 必须在 0 到 1。
-explicit 和 allow 字段必须是 boolean。
-~~~
-
-任何校验失败：
-
-~~~text
-valid = false
-fail_open = true
-allow_long = true
-allow_short = true
-risk_multiplier = 1.0
-不取消 pending
-不减仓
-不平仓
-~~~
-
-执行层只使用当前 JSON 字段。旧字段 `bias` 和 `size_multiplier` 不再生成，也不参与读取或执行逻辑。
-
-### 15.4 开仓候选接入点
-
-接入位置在 _run_strategy_impl()：
-
-~~~text
-build_entry_candidates()
-        ↓
-选择 candidate = top_candidates[0]
-        ↓
-原有价格、支撑阻力、目标利润校验
-        ↓
-新增 evaluate_ai_entry_candidate(candidate, ai_guard)
-        ↓
-place_pending_entry_order()
-~~~
-
-AI 只能评估已经由原策略产生的 candidate。
-
-建议返回：
-
-~~~json
-{
-  "allowed": true,
-  "action": "allow",
-  "reason": "AI did not block candidate",
-  "bias_generated_at": "..."
-}
-~~~
-
-过滤 long 候选必须同时满足：
-
-~~~text
-AI_RESEARCH_MODE = filter、filter_reduce 或 manage。
-AI guard 有效且未过期。
-futures_bias = short。
-explicit_short_signal = true。
-confidence >= AI_FILTER_MIN_CONFIDENCE，初始建议 0.75。
-allow_long = false。
-~~~
-
-过滤 short 候选必须同时满足：
-
-~~~text
-AI_RESEARCH_MODE = filter、filter_reduce 或 manage。
-AI guard 有效且未过期。
-futures_bias = long。
-explicit_long_signal = true。
-confidence >= AI_FILTER_MIN_CONFIDENCE。
-allow_short = false。
-~~~
-
-其他所有情况都放行。
-
-portfolio_stance 不参与候选方向过滤。Underweight 不能单独拦截 long，Overweight 不能单独拦截 short。
-
-### 15.5 新开仓数量保持不变
-
-当前仓位在 calculate_candidate_amount() 中根据：
-
-~~~text
-account_equity * MARGIN_RATE * LEVERAGE / entry_price
-~~~
-
-计算。
-
-~~~text
-AI 不修改 calculate_candidate_amount() 的结果。
-AI 不修改 MARGIN_RATE 或 LEVERAGE。
-AI 不因为同方向信号增加仓位。
-risk_multiplier 不应用于初始开仓数量。
-如果候选未被硬过滤，place_pending_entry_order() 使用原策略计算的完整 amount。
-~~~
-
-需要把开仓时的 AI snapshot 写入 candidate 或 entry_meta，再保存到 pending 和 trade_state，用于成交后判断 bias 是否发生反向变化。
-
-注意：当前基础配置 MARGIN_RATE=0.6、LEVERAGE=10，本身属于高风险暴露。切换真实资金前必须单独审计基础仓位和杠杆；AI multiplier 不能替代基础风险控制。
-
-### 15.6 pending STOP_LIMIT 管理
-
-接入位置在 manage_pending_entry()。
-
-只有 `AI_RESEARCH_MODE=manage` 才允许 AI 撤销未成交 pending。每次管理未成交 pending 时重新读取最新 AI guard。
-
-只有满足全部硬过滤条件且订单尚未成交时，才能：
-
-~~~python
-cancel_pending_entry_order("AI明确反向过滤，撤销未成交pending")
-~~~
-
-规则：
-
-~~~text
-AI 变成 neutral/mixed：保留 pending。
-AI 文件过期或读取失败：保留 pending，fail-open。
-只有 portfolio_stance 改变：保留 pending。
-只有 risk_multiplier 降低：首次版本保留 pending，不动态改量。
-pending 已部分成交：不得按 AI 直接平掉已成交部分，继续走原有部分成交保护流程。
-明确反向信号且满足硬过滤：只撤销尚未成交的剩余订单。
-~~~
-
-首次真实资金版本建议不开启 pending AI 撤单，先记录如果启用本应撤销的次数和结果。
-
-### 15.7 持仓阶段的处理原则
-
-现有持仓管理入口：
-
-~~~text
-monitor_position_new()
-apply_new_exit_rules()
-update_stop_if_tighter()
-close_position()
-~~~
-
-log / filter 模式：
-
-~~~text
-AI 不主动平仓。
-AI 不主动部分减仓。
-AI 不改变目标位。
-AI 不放宽保护止损。
-AI 只记录持仓方向与最新 futures_bias 是否一致。
-~~~
-
-`reduce` 和 `manage` 都允许缩紧已有仓位，但只有 `manage` 允许把“主动收紧止损”作为独立 AI 保护动作。`reduce` 在减仓后刷新止损数量属于订单一致性维护，不代表 AI 可以任意改变止损价格。任何模式都不能立即反手：
-
-~~~text
-long 持仓遇到明确 short 信号：
-  即使 risk_multiplier=1.0，也按反向信号默认目标保留比例执行 reduceOnly 部分减仓。
-  manage 模式可同时使用原策略 K 线和 ATR 算出的更紧 stop。
-
-short 持仓遇到明确 long 信号：
-  即使 risk_multiplier=1.0，也按反向信号默认目标保留比例执行 reduceOnly 部分减仓。
-  manage 模式可同时使用原策略 K 线和 ATR 算出的更紧 stop。
-
-futures_bias 没有反向，但 risk_multiplier 明确低于当前持仓比例：
-  只缩紧已有仓位，不改变方向。
-~~~
-
-`manage` 模式主动收紧止损时必须调用现有 `update_stop_if_tighter()`，确保：
-
-~~~text
-long 的新 stop 只能更高。
-short 的新 stop 只能更低。
-AI 不能直接提供任意 stop 价格。
-止损更新失败继续走现有保护性平仓和失败计数。
-~~~
-
-### 15.8 部分减仓方案
-
-当前代码没有通用的主动部分减仓函数，close_position() 是全量市价平仓。
-
-需要新增：
-
-~~~python
-reduce_position_fraction(fraction, reason, ai_guard)
-~~~
-
-安全流程（Binance 单边走仓模式）：
-
-~~~text
-1. 重新调用 get_position_risk() 获取交易所真实仓位。
-2. 获取实际 side 和 actual position amount，不能只信本地 trade_state。
-3. raw_position_side = info.get('positionSide', 'BOTH').upper()
-   * raw_position_side == 'BOTH': 单边走仓模式，可执行 reduceOnly。
-   * raw_position_side in ('LONG', 'SHORT'): **对冲持仓模式，当前不支持！**
-4. fraction 限制在 0 到 AI_MAX_POSITION_REDUCTION。
-5. reduce amount 按交易所精度处理并检查最小数量。
-6. 使用持仓反方向 MARKET 订单。
-7. params 必须包含 reduceOnly=true。
-8. ⚠️ **对冲模式跳过**：raw_position_side in ('LONG', 'SHORT') 时直接返回，不执行减仓。
-9. 不允许 closePosition 和 reduceOnly 混用。
-10. 成交后重新读取真实剩余仓位。
-11. 撤销旧保护止损，并按剩余数量重新挂 STOP_MARKET。
-12. 更新 trade_state.amount、手续费、累计已减仓数量和通知日志。
-
-⚠️ 重要限制：
-  * Binance 对冲模式下，reduceOnly 的行为不同步，可能需要额外参数指定减少哪个方向的仓位。
-  * 当前实现仅支持单边走仓模式（positionSide=BOTH），对冲模式下一律跳过并记录日志。
-  * 如需支持对冲模式，需重构减仓逻辑，明确指定 LONG/SHORT 方向分别处理。
-~~~
-
-示例：
-
-~~~text
-long 持仓减仓：
-  side = sell
-  reduceOnly = true
-
-short 持仓减仓：
-  side = buy
-  reduceOnly = true
-~~~
-
-必须在实际成交时保存：
-
-~~~text
-entry_initial_amount = 实际初始成交数量
-~~~
-
-对部署前已经存在的仓位，首次同步时用交易所实际数量建立 baseline，并明确写日志。
-
-risk_multiplier 在执行层的含义改为：
-
-~~~text
-目标保留仓位 = entry_initial_amount * risk_multiplier
-它只用于已有仓位，不用于初始开仓。
-它是目标比例，不是每轮重复减仓比例。
-~~~
-
-计算方式：
-
-~~~python
-initial_amount = trade_state["entry_initial_amount"]
-actual_amount = exchange_position_amount
-current_ratio = actual_amount / initial_amount
-
-risk_target_ratio = min(1.0, ai_guard["risk_multiplier"])
-requested_target_ratio = risk_target_ratio
-
-if position_is_opposite_to_explicit_signal:
-    requested_target_ratio = min(
-        requested_target_ratio,
-        AI_REVERSE_SIGNAL_RETAINED_POSITION_RATIO,
-    )
-
-retained_ratio_floor = max(
-    AI_MIN_RETAINED_POSITION_RATIO,
-    1.0 - AI_MAX_POSITION_REDUCTION,
-)
-target_ratio = max(retained_ratio_floor, requested_target_ratio)
-target_amount = initial_amount * target_ratio
-reduce_amount = max(0.0, actual_amount - target_amount)
-~~~
-
-示例：
-
-~~~text
-初始仓位 1.00 ETH，risk_multiplier=0.80：
-  目标保留 0.80 ETH，减仓 0.20 ETH。
-
-初始仓位 1.00 ETH，出现明确反向信号，但 risk_multiplier=1.00：
-  按 AI_REVERSE_SIGNAL_RETAINED_POSITION_RATIO=0.75，目标保留 0.75 ETH，减仓 0.25 ETH。
-
-下一轮仍然是 0.80：
-  当前已是 0.80 ETH，不再重复减仓。
-
-下一轮变成 0.90：
-  不自动加回仓位，继续保持 0.80 ETH。
-
-下一轮变成 0.70，但 AI_MIN_RETAINED_POSITION_RATIO=0.75：
-  最多缩到 0.75 ETH。
-~~~
-
-部分减仓有两类触发：
-
-~~~text
-触发 A：持仓方向与明确 futures signal 反向
-  long 持仓 + futures_bias=short + explicit_short_signal=true。
-  short 持仓 + futures_bias=long + explicit_long_signal=true。
-  confidence >= AI_REDUCE_MIN_CONFIDENCE。
-  目标比例取 risk_multiplier 与 AI_REVERSE_SIGNAL_RETAINED_POSITION_RATIO 中更小者。
-
-触发 B：AI 明确要求缩紧持仓
-  risk_multiplier < current_ratio（当前仓位超过 AI 建议的目标保留比例）。
-  confidence >= AI_REDUCE_MIN_CONFIDENCE。
-  不解析 reason 文本，只读取结构化 risk_multiplier。
-
-共同条件（必须同时满足 ALL）：
-  AI guard 有效且未过期（valid=True，未超过 expires_at）。
-  JSON 解析成功，required fields 齐全。
-  AI_RESEARCH_MODE = reduce、filter_reduce 或 manage。
-  AI_ALLOW_POSITION_REDUCTION = 1。
-  triggered = valid AND threshold_met AND (opposite OR risk_requests_reduction) 为 True。
-  同一个 generated_at 尚未执行过减仓（去重检查通过）。
-  交易所仓位查询成功（position_amt > 0）。
-  reduce_amount = max(0.0, current_amount - target_amount) > POSITION_AMT_EPSILON。
-  reduce_amount < current_amount - POSITION_AMT_EPSILON（不会导致全平）。
-
-注意：
-  * triggered 必须同时满足三个子条件，缺一不可。
-  * 同一个 generated_at 只能触发一次减仓，即使后续 bias 的 risk_multiplier 更激进。
-  * 减仓后不会自动补仓，risk_multiplier 回升时维持低位不变。
-~~~
-
-当前默认配置：
-
-~~~text
-AI_REVERSE_SIGNAL_RETAINED_POSITION_RATIO=0.5
-AI_MIN_RETAINED_POSITION_RATIO=0.5
-AI_MAX_POSITION_REDUCTION=0.5
-→ retained_ratio_floor = max(0.5, 1-0.5) = 0.5
-
-初始成交 1.00 ETH 时：
-  risk_multiplier=0.80：目标保留 0.80 ETH，最多减 0.20 ETH。
-  明确反向信号且 risk_multiplier=1.00：按反向信号默认比例，目标保留 0.50 ETH。
-  risk_multiplier=0.50：受最低保留比例限制，仍可减到 0.50 ETH。
-  仓位已经低于目标：不补仓，也不继续减仓。
-
-真正执行部分减仓必须同时满足：
-
-~~~text
-AI_RESEARCH_MODE = reduce 或 manage
-AI_ALLOW_POSITION_REDUCTION = 1
-JSON 合法且未过期
-confidence >= AI_REDUCE_MIN_CONFIDENCE
-出现明确反向信号，或 risk_multiplier 低于当前持仓比例
-交易所真实仓位查询成功
-同一个 generated_at 尚未执行过减仓
-
-首次启用 AI_MIN_RETAINED_POSITION_RATIO=0.5，即累计最多减掉初始仓位的 50%，不能因为 AI 直接清仓。
-
-### 15.8.1 ai_reduce_existing_position 函数实现细节
-
-这是实际执行 reduceOnly 市价减仓的核心函数，位于 `bian_new.py` L5266-5390。
-
-#### 完整执行流程
-
-~~~text
-输入参数：
-  position_risk: 当前持仓信息（含 side、position_amt、info.positionSide）
-  decision: AI 决策结果（含 reduce_amount、target_ratio 等）
-  guard: AI bias JSON 原始数据
-  signal_bar_15m: 15 分钟 K 线信号条（可选）
-
-步骤 1：校验持仓模式
-  raw_position_side = info.get('positionSide', 'BOTH').upper()
-  if raw_position_side in ('LONG', 'SHORT'):
-    记录日志 "AI 减仓暂不支持 Binance 对冲持仓模式"
-    跳过本轮减仓，返回 position_risk
-
-步骤 2：计算实际减仓数量
-  current_amount = abs(price_to_float(position_risk.get('position_amt')))
-  requested_amount = min(current_amount, price_to_float(decision.get('reduce_amount')))
-  
-  try:
-    reduce_amount = float(exchange.amount_to_precision(SYMBOL, requested_amount))
-  except Exception as e:
-    记录精度处理失败日志，跳过
-  
-  min_amount = exchange_min_amount()  # 读取交易对最小下单量
-  if reduce_amount <= POSITION_AMT_EPSILON or reduce_amount < min_amount:
-    记录 "数量低于最小值" 日志，跳过
-  
-  if reduce_amount >= current_amount - POSITION_AMT_EPSILON:
-    记录 "可能导致全平" 错误日志，拒绝执行
-
-步骤 3：执行 reduceOnly 市价单
-  order_side = 'sell' if side == 'long' else 'buy'
-  try:
-    order = exchange.create_order(
-      SYMBOL,
-      'market',
-      order_side,
-      reduce_amount,
-      None,
-      {'reduceOnly': True}
-    )
-  except Exception as e:
-    记录订单失败日志，写 audit event，返回
-
-步骤 4：快速确认成交（最多等待 1 秒）
-  reported_fill = extract_order_filled_amount(order)  # 从订单响应中获取成交数量
-  fallback_reduced_amount = reported_fill if reported_fill > EPSILON else reduce_amount
-  expected_remaining = max(0.0, current_amount - fallback_reduced_amount)
-  confirmed_position = None
-  position_confirmed = False
-  
-  for confirm_delay in (0.0, 0.5, 1):
-    if confirm_delay > 0: time.sleep(confirm_delay)
-    candidate_position = get_position_risk(side=side)
-    if not candidate_position: continue
-    candidate_amount = abs(price_to_float(candidate_position.get('position_amt')))
-    if EPSILON < candidate_amount < current_amount - EPSILON:
-      confirmed_position = candidate_position
-      position_confirmed = True
-      break
-
-步骤 5：确定实际减仓数量和剩余仓位
-  remaining_amount = (
-    abs(price_to_float(confirmed_position.get('position_amt')))
-    if position_confirmed else expected_remaining
-  )
-  actual_reduced_amount = max(0.0, current_amount - remaining_amount)
-  
-  if actual_reduced_amount <= POSITION_AMT_EPSILON:
-    actual_reduced_amount = fallback_reduced_amount  # fallback 到订单响应
-    remaining_amount = expected_remaining
-
-步骤 6：计算减仓价格和手续费
-  reduce_price = price_to_float(order.get('average')) if order.average else mark_price or entry_price
-  fee_rate = get_trading_fee_rate()
-  reduce_fee = reduce_price * actual_reduced_amount * fee_rate
-
-步骤 7：计算减仓已实现盈亏
-  entry_price = price_to_float(trade_state.get('entry_price'))
-  if side == 'long':
-    realized_pnl = (reduce_price - entry_price) * actual_reduced_amount
-  else:
-    realized_pnl = (entry_price - reduce_price) * actual_reduced_amount
-
-步骤 8：更新 trade_state 字段
-  trade_state['amount'] = remaining_amount  # 剩余仓位
-  trade_state['open_fee'] += reduce_fee     # 累加手续费
-  trade_state['ai_snapshot_json'] = json.dumps(ai_guard_snapshot(guard))
-  trade_state['ai_last_reduce_generated_at'] = guard.get('generated_at', '')
-  trade_state['ai_last_reduce_target_ratio'] = price_to_float(decision.get('target_ratio'))
-  trade_state['ai_partial_reduce_count'] += 1
-  trade_state['ai_partial_reduce_amount'] += actual_reduced_amount
-  trade_state['ai_partial_reduce_realized_pnl'] += realized_pnl
-  trade_state['ai_partial_reduce_fee'] += reduce_fee
-  trade_state['ai_reduce_reasons'].append({...})
-
-步骤 9：刷新保护止损订单
-  stop_price = price_to_float(trade_state.get('stop_loss_price'))
-  if stop_price > 0:
-    refresh_protective_stop_order(stop_price)  # 按剩余仓位重新挂单
-
-输出：
-  返回更新后的 position_risk（含最新仓位信息）
-
-关键特性：
-  * 只支持单边走仓模式（BOTH），对冲模式直接跳过
-  * 精度处理和最小量检查保证订单合法性
-  * 快速确认流程最多等待 1 秒，不阻塞主循环
-  * Fallback 机制：如果 1 秒内没读到新仓位，用订单响应的成交数量推算
-  * 记账字段累加：每次减仓都更新 count、amount、pnl、fee
-  * 止损重挂：减仓后必须按剩余数量刷新保护止损
-~~~
-
-### 15.9 全量平仓方案（当前未实现）
-
-AI_ALLOW_FULL_CLOSE 默认必须为 0。
-
-当前配置加载器会拒绝 `AI_ALLOW_FULL_CLOSE=1`。以下内容只保留为未来评审草案，当前代码不存在 AI 全平调用路径。
-
-portfolio_stance、普通 futures_bias 或单次新闻判断都不能调用 close_position()。
-
-未来即使考虑 AI 辅助全平，也必须同时满足：
-
-~~~text
-AI_RESEARCH_MODE = manage。
-AI_ALLOW_FULL_CLOSE = 1。
-明确的反向 explicit futures signal。
-confidence >= 0.85。
-原策略自身也出现出场确认，或保护止损已经需要收紧到接近市价。
-同一个 generated_at 未执行过动作。
-交易所仓位查询成功。
-~~~
-
-AI 平仓后不能在同一轮反向开仓，仍需遵守现有 post-exit cooldown。
-
-任何情况下：
-
-~~~text
-AI 不能撤掉止损后不恢复保护。
-AI 不能在仓位查询失败时平仓。
-AI 不能因文件缺失或过期而平仓。
-AI 不能自动反手。
-~~~
-
-### 15.10 动作矩阵
-
-| AI 状态 | 新开仓 | pending | 已有仓位 |
-|---|---|---|---|
-| 文件缺失、过期、解析失败 | 放行，原仓位 | 保留 | 不操作 |
-| neutral / mixed | 放行，开仓量不变 | 保留 | 仅当结构化 `risk_multiplier` 低于当前保留比例时才减仓 |
-| 同方向 explicit 信号 | 放行，不加仓 | 保留 | 不加仓，不放宽止损 |
-| 反方向但未达到严格阈值 | 放行并记录 | 保留 | 只记录 |
-| 反方向且满足硬过滤 | 可过滤候选；未过滤时开仓量不变 | 可撤销未成交 pending | `reduce` / `manage` 模式下按目标保留比例减仓 |
-| manage 模式反方向强信号 | 不反手；允许开仓时数量不变 | 先处理 pending | 最多部分减仓或收紧止损 |
-
-### 15.11 状态与审计字段
-
-建议在 trade_state 增加：
-
-~~~text
-ai_bias_generated_at
-ai_bias_expires_at
-ai_portfolio_stance
-ai_futures_bias
-ai_confidence
-ai_explicit_long_signal
-ai_explicit_short_signal
-ai_allow_long
-ai_allow_short
-ai_risk_multiplier
-ai_entry_action
-ai_entry_reason
-entry_initial_amount
-ai_target_position_ratio
-ai_target_position_amount
-ai_reduce_amount
-ai_last_reduce_generated_at
-ai_partial_reduce_count
-ai_snapshot_json
-~~~
-
-pending 状态至少保存：
-
-~~~text
-pending_entry_ai_generated_at
-pending_entry_ai_futures_bias
-pending_entry_ai_confidence
-pending_entry_ai_risk_multiplier
-pending_entry_ai_action
-~~~
-
-每个候选都写一条结构化日志：
-
-~~~text
-candidate side
-candidate module / strategy_tf
-AI mode
-AI valid / fail_open
-portfolio_stance
-futures_bias
-explicit signals
-confidence
-allow_long / allow_short
-raw risk_multiplier
-entry initial amount
-current position amount / current retained ratio
-target position ratio / target position amount
-reduce amount
-最终 action：allow / reduce / filter / log_only
-~~~
-
-### 15.12 幂等与并发要求
-
-~~~text
-同一个 generated_at 对同一持仓最多执行一次减仓或保护动作。
-使用 generated_at + position side + entry_time 作为动作幂等 key。
-读取 JSON 时使用一次完整 read + json.loads，不边读边解析。
-ai_market_bias.py 的 write_json() 已使用同目录临时文件写入、flush/fsync 后 os.replace 原子替换，避免读取半个 JSON。
-AI 读取失败不得改变现有订单和仓位。
-pending 撤单、减仓、止损刷新都必须在交易所确认后更新本地状态。
-~~~
-
-### 15.13 分阶段上线
-
-阶段 0：单元测试和静态验证（2026-07-19 已完成）
-
-~~~text
-测试所有 schema 缺失、过期、未来时间、错误 symbol 和类型错误。
-测试 long / short / neutral / mixed 动作矩阵。
-测试 risk_multiplier 不改变初始开仓量、不能放大已有仓位，也不能补回已减仓数量。
-测试 AI 不能产生候选或反转 side。
-mock 验证 reduceOnly 市价减仓方向、数量、状态记账和止损数量刷新。
-mock 验证 Binance 对冲持仓模式拒绝 AI 减仓。
-共 31 项测试通过，相关 Python 文件 py_compile 通过；测试脚本随后已按要求删除。
-~~~
-
-阶段 1：Demo + log
-
-~~~text
-BINANCE_DEMO_TRADING=1
-AI_RESEARCH_MODE=log
-至少观察 20 个真实候选。
-确认交易行为与未接入前一致。
-~~~
-
-阶段 2：Demo + reduce
-
-~~~text
-AI_RESEARCH_MODE=reduce
-AI_ALLOW_POSITION_REDUCTION=1
-AI_REVERSE_SIGNAL_RETAINED_POSITION_RATIO=0.75
-AI_MIN_RETAINED_POSITION_RATIO=0.75
-至少验证 20 次持仓态 AI 更新，覆盖反向信号和 risk_multiplier 下调。
-确认初始开仓量没有变化。
-确认 reduceOnly 数量精度、最小下单量、剩余仓位、止损重挂和部分减仓记账正确。
-确认同一个 generated_at 或相同目标比例不会重复减仓。
-确认 risk_multiplier 回升时不会自动加仓补回。
-~~~
-
-阶段 3：Demo + filter
-
-~~~text
-AI_RESEARCH_MODE=filter
-AI_FILTER_MIN_CONFIDENCE=0.75
-至少验证 20 个满足或接近过滤条件的候选。
-统计被过滤候选后续 1h / 4h / 9h 表现。
-~~~
-
-阶段 4：真实资金小额试运行
-
-~~~text
-先使用 AI_RESEARCH_MODE=log。
-真实资金模式和 AI 行为模式不能同日同时切换。
-人工确认基础 MARGIN_RATE 和 LEVERAGE。
-确认保护止损、外部平仓同步和 pending 管理全部正常。
-再考虑启用 reduce，filter 继续关闭。
-初始开仓数量始终沿用原策略，不做 AI 缩放。
-~~~
-
-阶段 5：manage 与保护动作
-
-~~~text
-在已经验证 reduceOnly 部分减仓、止损重挂和完整记账后，再启用 pending 撤单和保护动作。
-只在 Demo 完成故障注入、部分成交和幂等测试后启用。
-AI_ALLOW_FULL_CLOSE 继续保持 0。
-~~~
-
-### 15.14 验收与回滚
-
-必须通过：
-
-~~~text
-AI 文件删除后策略继续正常运行。
-AI 文件过期后策略继续正常运行。
-AI JSON 损坏后策略继续正常运行。
-AI 永远不改变原策略的初始开仓数量。
-AI 永远不能增加已有仓位，也不能补回已减仓数量。
-AI 永远不能放宽止损。
-AI 永远不能主动反手。
-过滤发生时没有创建任何入场订单。
-pending 被过滤时只撤销未成交部分。
-减仓后交易所仓位、本地 amount 和保护止损数量一致。
-相同 generated_at、相同目标仓位不会重复减仓。
-所有 AI 决策都有 generated_at 和 reason 可追溯。
-~~~
-
-紧急回滚：
-
-~~~text
-AI_RESEARCH_MODE=off
-AI_ALLOW_POSITION_REDUCTION=0
-AI_ALLOW_FULL_CLOSE=0
-~~~
-
-关闭 AI 后不需要改动原策略候选、止损、目标和平仓逻辑。
-
-## 16. 参考来源
-
-- Binance USD-M Futures common definitions/rate limits: https://developers.binance.com/docs/derivatives/usds-margined-futures/common-definition
-- Binance USD-M Futures new order / reduceOnly parameters: https://developers.binance.com/docs/derivatives/usds-margined-futures/trade/rest-api/New-Order
-- FRED API key documentation: https://fred.stlouisfed.org/docs/api/api_key.html
-- GDELT overview/free open platform: https://www.gdeltproject.org/
-- Finnhub API/pricing: https://finnhub.io/pricing
-- SEC EDGAR APIs: https://www.sec.gov/search-filings/edgar-application-programming-interfaces
+```
+
+手动仓位研究调度默认值：
+
+```env
+MANUAL_AI_RESEARCH_HOURS=9
+MANUAL_AI_RESEARCH_RETRY_SECONDS=1800
+MANUAL_AI_REFRESH_BEFORE_EXPIRY_SECONDS=3600
+```
+
+模式能力：
+
+| mode | 读取/审计 | 候选过滤 | 部分减仓 |
+|---|---:|---:|---:|
+| `off` | 否 | 否 | 否 |
+| `log` | 是 | 否 | 否 |
+| `reduce` | 是 | 否 | 是 |
+| `filter` | 是 | 是 | 否 |
+| `filter_reduce` | 是 | 是 | 是 |
+| `manage` | 是 | 是 | 是 |
+
+`manage` 不是无限授权。实际部分减仓仍需同时满足：
+
+```text
+bias 有效且属于当前 symbol。
+达到减仓置信度门槛。
+存在明确反向期货信号，或 risk_multiplier 要求降低仓位。
+AI_ALLOW_POSITION_REDUCTION=1。
+同一 generated_at 没有重复执行过。
+精度和最小下单量合法。
+减仓后仍保留安全底线以上的仓位。
+```
+
+`AI_ALLOW_FULL_CLOSE=1` 和 `AI_ALLOW_REVERSE=1` 当前会在配置加载时直接报错，不能进入交易循环。`bian_new.py` 在下单前还会再次硬性拒绝减仓数量达到当前全部仓位的请求。
+
+## 11. 运行命令
+
+### 11.1 推荐的逐交易对入口
+
+```bash
+python tradingAgents/run_symbol_research.py --symbol BTCUSDT --hours 9
+```
+
+它会自动选择 `BTC-USD`，先运行 TradingAgents，再生成：
+
+```text
+tradingAgents/.ai_research/latest_bias_BTCUSDT.json
+```
+
+### 11.2 直接运行 ai_market_bias.py
+
+只抓取研究输入，不调用 DeepSeek：
+
+```bash
+python tradingAgents/ai_market_bias.py --symbol BTCUSDT --tradingagents-ticker BTC-USD --hours 9 --fetch-only
+```
+
+使用已有新鲜 TradingAgents 报告生成 bias：
+
+```bash
+python tradingAgents/ai_market_bias.py --symbol BTCUSDT --tradingagents-ticker BTC-USD --hours 9
+```
+
+先运行 TradingAgents 再生成 bias：
+
+```bash
+python tradingAgents/ai_market_bias.py \
+  --symbol BTCUSDT \
+  --tradingagents-ticker BTC-USD \
+  --hours 9 \
+  --run-tradingagents \
+  --asset-type crypto
+```
+
+正常运行 `bian_new.py` 时通常不需要手工执行这些命令；手动仓位的 bias 缺失或接近过期时，脚本会自动后台调度。
+
+## 12. 环境变量加载
+
+`bian_new.py` 从仓库根目录 `.env.local` 加载 Binance、邮件和 AI 执行配置，已存在的系统环境变量优先。
+
+TradingAgents 研究脚本按以下顺序尝试加载，先加载的同名值优先：
+
+```text
+1. TRADINGAGENTS_ENV_FILE 指定文件
+2. tradingAgents/.env
+3. /home/ubuntu/binance/tradingAgents/.env（兼容路径）
+4. 仓库根目录 .ai_env.local
+5. 仓库根目录 .env.local
+6. 当前工作目录 .env
+```
+
+研究层至少需要可用的 LLM API key；Finnhub、FRED 等 key 缺失时，对应数据源会降级，但不能因此绕过 bias 的严格校验。
+
+真实 API key 和运行态 bias、报告、缓存、日志不得提交到 Git。
+
+## 13. 运行产物
+
+```text
+tradingAgents/.ai_research/latest_bias_SYMBOL.json
+tradingAgents/.ai_research/jobs/SYMBOL.lock
+tradingAgents/.ai_research/logs/manual_ai_SYMBOL.log
+tradingAgents/.ai_research/logs/ai_research_decisions_YYYY-MM.jsonl
+tradingAgents/.ai_research/cache/
+tradingAgents/outputs/BASE-USD_YYYY-MM-DD_summary.md
+tradingAgents/outputs/BASE-USD_YYYY-MM-DD_state.json
+tradingAgents/outputs/BASE-USD_YYYY-MM-DD_decision.json
+tradingAgents/.tradingagents/cache/
+tradingAgents/.tradingagents/logs/
+tradingAgents/.tradingagents/memory/
+```
+
+这些都是运行产物，不属于源码。
+
+## 14. 当前验证状态
+
+已覆盖的自动测试包括：
+
+```text
+任意 USD/USDT/USDC crypto symbol 识别。
+CCXT 永续 symbol 规范化。
+逐交易对 bias 文件路径。
+逐交易对新闻关键词。
+后台研究命令使用实际持仓 symbol。
+同一 symbol 的 flock 防重入入口。
+手动仓位双周期止损选择和周期锁定。
+已有 1 ATR 浮盈立即进入利润保护。
+TAS_/TAM_ 订单归属识别。
+部分平仓只刷新脚本保护单数量。
+确认全平后的出场条件单清理。
+ETH 与非 ETH 的 20 分钟冷却差异。
+脚本 ETH 和手动 BTC 同时管理。
+有仓位时暂停新的 ETH 入场扫描。
+AI 只能执行 reduceOnly/对应 hedge-side 的部分减仓。
+```
+
+Demo 全账户只读查询已验证可以正常返回仓位快照。验证过程不创建真实订单。
+
+## 15. 仍需观察的风险
+
+当前实现完成了代码接入，但仍需继续在 Binance Demo 长时间观察：
+
+```text
+不同币种最小下单量和精度边界。
+hedge mode 下 LONG/SHORT 双边仓位的长期行为。
+网络抖动时 position-risk 和标准 positions 复查的一致性。
+条件单成交与仓位归零之间的短暂竞态。
+TradingAgents 调用耗时、模型费用和 API rate limit。
+小币种新闻不足时 confidence 是否足够保守。
+AI 部分减仓后 TAM_ 止损数量刷新是否持续稳定。
+```
+
+明确不在当前范围：
+
+```text
+AI 主动全平。
+AI 自动反手。
+AI 自主加仓。
+用 AI 替代 ATR/结构止损。
+切换到 Binance 正式环境。
+```

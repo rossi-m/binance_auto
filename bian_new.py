@@ -33,6 +33,8 @@ import traceback
 import sqlite3
 import copy
 import json
+import uuid
+import subprocess
 
 from tradingAgents.ai_research_guard import (
     append_ai_audit_event,
@@ -128,9 +130,35 @@ MAIN_LOOP_ERROR_SLEEP_SECONDS = 5  # 主循环遇到顶层异常后，先休息5
 HEARTBEAT_INTERVAL_SECONDS = 15 * 60  # 每15分钟输出一次心跳日志，方便判断进程是否还活着
 MAX_SIGNAL_BAR_STALENESS_SECONDS = 45 * 60  # 15M信号K线最多允许落后45分钟，防止交易所/测试网返回旧K线
 DRY_RUN_OPEN_ORDER = False  # 运行时 dry-run 开关；开启后只走信号流程，不实际创建开仓订单。
+# 脚本创建的保护单都带客户端ID前缀，持仓存在期间只允许修改脚本自己的订单。
+STRATEGY_STOP_CLIENT_PREFIX = 'TAS_'
+MANUAL_STOP_CLIENT_PREFIX = 'TAM_'
+# 手动仓位同时评估两套管理周期，选中后在该笔持仓生命周期内保持不变。
+MANUAL_POSITION_PROFILES = (
+    {'name': '4h_1h', 'background_tf': '4h', 'exit_tf': '1h'},
+    {'name': '1h_15m', 'background_tf': '1h', 'exit_tf': '15m'},
+)
+MANUAL_STOP_SWING_LOOKBACK = 6
+MANUAL_STOP_STRUCTURE_ATR_BUFFER = 0.20
+MANUAL_STOP_MIN_DISTANCE_ATR = 0.25
+MANUAL_POSITION_MISS_CONFIRM_COUNT = 3
 # --- TradingAgents AI research guard ---
 # 默认 off，且减仓/全平/反手都有独立关闭开关。配置错误会阻止程序启动，避免误用宽松默认值。
 AI_RESEARCH_CONFIG = load_ai_research_config()
+# 手动仓位的 TradingAgents 默认跟随 AI_RESEARCH_MODE；AI关闭时不额外消耗模型调用。
+MANUAL_AI_RESEARCH_ENABLED = os.getenv(
+    'MANUAL_AI_RESEARCH_ENABLED',
+    '1' if AI_RESEARCH_CONFIG.mode != 'off' else '0',
+).strip().lower() in ('1', 'true', 'yes', 'on')
+MANUAL_AI_RESEARCH_HOURS = max(1, int(os.getenv('MANUAL_AI_RESEARCH_HOURS', '9')))
+MANUAL_AI_RESEARCH_RETRY_SECONDS = max(60, int(os.getenv('MANUAL_AI_RESEARCH_RETRY_SECONDS', '1800')))
+MANUAL_AI_REFRESH_BEFORE_EXPIRY_SECONDS = max(
+    60,
+    int(os.getenv('MANUAL_AI_REFRESH_BEFORE_EXPIRY_SECONDS', '3600')),
+)
+MANUAL_AI_RUNNER_PATH = os.path.join(BASE_DIR, 'tradingAgents', 'run_symbol_research.py')
+MANUAL_AI_RESEARCH_DIR = os.path.dirname(os.path.abspath(AI_RESEARCH_CONFIG.bias_file))
+MANUAL_AI_OUTPUTS_DIR = os.path.join(BASE_DIR, 'tradingAgents', 'outputs')
 
 # --- 新版策略参数 ---
 # 策略会参与打分和选信号的主周期；越靠前代表越高周期、权重通常越重。
@@ -387,6 +415,12 @@ logging.basicConfig(
 )
 logging.info("Binance Demo U本位合约 API 已初始化")
 logging.info("AI research guard 配置: %s", config_for_log(AI_RESEARCH_CONFIG))
+logging.info(
+    "手动仓位 TradingAgents 配置: enabled=%s, hours=%s, retry_seconds=%s",
+    MANUAL_AI_RESEARCH_ENABLED,
+    MANUAL_AI_RESEARCH_HOURS,
+    MANUAL_AI_RESEARCH_RETRY_SECONDS,
+)
 
 # 记录程序层面的临时运行状态，不属于某一笔交易。
 runtime_state = {
@@ -400,8 +434,13 @@ runtime_state = {
     # 背景周期K线只在对应已收盘K线变化后才需要重新抓取和计算指标。
     'kline_df_cache': {},
     # AI审计事件幂等key，避免持仓轮询每秒重复写同一结论。
-    'ai_audit_keys': {}
+    'ai_audit_keys': {},
+    # 每个手动交易对最多运行一个 TradingAgents 后台任务，避免阻塞每秒交易主循环。
+    'manual_ai_jobs': {},
 }
+
+# 手动仓位不复用单一 ETH trade_state；每个 symbol + positionSide 独立管理。
+manual_position_states = {}
 
 
 # ==========================================
@@ -412,21 +451,137 @@ AI_GUARD_SNAPSHOT_FIELDS = (
     'valid', 'fail_open', 'error', 'symbol', 'generated_at', 'expires_at',
     'portfolio_stance', 'futures_bias', 'time_horizon_hours',
     'explicit_long_signal', 'explicit_short_signal', 'confidence',
-    'allo_wlong', 'allow_short', 'risk_multiplier', 'reason'
+    'allow_long', 'allow_short', 'risk_multiplier', 'reason'
 )
 
 
-def get_current_ai_guard():
-    """读取一次AI JSON并执行严格校验；任何异常返回fail-open guard。"""
+def compact_usdt_symbol(symbol):
+    """把 CCXT 交易对转换成 bias 文件使用的 Binance 紧凑符号。"""
+    return normalize_futures_symbol(symbol).replace('/', '').replace(':USDT', '')
+
+
+def manual_ai_bias_file(symbol):
+    return os.path.join(MANUAL_AI_RESEARCH_DIR, f"latest_bias_{compact_usdt_symbol(symbol)}.json")
+
+
+def get_ai_guard_for_symbol(symbol, bias_file=None):
+    """按实际交易对加载独立AI结论；异常和过期结果继续按 fail-open 处理。"""
+    compact_symbol = compact_usdt_symbol(symbol)
+    target_bias_file = bias_file or manual_ai_bias_file(symbol)
     return load_ai_research_guard(
         AI_RESEARCH_CONFIG,
-        expected_symbol=SYMBOL.replace('/', '').replace(':USDT', ''),
-        now=datetime.datetime.now(EXCHANGE_TZ)
+        expected_symbol=compact_symbol,
+        now=datetime.datetime.now(EXCHANGE_TZ),
+        bias_file=target_bias_file,
     )
+
+
+def get_current_ai_guard():
+    """保持原ETH策略入口兼容。"""
+    return get_ai_guard_for_symbol(SYMBOL, bias_file=AI_RESEARCH_CONFIG.bias_file)
 
 
 def ai_guard_snapshot(guard):
     return {field: guard.get(field) for field in AI_GUARD_SNAPSHOT_FIELDS}
+
+
+def ai_guard_needs_refresh(guard):
+    """bias 无效或距离过期不足一小时（可配置）时，需要重新生成研究报告。"""
+    if not guard.get('valid'):
+        return True
+    try:
+        expires_at = datetime.datetime.fromisoformat(str(guard.get('expires_at')).replace('Z', '+00:00'))
+        now = datetime.datetime.now(datetime.timezone.utc)
+        return (expires_at.astimezone(datetime.timezone.utc) - now).total_seconds() <= MANUAL_AI_REFRESH_BEFORE_EXPIRY_SECONDS
+    except Exception:
+        return True
+
+
+def reap_manual_ai_jobs():
+    """回收已结束的后台任务和日志文件句柄，不在交易主循环里等待子进程。"""
+    jobs = runtime_state.setdefault('manual_ai_jobs', {})
+    for symbol, job in list(jobs.items()):
+        process = job.get('process')
+        if process is None:
+            continue
+        return_code = process.poll()
+        if return_code is None:
+            continue
+        log_handle = job.pop('log_handle', None)
+        if log_handle is not None:
+            log_handle.close()
+        job['process'] = None
+        job['return_code'] = return_code
+        job['completed_at'] = time.monotonic()
+        logging.info(f"手动仓位 TradingAgents 后台任务结束: symbol={symbol}, return_code={return_code}")
+
+
+def ensure_manual_ai_research_job(symbol, state=None):
+    """必要时为手动仓位启动逐symbol研究；同一symbol只允许一个后台任务。"""
+    state = state if isinstance(state, dict) else {}
+    guard = get_ai_guard_for_symbol(symbol)
+    state['ai_guard_snapshot'] = ai_guard_snapshot(guard)
+    state['ai_bias_file'] = manual_ai_bias_file(symbol)
+    if not MANUAL_AI_RESEARCH_ENABLED:
+        state['ai_research_status'] = 'disabled'
+        return guard
+    if not ai_guard_needs_refresh(guard):
+        state['ai_research_status'] = 'ready'
+        return guard
+
+    reap_manual_ai_jobs()
+    compact_symbol = compact_usdt_symbol(symbol)
+    jobs = runtime_state.setdefault('manual_ai_jobs', {})
+    job = jobs.get(compact_symbol, {})
+    process = job.get('process')
+    if process is not None and process.poll() is None:
+        state['ai_research_status'] = 'running'
+        return guard
+    last_attempt = float(job.get('last_attempt', 0.0) or 0.0)
+    # last_attempt=0 代表从未启动过；不能因服务器启动时间短于重试窗口而跳过首个任务。
+    if last_attempt > 0 and time.monotonic() - last_attempt < MANUAL_AI_RESEARCH_RETRY_SECONDS:
+        state['ai_research_status'] = 'retry_wait'
+        return guard
+
+    log_dir = os.path.join(MANUAL_AI_RESEARCH_DIR, 'logs')
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, f"manual_ai_{compact_symbol}.log")
+    log_handle = open(log_path, 'ab', buffering=0)
+    command = [
+        sys.executable,
+        MANUAL_AI_RUNNER_PATH,
+        '--symbol', compact_symbol,
+        '--hours', str(MANUAL_AI_RESEARCH_HOURS),
+        '--research-dir', MANUAL_AI_RESEARCH_DIR,
+        '--outputs-dir', MANUAL_AI_OUTPUTS_DIR,
+    ]
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=os.path.dirname(MANUAL_AI_RUNNER_PATH),
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    except Exception as e:
+        log_handle.close()
+        jobs[compact_symbol] = {'process': None, 'last_attempt': time.monotonic(), 'error': str(e)}
+        state['ai_research_status'] = 'start_failed'
+        logging.warning(f"启动手动仓位 TradingAgents 失败: symbol={compact_symbol}, error={e}")
+        return guard
+
+    jobs[compact_symbol] = {
+        'process': process,
+        'log_handle': log_handle,
+        'last_attempt': time.monotonic(),
+        'log_path': log_path,
+    }
+    state['ai_research_status'] = 'running'
+    logging.warning(
+        "已后台启动手动仓位 TradingAgents: symbol=%s pid=%s log=%s",
+        compact_symbol, process.pid, log_path,
+    )
+    return guard
 
 
 def write_ai_audit(event_type, guard, details=None, dedupe_key=''):
@@ -556,6 +711,42 @@ def extract_order_id(order):
         if candidate not in (None, ''):
             return str(candidate)
     return ''
+
+
+def extract_order_client_id(order):
+    """统一提取普通订单或 algo 条件单的客户端自定义ID。"""
+    if not isinstance(order, dict):
+        return ''
+    info = order.get('info', {})
+    if not isinstance(info, dict):
+        info = {}
+    for candidate in (
+        order.get('clientOrderId'),
+        order.get('clientAlgoId'),
+        info.get('clientOrderId'),
+        info.get('clientAlgoId'),
+        info.get('origClientOrderId'),
+    ):
+        if candidate not in (None, ''):
+            return str(candidate)
+    return ''
+
+
+def make_protective_client_order_id(prefix):
+    """生成不超过 Binance 36 字符限制的保护单客户端ID。"""
+    timestamp_suffix = str(int(time.time() * 1000))[-10:]
+    random_suffix = uuid.uuid4().hex[:16]
+    return f"{prefix}{timestamp_suffix}{random_suffix}"[:36]
+
+
+def is_script_owned_protective_order(order, tracked_order_id='', prefixes=None):
+    """判断条件单是否由本脚本创建；本地已记录的订单ID也视为脚本自有。"""
+    order_id = extract_order_id(order)
+    if tracked_order_id and order_id == str(tracked_order_id):
+        return True
+    client_id = extract_order_client_id(order)
+    prefixes = prefixes or (STRATEGY_STOP_CLIENT_PREFIX, MANUAL_STOP_CLIENT_PREFIX)
+    return any(client_id.startswith(prefix) for prefix in prefixes if prefix)
 
 
 def format_exception_message(error):
@@ -1190,9 +1381,9 @@ def validate_signal_bar_15m(signal_bar_15m, now_dt=None):
     return {'valid': True, 'is_new': is_new, 'reason': 'ok', 'stale_seconds': stale_seconds}
 
 
-def get_latest_price():
+def get_latest_price(symbol=SYMBOL):
     """获取最新成交价，用于真实下单和风控"""
-    ticker = exchange.fetch_ticker(SYMBOL)
+    ticker = exchange.fetch_ticker(symbol)
     return float(ticker['last'])
 
 
@@ -1220,7 +1411,9 @@ def infer_position_side(position_amt, info=None, pos=None):
     """优先用 positionSide 判断方向，兼容对冲模式下 SHORT 仓位数量为正数的情况。"""
     info = info or {}
     pos = pos or {}
-    raw_side = str(info.get('positionSide') or pos.get('side') or '').strip().upper()
+    raw_side = str(
+        info.get('positionSide') or pos.get('positionSide') or pos.get('side') or ''
+    ).strip().upper()
     if raw_side in ('LONG', 'SHORT'):
         return raw_side.lower()
     return 'long' if float(position_amt) > 0 else 'short'
@@ -1325,7 +1518,9 @@ def place_protective_stop_order(side, stop_price):
     params = {
         'stopPrice': stop_price,
         'reduceOnly': True,
-        'workingType': STOP_WORKING_TYPE
+        'workingType': STOP_WORKING_TYPE,
+        # 客户端ID用于明确订单归属，后续动态更新只撤销本脚本创建的保护单。
+        'newClientOrderId': make_protective_client_order_id(STRATEGY_STOP_CLIENT_PREFIX),
     }
     return exchange.create_order(SYMBOL, 'STOP_MARKET', stop_side, amount, None, params)
 
@@ -1339,7 +1534,17 @@ def normalize_exchange_bool(value):
     return str(value).strip().lower() in ('true', '1', 'yes')
 
 
-def is_close_position_conditional_order(order, side=None):
+def extract_order_position_side_upper(order):
+    """提取 Binance 双向持仓字段，返回 BOTH / LONG / SHORT / ''。"""
+    if not isinstance(order, dict):
+        return ''
+    info = order.get('info', {})
+    if not isinstance(info, dict):
+        info = {}
+    return str(order.get('positionSide') or info.get('positionSide') or '').strip().upper()
+
+
+def is_close_position_conditional_order(order, side=None, position_side=None):
     """判断某个 open order 是否是当前方向的全平仓条件单。"""
     if not isinstance(order, dict):
         return False
@@ -1369,6 +1574,13 @@ def is_close_position_conditional_order(order, side=None):
         #获取订单方向
         order_side = extract_order_side_upper(order)
         if order_side != expected_side:
+            return False
+
+    if position_side:
+        raw_position_side = extract_order_position_side_upper(order)
+        expected_position_side = str(position_side).strip().upper()
+        # 单向模式通常返回 BOTH；没有字段时依靠订单买卖方向继续判断。
+        if raw_position_side and raw_position_side not in ('BOTH', expected_position_side):
             return False
 
     return True
@@ -1414,16 +1626,31 @@ def update_daily_pnl_stats(exit_time, net_pnl_usdt):
         logging.warning(f"写入 SQLite 日收益失败: {e}")
 
 
-def get_exchange_symbol_id():
-    """获取交易所原生symbol，未load_markets时用ETHUSDT兜底。"""
+def normalize_futures_symbol(symbol):
+    """把 BTCUSDT、BTC/USDT、BTC/USDT:USDT 统一成 CCXT U本位交易对。"""
+    raw_symbol = str(symbol or '').strip().upper()
+    if not raw_symbol:
+        return ''
+    if '/' in raw_symbol:
+        base, quote_part = raw_symbol.split('/', 1)
+        quote = quote_part.split(':', 1)[0]
+        return f"{base}/{quote}"
+    if raw_symbol.endswith('USDT') and len(raw_symbol) > 4:
+        return f"{raw_symbol[:-4]}/USDT"
+    return raw_symbol
+
+
+def get_exchange_symbol_id(symbol=SYMBOL):
+    """获取交易所原生symbol；未load_markets时按常见U本位格式兜底。"""
+    symbol = normalize_futures_symbol(symbol)
     try:
-        market = exchange.market(SYMBOL)
+        market = exchange.market(symbol)
         market_id = market.get('id')
         if market_id:
             return market_id
     except Exception:
         pass
-    return SYMBOL.replace('/', '').replace(':USDT', '')
+    return symbol.replace('/', '').replace(':USDT', '')
 
 
 def normalize_raw_open_order(raw_order):
@@ -1438,6 +1665,9 @@ def normalize_raw_open_order(raw_order):
         'stopPrice': raw_order.get('stopPrice') or raw_order.get('triggerPrice') or raw_order.get('activatePrice'),
         'closePosition': raw_order.get('closePosition'),
         'reduceOnly': raw_order.get('reduceOnly'),
+        'clientOrderId': raw_order.get('clientOrderId'),
+        'positionSide': raw_order.get('positionSide'),
+        'symbol': raw_order.get('symbol'),
         'info': raw_order
     }
 
@@ -1457,17 +1687,20 @@ def normalize_raw_algo_order(raw_order):
         'filled': raw_order.get('actualQty'),
         'closePosition': raw_order.get('closePosition'),
         'reduceOnly': raw_order.get('reduceOnly'),
+        'clientAlgoId': raw_order.get('clientAlgoId'),
+        'positionSide': raw_order.get('positionSide'),
+        'symbol': raw_order.get('symbol'),
         'info': raw_order
     }
 
 
-def fetch_raw_future_open_orders():
+def fetch_raw_future_open_orders(symbol=SYMBOL):
     """直接调用币安U本位未成交单接口，补齐CCXT统一接口漏掉的条件单。"""
     method = getattr(exchange, 'fapiPrivateGetOpenOrders', None)
     if method is None:
         return []
     try:
-        raw_orders = method({'symbol': get_exchange_symbol_id()})
+        raw_orders = method({'symbol': get_exchange_symbol_id(symbol)})
     except Exception as e:
         logging.warning(f"原始接口查询U本位未成交单失败: {e}")
         return None
@@ -1476,13 +1709,13 @@ def fetch_raw_future_open_orders():
     return [normalize_raw_open_order(order) for order in raw_orders]
 
 
-def fetch_raw_future_open_algo_orders():
+def fetch_raw_future_open_algo_orders(symbol=SYMBOL):
     """直接调用 Binance U本位 openAlgoOrders，补齐 STOP_MARKET 条件委托。"""
     method = getattr(exchange, 'fapiPrivateGetOpenAlgoOrders', None)
     if method is None:
         return []
     try:
-        raw_orders = method({'symbol': get_exchange_symbol_id()})
+        raw_orders = method({'symbol': get_exchange_symbol_id(symbol)})
     except Exception as e:
         logging.warning(f"原始接口查询U本位未成交algo条件单失败: {e}")
         return None
@@ -1491,7 +1724,7 @@ def fetch_raw_future_open_algo_orders():
     return [normalize_raw_algo_order(order) for order in raw_orders]
 
 
-def fetch_open_close_position_orders(side=None, perf=None):
+def fetch_open_close_position_orders(side=None, perf=None, symbol=SYMBOL, position_side=None):
     """读取当前仓位方向上的全平仓条件单，便于做撤单确认和冲突排查。"""
     total_start = time.monotonic()
     open_orders = []
@@ -1499,7 +1732,7 @@ def fetch_open_close_position_orders(side=None, perf=None):
     try:
         unified_start = time.monotonic()
         # 获取ccxt所有未成交的挂单
-        open_orders = exchange.fetch_open_orders(SYMBOL)
+        open_orders = exchange.fetch_open_orders(symbol)
     except Exception as e:
         logging.warning(f"查询未成交条件单失败: {e}")
         unified_fetch_failed = True
@@ -1510,7 +1743,7 @@ def fetch_open_close_position_orders(side=None, perf=None):
     raw_open_start = time.monotonic()
     
     # 获取原始接口所有未成交的普通挂单
-    raw_open_orders = fetch_raw_future_open_orders()
+    raw_open_orders = fetch_raw_future_open_orders(symbol=symbol)
     record_perf(perf, 'fetch_open_close_position_orders_raw_open', raw_open_start)
     if raw_open_orders is None:
         if unified_fetch_failed:
@@ -1527,7 +1760,7 @@ def fetch_open_close_position_orders(side=None, perf=None):
 
     raw_algo_start = time.monotonic()
     # 获取原始接口库所有未成交的条件委托挂单
-    raw_algo_orders = fetch_raw_future_open_algo_orders()
+    raw_algo_orders = fetch_raw_future_open_algo_orders(symbol=symbol)
     record_perf(perf, 'fetch_open_close_position_orders_raw_algo', raw_algo_start)
     if raw_algo_orders is None:
         if unified_fetch_failed and not open_orders:
@@ -1545,127 +1778,95 @@ def fetch_open_close_position_orders(side=None, perf=None):
     matched_orders = []
     for order in open_orders:
         # 过滤出平仓条件单，
-        if is_close_position_conditional_order(order, side=side):
+        if is_close_position_conditional_order(order, side=side, position_side=position_side):
             matched_orders.append(order)
     record_perf(perf, 'fetch_open_close_position_orders', total_start)
     return matched_orders
 
 
-def fetch_open_protective_stop_orders(side=None):
+def fetch_open_protective_stop_orders(side=None, symbol=SYMBOL, position_side=None, owned_only=False, tracked_order_id=''):
     """读取当前方向的 STOP / STOP_MARKET 全平仓条件单。"""
-    matched_orders = fetch_open_close_position_orders(side=side)
+    matched_orders = fetch_open_close_position_orders(
+        side=side,
+        symbol=symbol,
+        position_side=position_side,
+    )
     if matched_orders is None:
         return None
 
     stop_orders = []
     for order in matched_orders:
         order_type = str(order.get('type') or order.get('info', {}).get('type') or '').strip().upper()
-        if order_type in ('STOP', 'STOP_MARKET'):
+        if order_type in ('STOP', 'STOP_MARKET') and (
+            not owned_only or is_script_owned_protective_order(order, tracked_order_id=tracked_order_id)
+        ):
             stop_orders.append(order)
     return stop_orders
 
 
-def cancel_all_open_orders_for_symbol(silent=False):
-    """撤销当前交易对的所有未成交单，用作 closePosition 隐藏冲突的最后恢复手段。"""
-    cancel_succeeded = False
-    error_messages = []
+def cancel_conditional_order_exact(order, symbol=SYMBOL, silent=False, reason='清理条件委托'):
+    """精确撤销一张普通或 algo 条件单，禁止用批量接口误伤其它订单。"""
+    order_id = extract_order_id(order)
+    if not order_id:
+        return True
+    info = order.get('info', {}) if isinstance(order, dict) else {}
+    if not isinstance(info, dict):
+        info = {}
+
+    algo_id = info.get('algoId') or order.get('algoId')
+    client_algo_id = info.get('clientAlgoId') or order.get('clientAlgoId')
+    if algo_id or client_algo_id:
+        raw_method = getattr(exchange, 'fapiPrivateDeleteAlgoOrder', None)
+        if raw_method is None:
+            logging.warning(f"{reason}: 缺少精确撤销algo条件单接口，拒绝批量撤单: id={order_id}")
+            return False
+        params = {'symbol': get_exchange_symbol_id(symbol)}
+        if algo_id:
+            params['algoId'] = algo_id
+        else:
+            params['clientAlgoId'] = client_algo_id
+        try:
+            raw_method(params)
+            if not silent:
+                logging.info(f"{reason}: 已精确撤销algo条件委托 {order_id}")
+            return True
+        except Exception as e:
+            if is_order_already_absent_error(e):
+                return True
+            logging.warning(f"{reason}: 精确撤销algo条件委托失败({order_id}): {e}")
+            return False
 
     try:
-        exchange.cancel_all_orders(SYMBOL, {'type': 'future'})
-        cancel_succeeded = True
+        exchange.cancel_order(order_id, symbol)
         if not silent:
-            logging.warning(f"已通过 cancel_all_orders 撤销 {SYMBOL} 全部未成交单")
-    except Exception as unified_error:
-        error_messages.append(f"cancel_all_orders failed: {format_exception_message(unified_error)}")
-
-    raw_method = getattr(exchange, 'fapiPrivateDeleteAllOpenOrders', None)
-    if raw_method is not None:
-        try:
-            raw_method({'symbol': get_exchange_symbol_id()})
-            cancel_succeeded = True
-            if not silent:
-                logging.warning(f"已通过原始接口撤销 {SYMBOL} 全部未成交单")
-        except Exception as raw_error:
-            error_messages.append(f"raw cancel all failed: {format_exception_message(raw_error)}")
-    else:
-        error_messages.append("raw cancel all failed: fapiPrivateDeleteAllOpenOrders unavailable")
-
-    raw_algo_method = getattr(exchange, 'fapiPrivateDeleteAlgoOpenOrders', None)
-    if raw_algo_method is not None:
-        try:
-            raw_algo_method({'symbol': get_exchange_symbol_id()})
-            cancel_succeeded = True
-            if not silent:
-                logging.warning(f"已通过原始接口撤销 {SYMBOL} 全部未成交algo条件单")
-        except Exception as raw_algo_error:
-            error_messages.append(f"raw cancel all algo failed: {format_exception_message(raw_algo_error)}")
-    else:
-        error_messages.append("raw cancel all algo failed: fapiPrivateDeleteAlgoOpenOrders unavailable")
-
-    if cancel_succeeded:
-        clear_local_stop_order_state()
+            logging.info(f"{reason}: 已撤销条件委托 {order_id}")
         return True
+    except Exception as e:
+        if is_order_already_absent_error(e):
+            return True
+        logging.warning(f"{reason}: 撤销条件委托失败({order_id}): {e}")
+        return False
 
-    trade_state['last_stop_order_refresh_error'] = '; '.join(error_messages)
-    if not silent:
-        logging.warning(f"批量撤销 {SYMBOL} 未成交单失败: {trade_state['last_stop_order_refresh_error']}")
-    return False
 
-
-def cancel_conditional_orders(orders, silent=False, reason='清理残留条件委托', perf=None):
-    """只撤销传入的 closePosition/reduceOnly 条件委托，不影响普通挂单。"""
+def cancel_conditional_orders(orders, silent=False, reason='清理残留条件委托', perf=None, symbol=SYMBOL):
+    """只精确撤销传入的 closePosition/reduceOnly 条件委托，不影响普通开仓挂单。"""
     cancel_start = time.monotonic()
-    algo_order_ids = []
-    regular_order_ids = []
-    order_ids = []
+    unique_orders = []
+    seen_order_ids = set()
     for order in orders or []:
         order_id = extract_order_id(order)
-        if order_id:
-            order_ids.append(order_id)
-            info = order.get('info', {}) if isinstance(order, dict) else {}
-            if isinstance(info, dict) and info.get('algoId'):
-                algo_order_ids.append(order_id)
-            else:
-                regular_order_ids.append(order_id)
-    order_ids = list(dict.fromkeys(order_ids))
-    if not order_ids:
+        if not order_id or order_id in seen_order_ids:
+            continue
+        seen_order_ids.add(order_id)
+        unique_orders.append(order)
+    if not unique_orders:
         record_perf(perf, 'cancel_conditional_orders', cancel_start)
         return True
 
     cancel_failed = False
-    if algo_order_ids:
-        method = getattr(exchange, 'fapiPrivateDeleteAlgoOpenOrders', None)
-        if method is None:
+    for order in unique_orders:
+        if not cancel_conditional_order_exact(order, symbol=symbol, silent=silent, reason=reason):
             cancel_failed = True
-            trade_state['last_stop_order_refresh_error'] = 'fapiPrivateDeleteAlgoOpenOrders unavailable'
-            if not silent:
-                logging.warning(f"{reason}: 无法批量撤销algo条件委托，接口不可用")
-        else:
-            try:
-                method({'symbol': get_exchange_symbol_id()})
-                if not silent:
-                    logging.info(f"{reason}: 已批量撤销algo条件委托 {algo_order_ids}")
-            except Exception as e:
-                cancel_failed = True
-                trade_state['last_stop_order_refresh_error'] = format_exception_message(e)
-                if not silent:
-                    logging.warning(f"{reason}: 批量撤销algo条件委托失败({algo_order_ids}): {trade_state['last_stop_order_refresh_error']}")
-
-    for order_id in list(dict.fromkeys(regular_order_ids)):
-        try:
-            exchange.cancel_order(order_id, SYMBOL)
-            if not silent:
-                logging.info(f"{reason}: 已撤销条件委托 {order_id}")
-        except Exception as e:
-            error_text = format_exception_message(e)
-            trade_state['last_stop_order_refresh_error'] = error_text
-            if is_order_already_absent_error(e):
-                if not silent:
-                    logging.warning(f"{reason}: 条件委托已不存在，按成功处理({order_id}): {error_text}")
-                continue
-            cancel_failed = True
-            if not silent:
-                logging.warning(f"{reason}: 撤销条件委托失败({order_id}): {error_text}")
 
     record_perf(perf, 'cancel_conditional_orders', cancel_start)
     return not cancel_failed
@@ -1690,7 +1891,7 @@ def cancel_all_close_position_conditional_orders(silent=False, reason='无仓位
 
 
 def reconcile_conditional_orders_for_position(side, silent=False):
-    """有仓位时只保留一张出场方向的 STOP/STOP_MARKET 止损单，清理同向重复和反方向的条件委托。"""
+    """ETH策略持仓存在时，只归并脚本自有保护单，绝不触碰手工条件单。"""
     
     matched_orders = fetch_open_close_position_orders(side=None)
     if matched_orders is None:
@@ -1700,6 +1901,8 @@ def reconcile_conditional_orders_for_position(side, silent=False):
     same_side_stops = []
     orders_to_cancel = []
     for order in matched_orders:
+        if not is_script_owned_protective_order(order, tracked_order_id=trade_state.get('stop_order_id', '')):
+            continue
         # 提取订单方向和类型
         order_side = extract_order_side_upper(order)
         order_type = extract_order_type_upper(order)
@@ -1785,7 +1988,11 @@ def sync_protective_stop_order_state(side=None, silent=False):
     if not side:
         return None
 
-    stop_orders = fetch_open_protective_stop_orders(side=side)
+    stop_orders = fetch_open_protective_stop_orders(
+        side=side,
+        owned_only=True,
+        tracked_order_id=trade_state.get('stop_order_id', ''),
+    )
     if stop_orders is None:
         return None
 
@@ -1845,7 +2052,11 @@ def wait_until_stop_order_disappears(stop_order_ids, side, retries=STOP_ORDER_CA
         return True
 
     for attempt in range(1, retries + 1):
-        matched_orders = fetch_open_protective_stop_orders(side=side)
+        matched_orders = fetch_open_protective_stop_orders(
+            side=side,
+            owned_only=True,
+            tracked_order_id=trade_state.get('stop_order_id', ''),
+        )
         if matched_orders is None:
             time.sleep(sleep_seconds)
             continue
@@ -1954,7 +2165,11 @@ def cancel_protective_stop_order(silent=False):
                     logging.warning(f"撤销服务端止损单时提示已不存在，按成功处理({stop_order_id}): {error_text}")
                 continue
 
-            matched_orders = fetch_open_protective_stop_orders(side=side or None)
+            matched_orders = fetch_open_protective_stop_orders(
+                side=side or None,
+                owned_only=True,
+                tracked_order_id=stop_order_id,
+            )
             if matched_orders is not None:
                 still_exists = any(extract_order_id(order) == str(stop_order_id) for order in matched_orders)
                 if not still_exists:
@@ -2026,7 +2241,12 @@ def refresh_protective_stop_order(stop_price):
             error_text = format_exception_message(e)
             trade_state['last_stop_order_refresh_error'] = error_text
             if is_close_position_conflict_error(e) and attempt < len(retry_delays):
-                matched_orders = fetch_open_close_position_orders(side=side)
+                # 冲突恢复也只能处理脚本自有保护单；手工止损/止盈必须原样保留。
+                matched_orders = fetch_open_protective_stop_orders(
+                    side=side,
+                    owned_only=True,
+                    tracked_order_id=trade_state.get('stop_order_id', ''),
+                )
                 matched_order_ids = []
                 if matched_orders is not None:
                     matched_order_ids = [extract_order_id(order) or 'unknown' for order in matched_orders]
@@ -2044,13 +2264,10 @@ def refresh_protective_stop_order(stop_price):
                                 f"closePosition 冲突恢复时旧条件单仍可见，准备继续重试: order_ids={matched_order_ids}"
                             )
                     else:
-                        logging.warning("closePosition 冲突但未查询到具体条件单，准备批量撤销当前交易对未成交单后重试")
-                        if not cancel_all_open_orders_for_symbol(silent=True):
-                            logging.error(
-                                f"closePosition 冲突恢复失败：批量撤销未成交单失败，error={trade_state.get('last_stop_order_refresh_error', '')}"
-                            )
-                            return False
-                        time.sleep(max(STOP_ORDER_POST_CANCEL_DELAY_SECONDS, 0.5))
+                        logging.warning(
+                            "closePosition 冲突但没有发现脚本自有条件单；为保护手工委托，拒绝批量撤单"
+                        )
+                        return False
                 logging.warning(
                     f"重挂服务端止损单遇到 closePosition 冲突，准备重试: attempt={attempt}, "
                     f"stop={stop_price}, open_close_position_orders={matched_order_ids}, error={error_text}"
@@ -2574,22 +2791,9 @@ def cancel_pending_entry_algo_order(order_id, reason='', silent=False):
         if all_cancelled:
             return True
 
-    delete_all_method = getattr(exchange, 'fapiPrivateDeleteAlgoOpenOrders', None)
-    if delete_all_method is None:
-        return False
-
-    try:
-        delete_all_method({'symbol': get_exchange_symbol_id()})
-        if not silent:
-            order_ids = [
-                raw_order.get('algoId') or raw_order.get('clientAlgoId') or 'unknown'
-                for raw_order in target_orders
-            ]
-            logging.warning(f"{reason}: 已批量撤销当前交易对 open algo 条件单，目标 pending ids={order_ids}")
-        return True
-    except Exception as e:
-        logging.warning(f"{reason}: 批量撤销 pending algo 条件单失败: id={order_id}, error={e}")
-        return False
+    # 精确撤销失败时不再调用 DeleteAlgoOpenOrders；批量接口可能同时删掉手工止损/止盈。
+    logging.warning(f"{reason}: pending algo 入场单无法精确撤销，已拒绝批量撤单: id={order_id}")
+    return False
 
 
 def cancel_pending_entry_order(reason, silent=False, clear_state=True):
@@ -3482,18 +3686,18 @@ def price_to_float(value):
         return 0.0
 
 
-def precision_price(price):
+def precision_price(price, symbol=SYMBOL):
     try:
-        return float(exchange.price_to_precision(SYMBOL, price))
+        return float(exchange.price_to_precision(symbol, price))
     except Exception:
         return float(price)
 
 
-def get_price_tick(reference_price=None):
+def get_price_tick(reference_price=None, symbol=SYMBOL):
     try:
         if not getattr(exchange, 'markets', None):
             exchange.load_markets()
-        market = exchange.market(SYMBOL)
+        market = exchange.market(symbol)
         precision = market.get('precision', {}).get('price')
         if isinstance(precision, int):
             return 10 ** (-precision)
@@ -5024,6 +5228,726 @@ def build_entry_candidates(context):
     return candidates
 
 
+def position_key(symbol, position_side, side=None):
+    """手动仓位以交易对和 Binance positionSide 作为独立生命周期键。"""
+    normalized_position_side = str(position_side or 'BOTH').upper()
+    key = f"{normalize_futures_symbol(symbol)}|{normalized_position_side}"
+    # 单向模式 positionSide 永远是 BOTH，额外带上实际多空方向才能识别快速反手的新生命周期。
+    if normalized_position_side == 'BOTH' and side in ('long', 'short'):
+        key = f"{key}|{side.upper()}"
+    return key
+
+
+def normalize_account_position(pos):
+    """把 CCXT 仓位统一为手动接管模块使用的结构。"""
+    if not isinstance(pos, dict):
+        return None
+    info = pos.get('info', {})
+    if not isinstance(info, dict):
+        info = {}
+    raw_amount = price_to_float(info.get('positionAmt', pos.get('positionAmt', pos.get('contracts', 0))))
+    if abs(raw_amount) <= POSITION_AMT_EPSILON:
+        return None
+
+    symbol = normalize_futures_symbol(pos.get('symbol') or info.get('symbol'))
+    if not symbol or not symbol.endswith('/USDT'):
+        return None
+    side = infer_position_side(raw_amount, info=info, pos=pos)
+    raw_position_side = str(info.get('positionSide') or pos.get('positionSide') or 'BOTH').strip().upper()
+    if raw_position_side not in ('BOTH', 'LONG', 'SHORT'):
+        raw_position_side = 'BOTH'
+    entry_price = price_to_float(info.get('entryPrice', pos.get('entryPrice', 0)))
+    mark_price = price_to_float(info.get('markPrice', pos.get('markPrice', 0)))
+    liquidation_price = normalize_liquidation_price(
+        info.get('liquidationPrice', pos.get('liquidationPrice', 0))
+    )
+    return {
+        'key': position_key(symbol, raw_position_side, side=side),
+        'symbol': symbol,
+        'exchange_symbol_id': get_exchange_symbol_id(symbol),
+        'position_side': raw_position_side,
+        'side': side,
+        'position_amt': raw_amount,
+        'amount': abs(raw_amount),
+        'entry_price': entry_price,
+        'mark_price': mark_price,
+        'liquidation_price': liquidation_price,
+        'info': info,
+    }
+
+
+def fetch_all_account_positions():
+    """读取账户内全部非零U本位仓位；风险接口失败时降级到标准仓位接口。"""
+    errors = []
+    positions = None
+    # 不传 symbol 的 CCXT 统一接口可能先加载现货市场；Demo 环境优先直连U本位原生接口。
+    raw_position_methods = (
+        ('v3', getattr(exchange, 'fapiPrivateV3GetPositionRisk', None)),
+        ('v2', getattr(exchange, 'fapiPrivateV2GetPositionRisk', None)),
+        ('v1', getattr(exchange, 'fapiPrivateGetPositionRisk', None)),
+    )
+    for raw_version, raw_position_method in raw_position_methods:
+        if raw_position_method is None:
+            continue
+        try:
+            positions = raw_position_method({})
+            break
+        except Exception as e:
+            errors.append(f"raw_position_risk_{raw_version}={e}")
+    if positions is None:
+        try:
+            positions = exchange.fetch_positions_risk()
+        except Exception as e:
+            errors.append(f"fetch_positions_risk={e}")
+    if positions is None:
+        try:
+            positions = exchange.fetch_positions()
+        except Exception as e:
+            errors.append(f"fetch_positions={e}")
+            return {'fetch_failed': True, 'positions': [], 'error': '; '.join(errors)}
+
+    normalized = []
+    for pos in positions or []:
+        item = normalize_account_position(pos)
+        if item is not None:
+            normalized.append(item)
+    return {'fetch_failed': False, 'positions': normalized, 'error': '; '.join(errors)}
+
+
+def is_local_strategy_position(position):
+    """现有 trade_state 对应的 ETH 仓位仍由原策略管理，不重复归入手动仓位。"""
+    return bool(
+        trade_state.get('has_position')
+        and normalize_futures_symbol(position.get('symbol')) == normalize_futures_symbol(SYMBOL)
+        and position.get('side') == trade_state.get('side')
+    )
+
+
+def is_pending_strategy_position(position):
+    """pending ETH 已成交但尚未同步时，先交给 pending 流程初始化，避免误判为手动仓位。"""
+    return bool(
+        has_pending_entry()
+        and normalize_futures_symbol(position.get('symbol')) == normalize_futures_symbol(SYMBOL)
+        and position.get('side') == trade_state.get('pending_entry_side')
+    )
+
+
+def manual_position_stop_is_valid(position, stop_price, atr):
+    """手动仓位止损只和当前标记价比较，允许盈利后的止损越过入场价。"""
+    side = position.get('side')
+    symbol = position.get('symbol')
+    entry = price_to_float(position.get('entry_price'))
+    mark = price_to_float(position.get('mark_price'))
+    if mark <= 0:
+        return None, '缺少标记价格'
+    safe_stop, _ = ensure_stop_price_safe(
+        entry or mark,
+        stop_price,
+        side,
+        liquidation_price=position.get('liquidation_price'),
+    )
+    safe_stop = precision_price(safe_stop, symbol=symbol)
+    tick = get_price_tick(mark, symbol=symbol)
+    min_distance = max(price_to_float(atr) * MANUAL_STOP_MIN_DISTANCE_ATR, tick)
+    if side == 'long':
+        if safe_stop <= 0 or safe_stop > mark - tick:
+            return None, '多单止损不在当前价下方'
+        if mark - safe_stop < min_distance:
+            return None, '多单止损距离当前价过近'
+    else:
+        if safe_stop <= 0 or safe_stop < mark + tick:
+            return None, '空单止损不在当前价上方'
+        if safe_stop - mark < min_distance:
+            return None, '空单止损距离当前价过近'
+    return safe_stop, 'ok'
+
+
+def choose_tightest_stop(side, candidates):
+    """多单取最高止损、空单取最低止损，即选择预期亏损更小的保护位。"""
+    valid = [(price_to_float(stop), reason) for stop, reason in candidates if price_to_float(stop) > 0]
+    if not valid:
+        return None
+    return max(valid, key=lambda item: item[0]) if side == 'long' else min(valid, key=lambda item: item[0])
+
+
+def manual_profile_stop_candidate(position, profile, dfs, now_dt, highest, lowest):
+    """计算一套背景/出场周期对应的初始止损候选。"""
+    side = position['side']
+    mark = price_to_float(position.get('mark_price'))
+    entry = price_to_float(position.get('entry_price'))
+    symbol = position['symbol']
+    exit_tf = profile['exit_tf']
+    background_tf = profile['background_tf']
+    df_exit = dfs.get(exit_tf)
+    df_background = dfs.get(background_tf)
+    if df_exit is None or df_background is None:
+        return None
+
+    df_closed = get_closed_df(df_exit, exit_tf, now_dt=now_dt)
+    if len(df_closed) == 0:
+        return None
+    atr = price_to_float(df_closed.iloc[-1].get('atr'))
+    if atr <= 0:
+        return None
+    tick = get_price_tick(mark, symbol=symbol)
+    raw_candidates = []
+
+    # 最近结构低点/高点给手动仓位提供基础保护，ATR缓冲避免贴在影线上。
+    recent = df_closed.tail(MANUAL_STOP_SWING_LOOKBACK)
+    if side == 'long':
+        structure_stop = price_to_float(recent['low'].min()) - MANUAL_STOP_STRUCTURE_ATR_BUFFER * atr
+    else:
+        structure_stop = price_to_float(recent['high'].max()) + MANUAL_STOP_STRUCTURE_ATR_BUFFER * atr
+    raw_candidates.append((structure_stop, f"{exit_tf}最近结构位"))
+
+    large = latest_large_strong(df_closed)
+    if large:
+        raw_candidates.append((strong_candle_stop_for_position(side, large, tick), f"{exit_tf}大强K结构"))
+    same_strong = latest_effective_strong(df_closed, side)
+    if same_strong:
+        raw_candidates.append((strong_candle_stop_for_position(side, same_strong, tick), f"{exit_tf}同向强K结构"))
+    opposite = 'short' if side == 'long' else 'long'
+    opposite_strong = latest_effective_strong(df_closed, opposite)
+    if opposite_strong:
+        raw_candidates.append((strong_candle_stop_for_position(side, opposite_strong, tick), f"{exit_tf}反向强K结构"))
+
+    # 接管时已经达到1 ATR浮盈，也立即沿用原策略的30%/50%/70%/90%利润锁定。
+    profit_lock = profit_atr_lock_stop_for_position(side, entry, highest, lowest, atr)
+    if profit_lock:
+        raw_candidates.append((
+            profit_lock['stop'],
+            f"已盈利{profit_lock['profit_atr']:.2f}ATR，保留{profit_lock['retain_ratio']:.0%}利润",
+        ))
+
+    valid_candidates = []
+    rejected = []
+    for raw_stop, reason in raw_candidates:
+        valid_stop, invalid_reason = manual_position_stop_is_valid(position, raw_stop, atr)
+        if valid_stop is None:
+            rejected.append(f"{reason}:{invalid_reason}")
+            continue
+        valid_candidates.append((valid_stop, reason))
+
+    # 极端行情下结构位可能全部失效，仍用1 ATR兜底，避免新接管仓位长期裸奔。
+    if not valid_candidates:
+        fallback_stop = mark - atr if side == 'long' else mark + atr
+        valid_stop, invalid_reason = manual_position_stop_is_valid(position, fallback_stop, atr)
+        if valid_stop is None:
+            return None
+        valid_candidates.append((valid_stop, f"{exit_tf} ATR应急保护"))
+
+    best_stop, reason = choose_tightest_stop(side, valid_candidates)
+    background_state = evaluate_adx_ema_context(df_background, background_tf, now_dt=now_dt)
+    return {
+        'profile_name': profile['name'],
+        'background_tf': background_tf,
+        'exit_tf': exit_tf,
+        'stop': best_stop,
+        'atr': atr,
+        'reason': reason,
+        'background_summary': background_state.get('summary', ''),
+        'rejected': rejected,
+    }
+
+
+def select_manual_position_profile(position, dfs, now_dt, highest, lowest):
+    """同时评估两套周期并选择亏损更小的一套，选定后由 state 锁定。"""
+    candidates = []
+    for profile in MANUAL_POSITION_PROFILES:
+        candidate = manual_profile_stop_candidate(position, profile, dfs, now_dt, highest, lowest)
+        if candidate:
+            candidates.append(candidate)
+    if not candidates:
+        return None
+    if position['side'] == 'long':
+        return max(candidates, key=lambda item: item['stop'])
+    return min(candidates, key=lambda item: item['stop'])
+
+
+def fetch_manual_position_dfs(symbol):
+    """手动仓位只抓15M/1H/4H，缓存按 symbol 隔离，不运行ETH开仓策略。"""
+    dfs = {
+        '15m': fetch_df_cached(symbol, '15m', 220),
+        '1h': fetch_df_cached(symbol, '1h', 220),
+        '4h': fetch_df_cached(symbol, '4h', SUP_RES_LOOKBACK_4H),
+    }
+    return None if any(df is None for df in dfs.values()) else dfs
+
+
+def manual_owned_stop_orders(state):
+    """读取该手动仓位的脚本自有保护单，手工订单不会进入结果。"""
+    orders = fetch_open_protective_stop_orders(
+        side=state['side'],
+        symbol=state['symbol'],
+        position_side=state.get('position_side'),
+        owned_only=False,
+    )
+    if orders is None:
+        return None
+    tracked_id = state.get('stop_order_id', '')
+    return [
+        order for order in orders
+        if is_script_owned_protective_order(
+            order,
+            tracked_order_id=tracked_id,
+            prefixes=(MANUAL_STOP_CLIENT_PREFIX,),
+        )
+    ]
+
+
+def place_manual_protective_stop_order(state, stop_price):
+    """为一笔手动仓位创建带 TAM_ 前缀的服务端 STOP_MARKET 保护单。"""
+    side = state['side']
+    symbol = state['symbol']
+    stop_side = 'sell' if side == 'long' else 'buy'
+    client_order_id = make_protective_client_order_id(MANUAL_STOP_CLIENT_PREFIX)
+    params = {
+        'stopPrice': precision_price(stop_price, symbol=symbol),
+        'workingType': STOP_WORKING_TYPE,
+        'newClientOrderId': client_order_id,
+    }
+    raw_position_side = state.get('position_side', 'BOTH')
+    amount = price_to_float(state.get('amount'))
+    if raw_position_side in ('LONG', 'SHORT'):
+        # 对冲模式使用 positionSide + closePosition，避免 reduceOnly 参数被 Binance 拒绝。
+        params['positionSide'] = raw_position_side
+        params['closePosition'] = True
+        amount = None
+    else:
+        params['reduceOnly'] = True
+    order = exchange.create_order(symbol, 'STOP_MARKET', stop_side, amount, None, params)
+    return order, client_order_id
+
+
+def refresh_manual_protective_stop_order(state, stop_price, reason, force_quantity_refresh=False):
+    """精确替换手动仓位的脚本保护单；交易所上的手工条件单保持不动。"""
+    owned_orders = manual_owned_stop_orders(state)
+    if owned_orders is None:
+        return False
+    for order in owned_orders:
+        if not cancel_conditional_order_exact(
+            order,
+            symbol=state['symbol'],
+            silent=True,
+            reason='替换手动仓位脚本保护单',
+        ):
+            state['last_stop_order_error'] = f"无法撤销脚本保护单 {extract_order_id(order)}"
+            return False
+    if owned_orders:
+        time.sleep(STOP_ORDER_POST_CANCEL_DELAY_SECONDS)
+
+    try:
+        order, client_order_id = place_manual_protective_stop_order(state, stop_price)
+        state['stop_order_id'] = extract_order_id(order)
+        state['stop_client_order_id'] = extract_order_client_id(order) or client_order_id
+        state['stop_order_price'] = precision_price(stop_price, symbol=state['symbol'])
+        state['stop_loss_price'] = state['stop_order_price']
+        state['last_stop_order_error'] = ''
+        state['last_order_amount'] = price_to_float(state.get('amount'))
+        logging.info(
+            "手动仓位保护单已更新: symbol=%s side=%s profile=%s stop=%s amount=%s reason=%s quantity_refresh=%s",
+            state['symbol'], state['side'], state.get('profile_name'), state['stop_order_price'],
+            state.get('amount'), reason, force_quantity_refresh,
+        )
+        return True
+    except Exception as e:
+        state['last_stop_order_error'] = format_exception_message(e)
+        logging.error(
+            "手动仓位保护单创建失败（不会撤销手工委托）: symbol=%s side=%s stop=%s error=%s",
+            state['symbol'], state['side'], stop_price, state['last_stop_order_error'],
+        )
+        return False
+
+
+def manual_stop_is_tighter(side, new_stop, current_stop, mark, symbol):
+    tick = get_price_tick(mark, symbol=symbol)
+    if side == 'long':
+        return new_stop > current_stop + tick / 2 and new_stop <= mark - tick
+    return (current_stop <= 0 or new_stop < current_stop - tick / 2) and new_stop >= mark + tick
+
+
+def build_manual_dynamic_stop(state, position, dfs, now_dt):
+    """按已锁定的出场周期生成动态止损，并允许4H阻力/支撑进一步收紧。"""
+    side = state['side']
+    exit_tf = state['exit_tf']
+    mark = price_to_float(position.get('mark_price'))
+    symbol = state['symbol']
+    df_exit_closed = get_closed_df(dfs[exit_tf], exit_tf, now_dt=now_dt)
+    if len(df_exit_closed) == 0:
+        return None
+    atr = price_to_float(df_exit_closed.iloc[-1].get('atr'))
+    if atr <= 0:
+        return None
+    tick = get_price_tick(mark, symbol=symbol)
+    raw_candidates = []
+
+    large = latest_large_strong(df_exit_closed)
+    if large:
+        raw_candidates.append((strong_candle_stop_for_position(side, large, tick), f"{exit_tf}大强K"))
+    same = latest_effective_strong(df_exit_closed, side)
+    if same:
+        raw_candidates.append((strong_candle_stop_for_position(side, same, tick), f"{exit_tf}同向强K"))
+    opposite = latest_effective_strong(df_exit_closed, 'short' if side == 'long' else 'long')
+    if opposite:
+        raw_candidates.append((strong_candle_stop_for_position(side, opposite, tick), f"{exit_tf}反向强K"))
+
+    profit_lock = profit_atr_lock_stop_for_position(
+        side,
+        price_to_float(state.get('entry_price')),
+        price_to_float(state.get('highest_price')),
+        price_to_float(state.get('lowest_price')),
+        atr,
+    )
+    if profit_lock:
+        raw_candidates.append((
+            profit_lock['stop'],
+            f"浮盈{profit_lock['profit_atr']:.2f}ATR，保留{profit_lock['retain_ratio']:.0%}利润",
+        ))
+
+    df_4h_closed = get_closed_df(dfs['4h'], '4h', now_dt=now_dt)
+    if len(df_4h_closed) > 0:
+        atr_4h = price_to_float(df_4h_closed.iloc[-1].get('atr'))
+        zones = build_support_resistance_zones(dfs['4h'], now_dt=now_dt)
+        near_buffer = SUP_RES_NEAR_ATR * atr_4h
+        if side == 'long':
+            resistance = nearest_opposite_zone(zones, side, mark - near_buffer)
+            if resistance and mark >= resistance['lower'] - near_buffer:
+                raw_candidates.append((resistance['lower'] - 0.4 * atr_4h, '靠近4H阻力区'))
+        else:
+            support = nearest_opposite_zone(zones, side, mark + near_buffer)
+            if support and mark <= support['upper'] + near_buffer:
+                raw_candidates.append((support['upper'] + 0.4 * atr_4h, '靠近4H支撑区'))
+
+    valid_candidates = []
+    for raw_stop, reason in raw_candidates:
+        valid_stop, _ = manual_position_stop_is_valid(position, raw_stop, atr)
+        if valid_stop is not None:
+            valid_candidates.append((valid_stop, reason))
+    return choose_tightest_stop(side, valid_candidates)
+
+
+def initialize_manual_position_state(position):
+    """首次发现手动仓位时选择并锁定周期，同时立即创建保护单。"""
+    symbol = position['symbol']
+    mark = price_to_float(position.get('mark_price')) or get_latest_price(symbol)
+    position = dict(position, mark_price=mark)
+    entry = price_to_float(position.get('entry_price')) or mark
+    highest = max(entry, mark)
+    lowest = min(entry, mark)
+    dfs = fetch_manual_position_dfs(symbol)
+    if dfs is None:
+        logging.warning(f"手动仓位K线不完整，暂缓接管: symbol={symbol}")
+        return None
+    now_dt = get_server_now_dt()
+    selected = select_manual_position_profile(position, dfs, now_dt, highest, lowest)
+    if selected is None:
+        logging.error(f"手动仓位两套周期都无法生成有效止损: symbol={symbol}, side={position['side']}")
+        return None
+
+    state = {
+        'key': position['key'],
+        'symbol': symbol,
+        'position_side': position['position_side'],
+        'side': position['side'],
+        'entry_price': entry,
+        'amount': position['amount'],
+        'last_order_amount': 0.0,
+        'liquidation_price': position.get('liquidation_price'),
+        'highest_price': highest,
+        'lowest_price': lowest,
+        'profile_name': selected['profile_name'],
+        'background_tf': selected['background_tf'],
+        'exit_tf': selected['exit_tf'],
+        'initial_atr': selected['atr'],
+        'stop_loss_price': selected['stop'],
+        'stop_order_price': 0.0,
+        'stop_order_id': '',
+        'stop_client_order_id': '',
+        'detected_time': get_server_time_str(),
+        'miss_count': 0,
+        'last_stop_order_error': '',
+        'background_summary': selected.get('background_summary', ''),
+        'ai_initial_amount': position['amount'],
+        'ai_last_reduce_generated_at': '',
+        'ai_partial_reduce_count': 0,
+        'ai_partial_reduce_amount': 0.0,
+        'ai_last_decision': {},
+        'ai_guard_snapshot': {},
+        'ai_bias_file': manual_ai_bias_file(symbol),
+        'ai_research_status': '',
+    }
+    if not refresh_manual_protective_stop_order(state, selected['stop'], selected['reason']):
+        logging.error(f"手动仓位已发现但脚本保护单尚未挂成功: key={state['key']}")
+    logging.warning(
+        "已接管手动仓位并锁定周期: key=%s side=%s entry=%s mark=%s profile=%s stop=%s background=%s",
+        state['key'], state['side'], entry, mark, state['profile_name'], state['stop_loss_price'],
+        state.get('background_summary', ''),
+    )
+    # 保护止损先落地，再异步启动AI研究；AI任务慢或失败不会延迟仓位保护。
+    ensure_manual_ai_research_job(symbol, state=state)
+    return state
+
+
+def cleanup_closed_position_exit_orders(state):
+    """确认仓位完全归零后，清理该 symbol/side 的全部止损止盈，普通开仓委托不受影响。"""
+    orders = fetch_open_close_position_orders(
+        side=state['side'],
+        symbol=state['symbol'],
+        position_side=state.get('position_side'),
+    )
+    if orders is None:
+        return False
+    return cancel_conditional_orders(
+        orders,
+        silent=True,
+        reason='确认手动仓位全平后清理该方向出场条件单',
+        symbol=state['symbol'],
+    )
+
+
+def confirm_manual_position_fully_closed(state):
+    """连续缺失后再用标准仓位接口复查，防止平仓后立刻重开的竞态。"""
+    try:
+        positions = exchange.fetch_positions([state['symbol']])
+    except Exception as e:
+        logging.warning(f"手动仓位全平复查失败，保留状态等待下轮: key={state['key']}, error={e}")
+        return False
+    for raw_position in positions or []:
+        position = normalize_account_position(raw_position)
+        if position is None:
+            continue
+        if position['key'] == state['key'] and position['side'] == state['side']:
+            return False
+    return True
+
+
+def manual_exchange_min_amount(symbol):
+    try:
+        market = exchange.market(symbol)
+        return price_to_float(market.get('limits', {}).get('amount', {}).get('min'))
+    except Exception:
+        return 0.0
+
+
+def apply_manual_ai_position_guard(state, position, mark):
+    """按该交易对独立bias评估手动仓位；AI只能减仓，不能加仓、全平或反手。"""
+    guard = ensure_manual_ai_research_job(state['symbol'], state=state)
+    current_amount = price_to_float(state.get('amount'))
+    initial_amount = price_to_float(state.get('ai_initial_amount'))
+    if initial_amount <= 0:
+        initial_amount = current_amount
+        state['ai_initial_amount'] = initial_amount
+    if current_amount <= POSITION_AMT_EPSILON or initial_amount <= POSITION_AMT_EPSILON:
+        return False
+
+    decision = evaluate_position_reduction(
+        state['side'],
+        initial_amount,
+        current_amount,
+        guard,
+        AI_RESEARCH_CONFIG,
+        last_reduce_generated_at=state.get('ai_last_reduce_generated_at', ''),
+    )
+    state_key = state.get('key') or position_key(
+        state['symbol'],
+        state.get('position_side', 'BOTH'),
+        side=state.get('side'),
+    )
+    write_ai_audit(
+        'manual_position_evaluation',
+        guard,
+        {
+            'symbol': compact_usdt_symbol(state['symbol']),
+            'position_side': state['side'],
+            'entry_initial_amount': initial_amount,
+            'current_amount': current_amount,
+            **decision,
+        },
+        dedupe_key=(
+            f"manual-position:{compact_usdt_symbol(state['symbol'])}:{state_key}:"
+            f"{guard.get('generated_at', 'invalid')}:{current_amount:.12f}:{decision.get('shadow_action')}"
+        ),
+    )
+    if not decision.get('should_reduce'):
+        return False
+
+    requested_amount = min(current_amount, price_to_float(decision.get('reduce_amount')))
+    try:
+        reduce_amount = float(exchange.amount_to_precision(state['symbol'], requested_amount))
+    except Exception as e:
+        logging.warning(f"手动仓位AI减仓数量精度处理失败: key={state['key']}, error={e}")
+        return False
+    min_amount = manual_exchange_min_amount(state['symbol'])
+    if reduce_amount <= POSITION_AMT_EPSILON or (min_amount > 0 and reduce_amount < min_amount):
+        return False
+    if reduce_amount >= current_amount - POSITION_AMT_EPSILON:
+        # 即使上游配置异常，也硬性禁止AI把手动仓位完全平掉。
+        logging.error(f"拒绝手动仓位AI全平: key={state['key']}, current={current_amount}, reduce={reduce_amount}")
+        return False
+
+    order_side = 'sell' if state['side'] == 'long' else 'buy'
+    params = {}
+    raw_position_side = state.get('position_side', 'BOTH')
+    if raw_position_side in ('LONG', 'SHORT'):
+        params['positionSide'] = raw_position_side
+    else:
+        params['reduceOnly'] = True
+    try:
+        order = exchange.create_order(
+            state['symbol'],
+            'market',
+            order_side,
+            reduce_amount,
+            None,
+            params,
+        )
+    except Exception as e:
+        logging.error(f"手动仓位AI减仓失败: key={state['key']}, error={e}")
+        return False
+
+    reported_fill = extract_order_filled_amount(order)
+    actual_reduced = reported_fill if reported_fill > POSITION_AMT_EPSILON else reduce_amount
+    remaining_amount = max(0.0, current_amount - actual_reduced)
+    if remaining_amount <= POSITION_AMT_EPSILON:
+        logging.error(f"手动仓位AI减仓返回异常剩余数量，保留旧状态等待交易所复核: key={state['key']}")
+        return False
+
+    state['amount'] = remaining_amount
+    state['ai_last_reduce_generated_at'] = guard.get('generated_at', '')
+    state['ai_partial_reduce_count'] = int(state.get('ai_partial_reduce_count', 0) or 0) + 1
+    state['ai_partial_reduce_amount'] = price_to_float(state.get('ai_partial_reduce_amount')) + actual_reduced
+    state['ai_last_decision'] = decision
+    stop_price = price_to_float(state.get('stop_loss_price'))
+    stop_refreshed = False
+    if stop_price > 0:
+        # 减仓成交后只刷新 TAM_ 保护单数量，用户自己的止损止盈仍然保留。
+        stop_refreshed = refresh_manual_protective_stop_order(
+            state,
+            stop_price,
+            'TradingAgents减仓后刷新保护单数量',
+            force_quantity_refresh=True,
+        )
+    write_ai_audit(
+        'manual_position_reduction_executed',
+        guard,
+        {
+            'symbol': compact_usdt_symbol(state['symbol']),
+            'position_side': state['side'],
+            **decision,
+            'reduce_order_id': extract_order_id(order),
+            'actual_reduce_amount': actual_reduced,
+            'remaining_amount': remaining_amount,
+            'stop_refreshed': stop_refreshed,
+            'actual_action': 'reduced',
+        },
+        dedupe_key=(
+            f"manual-reduced:{compact_usdt_symbol(state['symbol'])}:"
+            f"{guard.get('generated_at', '')}:{extract_order_id(order)}"
+        ),
+    )
+    logging.warning(
+        "TradingAgents已对手动仓位执行减仓: key=%s reduced=%s remaining=%s order_id=%s stop_refreshed=%s",
+        state['key'], actual_reduced, remaining_amount, extract_order_id(order), stop_refreshed,
+    )
+    return True
+
+
+def manage_manual_position(state, position):
+    """同步一笔手动仓位的价格、数量和锁定周期动态止损。"""
+    mark = price_to_float(position.get('mark_price')) or get_latest_price(state['symbol'])
+    position = dict(position, mark_price=mark)
+    state['miss_count'] = 0
+    state['liquidation_price'] = position.get('liquidation_price')
+    if state['side'] == 'long':
+        state['highest_price'] = max(price_to_float(state.get('highest_price')), mark)
+    else:
+        previous_low = price_to_float(state.get('lowest_price'))
+        state['lowest_price'] = mark if previous_low <= 0 else min(previous_low, mark)
+
+    old_amount = price_to_float(state.get('amount'))
+    new_amount = price_to_float(position.get('amount'))
+    state['amount'] = new_amount
+    quantity_changed = abs(new_amount - old_amount) > POSITION_AMT_EPSILON
+    apply_manual_ai_position_guard(state, position, mark)
+    dfs = fetch_manual_position_dfs(state['symbol'])
+    if dfs is None:
+        return
+    dynamic = build_manual_dynamic_stop(state, position, dfs, get_server_now_dt())
+    current_stop = price_to_float(state.get('stop_loss_price'))
+    if dynamic:
+        new_stop, reason = dynamic
+        if manual_stop_is_tighter(state['side'], new_stop, current_stop, mark, state['symbol']):
+            refresh_manual_protective_stop_order(state, new_stop, reason)
+            return
+
+    owned_orders = manual_owned_stop_orders(state)
+    own_stop_missing = owned_orders is not None and not owned_orders
+    if quantity_changed or own_stop_missing:
+        refresh_manual_protective_stop_order(
+            state,
+            current_stop,
+            '仓位数量变化，刷新脚本保护单数量' if quantity_changed else '脚本保护单缺失，重新补挂',
+            force_quantity_refresh=quantity_changed,
+        )
+
+
+def manage_all_manual_positions(account_positions):
+    """发现、更新并确认关闭全部手动仓位，返回当前是否仍需暂停ETH开仓。"""
+    reap_manual_ai_jobs()
+    visible_manual = {}
+    for position in account_positions:
+        if is_local_strategy_position(position) or is_pending_strategy_position(position):
+            continue
+        visible_manual[position['key']] = position
+
+    # 同一个 one-way key 如果方向已反转，先清掉旧方向出场单，再按新仓位重新接管。
+    for key, position in list(visible_manual.items()):
+        existing = manual_position_states.get(key)
+        if existing and existing.get('side') != position.get('side'):
+            cleanup_closed_position_exit_orders(existing)
+            manual_position_states.pop(key, None)
+
+    for key, position in visible_manual.items():
+        state = manual_position_states.get(key)
+        if state is None:
+            state = initialize_manual_position_state(position)
+            if state is not None:
+                manual_position_states[key] = state
+        else:
+            manage_manual_position(state, position)
+
+    for key, state in list(manual_position_states.items()):
+        if key in visible_manual:
+            continue
+        state['miss_count'] = int(state.get('miss_count', 0) or 0) + 1
+        if state['miss_count'] < MANUAL_POSITION_MISS_CONFIRM_COUNT:
+            logging.warning(
+                "手动仓位暂未查到，等待连续确认: key=%s miss=%s/%s",
+                key, state['miss_count'], MANUAL_POSITION_MISS_CONFIRM_COUNT,
+            )
+            continue
+        if not confirm_manual_position_fully_closed(state):
+            state['miss_count'] = 0
+            continue
+        cleanup_ok = cleanup_closed_position_exit_orders(state)
+        if not cleanup_ok:
+            state['miss_count'] = MANUAL_POSITION_MISS_CONFIRM_COUNT
+            logging.warning(f"手动仓位已全平但出场条件单尚未清理完成，下轮继续重试: key={key}")
+            continue
+        closed_time = get_server_time_str()
+        if normalize_futures_symbol(state['symbol']) == normalize_futures_symbol(SYMBOL):
+            # 手动ETH平仓仍执行20分钟冷却；BTC/SOL等非ETH平仓不写入ETH冷却时间。
+            trade_state['last_exit_time'] = closed_time
+        manual_position_states.pop(key, None)
+        logging.warning(
+            "手动仓位已确认全平并完成出场单清理: key=%s cooldown=%s",
+            key,
+            '20分钟ETH冷却' if normalize_futures_symbol(state['symbol']) == normalize_futures_symbol(SYMBOL) else '无ETH冷却',
+        )
+
+    return bool(visible_manual or manual_position_states)
+
+
 def build_context(dfs, now_dt, perf=None):
     """
     上下文聚合器 — 每轮交易决策前，合并所需的市场状态信息。
@@ -5623,6 +6547,39 @@ def _run_strategy_impl(perf):
     """run_strategy主体；返回退出原因，便于统一控制流程。"""
     global trade_state
     gate_result = {}
+
+    # 每轮最先扫描全账户仓位。手动仓位接管不受ETH冷却影响，也不依赖交易对白名单。
+    account_snapshot = fetch_all_account_positions()
+    if account_snapshot.get('fetch_failed'):
+        logging.warning(f"无法读取全账户仓位，本轮禁止新开ETH: {account_snapshot.get('error')}")
+        # 已有本地ETH持仓时仍继续走原持仓管理；空仓时宁可跳过，也不能在未知仓位下开新单。
+        if not trade_state.get('has_position'):
+            return 'account_positions_fetch_failed'
+        account_positions = []
+    else:
+        account_positions = account_snapshot.get('positions', [])
+
+    if has_pending_entry():
+        # pending 可能刚成交，先让原流程把对应ETH仓位初始化为策略仓位。
+        pending_sync_result = sync_pending_entry_fill_if_needed()
+        if pending_sync_result:
+            # pending 同步可能主动撤退或完成持仓初始化，重新读取仓位避免使用旧快照。
+            refreshed_snapshot = fetch_all_account_positions()
+            if not refreshed_snapshot.get('fetch_failed'):
+                account_positions = refreshed_snapshot.get('positions', [])
+        if has_pending_entry() and account_positions:
+            cancel_pending_entry_order(
+                '账户已存在持仓，暂停ETH自动开仓并撤销脚本pending入场单',
+                silent=False,
+            )
+
+    manual_positions_active = manage_all_manual_positions(account_positions)
+    any_account_position = bool(account_positions)
+
+    # 只有手动仓位时，完成动态止损后直接结束本轮，不抓ETH策略K线、不寻找ETH开仓信号。
+    if not trade_state.get('has_position') and (any_account_position or manual_positions_active):
+        return 'manual_positions_managed_entry_paused'
+
     #没有仓位并且有未完成的开仓委托， has_pending_entry: 是否有未完成的开仓委托
     if not trade_state.get('has_position') and has_pending_entry():
         #检查peding挂单是否开仓，判断peding开仓位置是否合理，利润预期是否满足，不合理不够就就立马平仓，并且清空挂单,并且重置本地止损状态，重置本地pending状态;

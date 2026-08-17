@@ -58,8 +58,8 @@ DEFAULT_TRADINGAGENTS_LLM_MAX_RETRIES = 1
 DEFAULT_TRADINGAGENTS_MAX_DATA_ROWS = 60
 DEFAULT_TRADINGAGENTS_MAX_NEWS_ITEMS = 12
 DEFAULT_TRADINGAGENTS_MAX_NEWS_SUMMARY_CHARS = 500
-NEWS_KEYWORDS = (
-    "ETH", "Ethereum", "Bitcoin", "BTC", "crypto", "stablecoin", "ETF",
+GENERIC_NEWS_KEYWORDS = (
+    "crypto", "stablecoin", "ETF",
     "SEC", "Fed", "rates", "inflation", "risk appetite", "Binance",
 )
 RSS_FEEDS = (
@@ -80,10 +80,6 @@ NEWS_SOURCE_TRUST = {
     "gdelt": 7.0,
     "rss": 8.0,
 }
-ETH_DIRECT_TERMS = (
-    "ethereum", "ether", "eth ", "eth-", "eth/", "staking", "pectra",
-    "layer 2", "layer-2", "rollup", "eip-",
-)
 CRYPTO_CONTEXT_TERMS = (
     "bitcoin", "btc", "crypto", "stablecoin", "defi", "token", "binance",
 )
@@ -115,12 +111,33 @@ def now_exchange() -> datetime:
 
 
 def symbol_to_binance(symbol: str) -> str:
-    compact = symbol.upper().replace("/", "").replace("-", "").replace(":", "")
+    raw_symbol = symbol.upper().split(":", 1)[0]
+    compact = raw_symbol.replace("/", "").replace("-", "")
     if compact.endswith("USD") and not compact.endswith("USDT"):
         return compact[:-3] + "USDT"
-    if compact in {"ETH", "BTC", "SOL", "XRP", "ADA"}:
+    if compact and not compact.endswith(("USD", "USDT", "USDC")):
         return compact + "USDT"
     return compact
+
+
+def symbol_news_terms(symbol: str) -> tuple[str, ...]:
+    """按实际交易对生成新闻关键词；映射只补充别名，不限制可分析币种。"""
+    compact = symbol_to_binance(symbol)
+    base = compact[:-4] if compact.endswith("USDT") else compact
+    search_base = re.sub(r"^\d+", "", base) or base
+    aliases = {
+        "BTC": ("bitcoin",),
+        "ETH": ("ethereum", "ether"),
+        "SOL": ("solana",),
+        "XRP": ("ripple",),
+        "DOGE": ("dogecoin",),
+        "ADA": ("cardano",),
+        "AVAX": ("avalanche",),
+        "LINK": ("chainlink",),
+        "DOT": ("polkadot",),
+    }.get(search_base, ())
+    direct = (search_base, search_base.lower(), *aliases)
+    return tuple(dict.fromkeys(term for term in (*direct, *GENERIC_NEWS_KEYWORDS) if term))
 
 
 def parse_dt(value: str | None) -> str:
@@ -141,7 +158,7 @@ def request_json(url: str, params: dict[str, Any] | None = None, headers: dict[s
     return response.json()
 
 
-def fetch_finnhub_crypto_news(hours: int, limit: int = 30) -> list[dict[str, Any]]:
+def fetch_finnhub_crypto_news(hours: int, limit: int = 30, symbol: str = "ETHUSDT") -> list[dict[str, Any]]:
     token = os.getenv("FINNHUB_API_KEY")
     if not token:
         return []
@@ -165,7 +182,7 @@ def fetch_finnhub_crypto_news(hours: int, limit: int = 30) -> list[dict[str, Any
         if published and published < cutoff:
             continue
         text = f"{article.get('headline', '')} {article.get('summary', '')}"
-        if not keyword_match(text):
+        if not keyword_match(text, symbol=symbol):
             continue
         items.append(
             {
@@ -181,12 +198,18 @@ def fetch_finnhub_crypto_news(hours: int, limit: int = 30) -> list[dict[str, Any
     return items
 
 
-def keyword_match(text: str) -> bool:
+def keyword_match(text: str, symbol: str = "ETHUSDT") -> bool:
     upper = text.upper()
-    return any(keyword.upper() in upper for keyword in NEWS_KEYWORDS)
+    return any(keyword.upper() in upper for keyword in symbol_news_terms(symbol))
 
 
-def parse_rss_feed(xml_text: str, source_url: str, hours: int, limit: int) -> list[dict[str, Any]]:
+def parse_rss_feed(
+    xml_text: str,
+    source_url: str,
+    hours: int,
+    limit: int,
+    symbol: str = "ETHUSDT",
+) -> list[dict[str, Any]]:
     root = ElementTree.fromstring(xml_text)
     cutoff = now_utc() - timedelta(hours=hours)
     items = []
@@ -224,7 +247,7 @@ def parse_rss_feed(xml_text: str, source_url: str, hours: int, limit: int) -> li
         if not link:
             link_node = node.find("{http://www.w3.org/2005/Atom}link")
             link = link_node.attrib.get("href", "") if link_node is not None else ""
-        if not keyword_match(f"{title} {summary}"):
+        if not keyword_match(f"{title} {summary}", symbol=symbol):
             continue
         items.append(
             {
@@ -240,14 +263,14 @@ def parse_rss_feed(xml_text: str, source_url: str, hours: int, limit: int) -> li
     return items
 
 
-def fetch_rss_news(hours: int, limit_per_feed: int = 10) -> list[dict[str, Any]]:
+def fetch_rss_news(hours: int, limit_per_feed: int = 10, symbol: str = "ETHUSDT") -> list[dict[str, Any]]:
     headers = {"User-Agent": "tradingagents-ai-research/1.0"}
     items = []
     for feed_url in RSS_FEEDS:
         try:
             response = requests.get(feed_url, headers=headers, timeout=REQUEST_TIMEOUT)
             response.raise_for_status()
-            items.extend(parse_rss_feed(response.text, feed_url, hours, limit_per_feed))
+            items.extend(parse_rss_feed(response.text, feed_url, hours, limit_per_feed, symbol=symbol))
         except Exception as exc:
             items.append(
                 {
@@ -261,8 +284,10 @@ def fetch_rss_news(hours: int, limit_per_feed: int = 10) -> list[dict[str, Any]]
     return items
 
 
-def fetch_gdelt_news(hours: int, limit: int = 20) -> list[dict[str, Any]]:
-    query = '(Ethereum OR ETH OR Bitcoin OR crypto OR "spot ETF" OR stablecoin) sourceCountry:US'
+def fetch_gdelt_news(hours: int, limit: int = 20, symbol: str = "ETHUSDT") -> list[dict[str, Any]]:
+    base_terms = [term for term in symbol_news_terms(symbol) if term.lower() not in {item.lower() for item in GENERIC_NEWS_KEYWORDS}]
+    query_terms = base_terms[:4] + ["crypto", '"spot ETF"', "stablecoin"]
+    query = "(" + " OR ".join(query_terms) + ") sourceCountry:US"
     params = {
         "query": query,
         "mode": "ArtList",
@@ -346,7 +371,11 @@ def parse_news_datetime(value: Any) -> datetime | None:
     return parsed.astimezone(UTC)
 
 
-def news_item_score(item: dict[str, Any], current_time: datetime | None = None) -> float:
+def news_item_score(
+    item: dict[str, Any],
+    current_time: datetime | None = None,
+    symbol: str = "ETHUSDT",
+) -> float:
     current_time = (current_time or now_utc()).astimezone(UTC)
     title = str(item.get("title", "")).lower()
     summary = str(item.get("summary", "")).lower()
@@ -370,8 +399,9 @@ def news_item_score(item: dict[str, Any], current_time: datetime | None = None) 
         else:
             recency_score = 0.0
 
-    direct_in_title = any(term in f"{title} " for term in ETH_DIRECT_TERMS)
-    direct_in_text = any(term in f"{combined} " for term in ETH_DIRECT_TERMS)
+    direct_terms = tuple(term.lower() for term in symbol_news_terms(symbol) if term.lower() not in {item.lower() for item in GENERIC_NEWS_KEYWORDS})
+    direct_in_title = any(term in f"{title} " for term in direct_terms)
+    direct_in_text = any(term in f"{combined} " for term in direct_terms)
     context_in_title = any(term in title for term in CRYPTO_CONTEXT_TERMS)
     context_in_text = any(term in combined for term in CRYPTO_CONTEXT_TERMS)
     if direct_in_title:
@@ -403,6 +433,7 @@ def select_news_items(
     items: list[dict[str, Any]],
     limit: int = 12,
     current_time: datetime | None = None,
+    symbol: str = "ETHUSDT",
 ) -> list[dict[str, Any]]:
     limit = max(1, int(limit))
     best_by_key: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -413,7 +444,7 @@ def select_news_items(
         key = re.sub(r"\W+", "", (title or str(item.get("url", ""))).lower())[:120]
         if not key:
             continue
-        score = news_item_score(item, current_time)
+        score = news_item_score(item, current_time, symbol=symbol)
         existing = best_by_key.get(key)
         if existing is None or score > existing[0]:
             best_by_key[key] = (score, item)
@@ -615,9 +646,9 @@ def build_research_snapshot(args: argparse.Namespace) -> dict[str, Any]:
     research_dir = Path(args.research_dir)
     cache_dir = research_dir / "cache"
     news = dedupe_news(
-        fetch_finnhub_crypto_news(args.hours)
-        + fetch_rss_news(args.hours)
-        + fetch_gdelt_news(args.hours)
+        fetch_finnhub_crypto_news(args.hours, symbol=args.symbol)
+        + fetch_rss_news(args.hours, symbol=args.symbol)
+        + fetch_gdelt_news(args.hours, symbol=args.symbol)
     )
     source_counts: dict[str, int] = {}
     for item in news:
@@ -637,7 +668,10 @@ def build_research_snapshot(args: argparse.Namespace) -> dict[str, Any]:
             "primary_research_engine": "TradingAgents multi-agent report",
             "normalizer": "DeepSeek JSON compression only",
             "external_data_role": "corroboration and freshness checks, not a replacement for TradingAgents",
-            "execution_role": "research output only; not connected to bian_new.py",
+            "execution_role": (
+                "Writes a symbol-specific bias consumed by bian_new.py; the research process never places orders. "
+                "bian_new.py independently enforces confidence, reduction, no-full-close, and no-reversal guards."
+            ),
         },
     }
 
