@@ -1,4 +1,4 @@
-# TradingAgents AI 研究与手动仓位接管方案
+# TradingAgents AI 研究与多交易对持仓管理方案
 
 文档状态：
 
@@ -7,27 +7,27 @@
 运行目录：/home/ubuntu/binance
 交易环境：Binance USD-M Demo
 当前 AI 模式：manage
-当前状态：多交易对手动仓位接管和逐交易对 TradingAgents 研究已接入 bian_new.py
+当前状态：脚本 ETH 与任意手动 USD-M 持仓均已接入逐交易对 TradingAgents 研究
 ```
 
 ## 1. 当前结论
 
 `ai_market_bias.py` 仍然是独立的研究结果生产脚本，本身不下单，也不直接管理仓位。
 
-现在已经存在完整连接：`bian_new.py` 发现手动仓位后，会异步启动 `run_symbol_research.py`；后者按实际交易对运行 TradingAgents 和 `ai_market_bias.py`，生成该交易对自己的 bias 文件，再由 `bian_new.py` 校验并使用。
+现在已经存在完整连接：`bian_new.py` 确认脚本 ETH 或手动 USD-M 仓位后，会异步启动 `run_symbol_research.py`；后者按实际交易对运行 TradingAgents 和 `ai_market_bias.py`，生成该交易对自己的 bias 文件，再由 `bian_new.py` 校验并使用。
 
 例如：
 
 ```text
-手动 BTCUSDT 仓位
-  -> run_symbol_research.py --symbol BTCUSDT
-  -> analyze_eth_tradingagents.py --ticker BTC-USD
-  -> ai_market_bias.py --symbol BTCUSDT
-  -> .ai_research/latest_bias_BTCUSDT.json
+持仓 SYMBOL（例如 BTCUSDT）
+  -> run_symbol_research.py --symbol SYMBOL
+  -> analyze_eth_tradingagents.py --ticker BASE-USD
+  -> ai_market_bias.py --symbol SYMBOL
+  -> .ai_research/latest_bias_SYMBOL.json
   -> bian_new.py 校验后最多执行受限的部分减仓
 ```
 
-这套实现没有手动仓位币种白名单。只要 Binance USD-M 账户返回的是有效非零仓位，BTC、SOL、PEPE 等交易对都可以进入接管流程。
+这套实现没有手动仓位币种白名单。只要 Binance USD-M 账户返回的是有效非零仓位，BTC、SOL、PEPE 等交易对都可以进入接管流程；脚本自己的 ETH 仓位使用同一套研究调度器，但仓位和止损仍由原 `trade_state` 管理。
 
 ## 2. 安全边界
 
@@ -72,13 +72,13 @@ AI 代码不能修改 Demo/正式环境开关。
 
 | 文件 | 当前职责 |
 |---|---|
-| `bian_new.py` | ETH 原策略、全账户手动仓位发现、动态止损、订单归属、逐交易对 AI 调度和受限减仓 |
+| `bian_new.py` | ETH 原策略、全账户手动仓位发现、动态止损、订单归属、固定三时点逐交易对 AI 调度和受限减仓 |
 | `tradingAgents/run_symbol_research.py` | 单交易对后台任务入口；负责 symbol 转换和 `flock` 防重入 |
 | `tradingAgents/analyze_eth_tradingagents.py` | TradingAgents 多 Agent 研究入口；文件名保留历史名称，但已支持任意有效 USD/USDT/USDC 加密交易对 |
 | `tradingAgents/ai_market_bias.py` | 读取 TradingAgents 报告和辅助数据，生成 `latest_bias_SYMBOL.json` |
 | `tradingAgents/ai_research_guard.py` | 配置校验、bias 校验、fail-open、候选过滤、部分减仓计算和 JSONL 审计 |
-| `test_bian_manual_takeover.py` | 手动仓位、保护单归属、冷却和 AI 减仓测试 |
-| `test_tradingagents_multi_symbol.py` | 任意币种、逐 symbol 文件和 runner 转换测试 |
+
+本地工作目录另外保留 `test_bian_manual_takeover.py` 和 `test_tradingagents_multi_symbol.py` 做回归验证；按当前仓库约定，这两个测试文件不上传到 Git。
 
 ## 4. 实际运行链路
 
@@ -112,9 +112,39 @@ bian_new.py 每轮读取 Binance USD-M 全账户非零仓位
 
 后台研究不会阻塞每秒交易循环。脚本 ETH 和手动 BTC 同时持仓时，会分别启动 ETHUSDT、BTCUSDT 任务；两个进程可以并行，分别生成独立 JSON，不会互相覆盖。首次发现手动仓位时，脚本先尝试创建保护止损，然后才启动研究任务。
 
-调度使用“即时补缺 + 固定批次”：bias 缺失、损坏或过期时立即生成一次；只要该交易对仍有持仓，之后重新对齐北京时间 `05:50`、`13:50`、`20:50` 三个固定研究批次。新仓建立前已经错过的批次不补跑；任务失败按重试间隔再次尝试。
+调度使用“即时补缺 + 固定批次”：bias 缺失、损坏、过期、symbol 不匹配或 schema 校验失败时立即生成一次；只要该交易对仍有持仓，之后重新对齐北京时间 `05:50`、`13:50`、`20:50` 三个固定研究批次。新仓建立前已经错过的批次不补跑；任务失败按重试间隔再次尝试。
 
-### 4.2 分交易对隔离
+### 4.2 固定批次判定
+
+固定时点是 TradingAgents 任务的启动时间，不再像旧 cron 方案那样把“报告”和“bias”拆成相差 10 分钟的两个任务。`run_symbol_research.py` 会在一个进程链路内先完成 TradingAgents 报告，再生成 bias，因此 JSON 通常会晚于固定时点数分钟写入。
+
+以 ETH 在北京时间 10:00 开仓为例：
+
+```text
+10:00 没有有效 ETH JSON：立即启动一次 ETHUSDT 研究。
+13:49：不提前刷新。
+13:50：即使 10:00 的 JSON 仍有效，也启动 13:50 固定批次。
+20:50：启动 20:50 固定批次。
+次日 05:50：启动 05:50 固定批次，继续保持固定节奏。
+```
+
+如果 ETH 在 14:00 才开仓且已有有效 JSON，13:50 是开仓前的批次，不会补跑；下一次固定刷新是 20:50。
+
+是否完成某个批次不依赖内存标记，而是比较 bias 的 `generated_at` 和最近已到达的固定时点。因此 `bian_new.py` 重启后，只要仓位还在，也能继续判断该批次是否已经生成成功。
+
+### 4.3 空仓、失败和进程边界
+
+```text
+当前没有任何持仓：不为固定时点主动运行 TradingAgents。
+ETH 空仓候选或 pending：只读取已有 ETH bias，不为候选单独启动研究。
+新持仓没有有效 bias：立即启动，不等待下一个固定时点。
+同一 symbol 已有任务运行：本轮复用运行状态，不重复启动。
+任务失败：从上一次启动尝试起至少等待 1800 秒后重试。
+任务运行期间仓位关闭：当前不会强制杀掉子进程；该次报告/JSON可以正常完成。
+研究失败或仍在运行：ATR、结构止损和原策略继续工作，AI 按 fail-open 处理。
+```
+
+### 4.4 分交易对隔离
 
 以 BTC 和 SOL 同时存在为例：
 
@@ -127,7 +157,7 @@ bian_new.py 每轮读取 Binance USD-M 全账户非零仓位
 .ai_research/logs/manual_ai_SOLUSDT.log
 ```
 
-同一交易对同一时间只允许一个研究任务；不同交易对没有全局串行锁，因此 ETH、BTC 等任务可以同时运行。`flock` 随进程退出自动释放，锁文件本身保留不代表任务仍在运行。
+`bian_new.py` 的进程表和 `run_symbol_research.py` 的 `flock` 提供两层同 symbol 防重。同一交易对同一时间只允许一个研究任务；不同交易对没有全局串行锁，因此 ETH、BTC 等任务可以同时运行。`flock` 随进程退出自动释放，锁文件本身保留不代表任务仍在运行。
 
 ## 5. 手动仓位接管规则
 
@@ -316,6 +346,8 @@ confidence 和 risk_multiplier 必须在 0 到 1 之间。
 
 `risk_multiplier` 是目标保留比例，只能用于缩小已有仓位，不能参与扩大仓位或补回已经减掉的数量。
 
+`expires_at` 默认是生成后 9 小时，用来保证执行层不会使用陈旧结论；固定三时点是研究调度规则。两者同时存在：到固定时点会刷新尚未过期的 JSON，而 JSON 如果提前失效或校验失败，则不等固定时点立即补跑。
+
 ## 10. manage 模式
 
 当前 `.env.local` 的 AI 相关配置是：
@@ -356,16 +388,20 @@ MANUAL_AI_RESEARCH_RETRY_SECONDS=1800
 20:50
 ```
 
+脚本使用固定 `UTC+8` 时区构造批次时间，因此服务器系统时区不同也不会改变这三个北京时间；服务器系统时钟仍必须保持准确。
+
+`MANUAL_AI_RESEARCH_ENABLED` 是历史兼容名称，现在实际控制所有持仓交易对（包括脚本 ETH）的自动研究。没有显式设置时，只要 `AI_RESEARCH_MODE != off` 就默认启用；显式设为 `0` 时只读取已有 bias，不启动后台研究。
+
 模式能力：
 
-| mode | 读取/审计 | 候选过滤 | 部分减仓 |
-|---|---:|---:|---:|
-| `off` | 否 | 否 | 否 |
-| `log` | 是 | 否 | 否 |
-| `reduce` | 是 | 否 | 是 |
-| `filter` | 是 | 是 | 否 |
-| `filter_reduce` | 是 | 是 | 是 |
-| `manage` | 是 | 是 | 是 |
+| mode | 读取/审计 | ETH 候选过滤 | 已有仓位部分减仓 | ETH pending 撤销 |
+|---|---:|---:|---:|---:|
+| `off` | 否 | 否 | 否 | 否 |
+| `log` | 是 | 否 | 否 | 否 |
+| `reduce` | 是 | 否 | 是 | 否 |
+| `filter` | 是 | 是 | 否 | 否 |
+| `filter_reduce` | 是 | 是 | 是 | 否 |
+| `manage` | 是 | 是 | 是 | 是 |
 
 `manage` 不是无限授权。实际部分减仓仍需同时满足：
 
@@ -381,6 +417,8 @@ AI_ALLOW_POSITION_REDUCTION=1。
 
 `AI_ALLOW_FULL_CLOSE=1` 和 `AI_ALLOW_REVERSE=1` 当前会在配置加载时直接报错，不能进入交易循环。`bian_new.py` 在下单前还会再次硬性拒绝减仓数量达到当前全部仓位的请求。
 
+手动 BTC/SOL 等仓位没有“AI 新开仓候选”阶段，因此 AI 对它们只做已有仓位评估；脚本 ETH 才会在空仓候选和 pending 阶段读取 `allow_long` / `allow_short`。
+
 ## 11. 运行命令
 
 ### 11.1 推荐的逐交易对入口
@@ -394,6 +432,8 @@ python tradingAgents/run_symbol_research.py --symbol BTCUSDT --hours 9
 ```text
 tradingAgents/.ai_research/latest_bias_BTCUSDT.json
 ```
+
+`run_symbol_research.py` 当前通过 `ai_market_bias.py` 的默认参数运行 DeepSeek，TradingAgents 的 deep/quick 模型均为 `deepseek-v4-flash`，LLM timeout 为 300 秒、重试 1 次、行情最多 60 行、新闻最多 12 条、每条摘要最多 500 字符。
 
 ### 11.2 直接运行 ai_market_bias.py
 
@@ -420,7 +460,7 @@ python tradingAgents/ai_market_bias.py \
   --asset-type crypto
 ```
 
-正常运行 `bian_new.py` 时通常不需要手工执行这些命令；手动仓位的 bias 缺失或接近过期时，脚本会自动后台调度。
+正常运行 `bian_new.py` 时通常不需要手工执行这些命令；任何当前持仓交易对的 bias 无效时会立即后台补跑，之后在北京时间 `05:50`、`13:50`、`20:50` 固定刷新。
 
 ## 12. 环境变量加载
 
@@ -459,6 +499,8 @@ tradingAgents/.tradingagents/memory/
 
 这些都是运行产物，不属于源码。
 
+`manual_ai_SYMBOL.log` 的文件名前缀是为兼容已有运行目录保留的历史名称，现在脚本 ETH 和手动交易对的后台研究都使用这个命名格式。
+
 ## 14. 当前验证状态
 
 已覆盖的自动测试包括：
@@ -470,6 +512,11 @@ CCXT 永续 symbol 规范化。
 逐交易对新闻关键词。
 后台研究命令使用实际持仓 symbol。
 同一 symbol 的 flock 防重入入口。
+无有效 JSON 时立即补跑，随后回归固定三时点。
+13:49 不提前刷新、13:50 到点刷新。
+新仓不补跑开仓前已经错过的批次。
+20:50 到次日 05:50 的跨日批次判断。
+脚本 ETH 与手动 BTC 使用独立并行研究任务和 JSON。
 手动仓位双周期止损选择和周期锁定。
 已有 1 ATR 浮盈立即进入利润保护。
 TAS_/TAM_ 订单归属识别。
