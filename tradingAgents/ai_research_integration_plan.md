@@ -88,6 +88,8 @@ AI 代码不能修改 Demo/正式环境开关。
 bian_new.py 每轮读取 Binance USD-M 全账户非零仓位
   |
   +-- 原策略创建的 ETH 仓位 -> 原 ETH trade_state 管理
+  |       +-- ETH bias 缺失或临近过期时启动 ETHUSDT 后台研究
+  |       +-- 生成并读取 latest_bias_ETHUSDT.json
   |
   +-- 其他仓位 -> manual_position_states 独立管理
           |
@@ -108,7 +110,7 @@ bian_new.py 每轮读取 Binance USD-M 全账户非零仓位
           +-- ATR/结构动态止损始终独立运行
 ```
 
-后台研究不会阻塞每秒交易循环。首次发现手动仓位时，脚本先尝试创建保护止损，然后才启动研究任务。
+后台研究不会阻塞每秒交易循环。脚本 ETH 和手动 BTC 同时持仓时，会分别启动 ETHUSDT、BTCUSDT 任务；两个进程可以并行，分别生成独立 JSON，不会互相覆盖。首次发现手动仓位时，脚本先尝试创建保护止损，然后才启动研究任务。
 
 ### 4.2 分交易对隔离
 
@@ -123,7 +125,7 @@ bian_new.py 每轮读取 Binance USD-M 全账户非零仓位
 .ai_research/logs/manual_ai_SOLUSDT.log
 ```
 
-同一交易对同一时间只允许一个研究任务。`flock` 随进程退出自动释放，锁文件本身保留不代表任务仍在运行。
+同一交易对同一时间只允许一个研究任务；不同交易对没有全局串行锁，因此 ETH、BTC 等任务可以同时运行。`flock` 随进程退出自动释放，锁文件本身保留不代表任务仍在运行。
 
 ## 5. 手动仓位接管规则
 

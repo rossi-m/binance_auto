@@ -145,7 +145,7 @@ MANUAL_POSITION_MISS_CONFIRM_COUNT = 3
 # --- TradingAgents AI research guard ---
 # 默认 off，且减仓/全平/反手都有独立关闭开关。配置错误会阻止程序启动，避免误用宽松默认值。
 AI_RESEARCH_CONFIG = load_ai_research_config()
-# 手动仓位的 TradingAgents 默认跟随 AI_RESEARCH_MODE；AI关闭时不额外消耗模型调用。
+# 所有持仓的逐交易对 TradingAgents 默认跟随 AI_RESEARCH_MODE；保留原环境变量名以兼容现有配置。
 MANUAL_AI_RESEARCH_ENABLED = os.getenv(
     'MANUAL_AI_RESEARCH_ENABLED',
     '1' if AI_RESEARCH_CONFIG.mode != 'off' else '0',
@@ -416,7 +416,7 @@ logging.basicConfig(
 logging.info("Binance Demo U本位合约 API 已初始化")
 logging.info("AI research guard 配置: %s", config_for_log(AI_RESEARCH_CONFIG))
 logging.info(
-    "手动仓位 TradingAgents 配置: enabled=%s, hours=%s, retry_seconds=%s",
+    "逐交易对持仓 TradingAgents 配置: enabled=%s, hours=%s, retry_seconds=%s",
     MANUAL_AI_RESEARCH_ENABLED,
     MANUAL_AI_RESEARCH_HOURS,
     MANUAL_AI_RESEARCH_RETRY_SECONDS,
@@ -435,7 +435,7 @@ runtime_state = {
     'kline_df_cache': {},
     # AI审计事件幂等key，避免持仓轮询每秒重复写同一结论。
     'ai_audit_keys': {},
-    # 每个手动交易对最多运行一个 TradingAgents 后台任务，避免阻塞每秒交易主循环。
+    # 每个持仓交易对最多运行一个 TradingAgents 后台任务；ETH、BTC 等不同交易对可以并行。
     'manual_ai_jobs': {},
 }
 
@@ -498,7 +498,7 @@ def ai_guard_needs_refresh(guard):
 
 
 def reap_manual_ai_jobs():
-    """回收已结束的后台任务和日志文件句柄，不在交易主循环里等待子进程。"""
+    """回收已结束的逐交易对研究任务，不在交易主循环里等待子进程。"""
     jobs = runtime_state.setdefault('manual_ai_jobs', {})
     for symbol, job in list(jobs.items()):
         process = job.get('process')
@@ -513,11 +513,11 @@ def reap_manual_ai_jobs():
         job['process'] = None
         job['return_code'] = return_code
         job['completed_at'] = time.monotonic()
-        logging.info(f"手动仓位 TradingAgents 后台任务结束: symbol={symbol}, return_code={return_code}")
+        logging.info(f"持仓 TradingAgents 后台任务结束: symbol={symbol}, return_code={return_code}")
 
 
 def ensure_manual_ai_research_job(symbol, state=None):
-    """必要时为手动仓位启动逐symbol研究；同一symbol只允许一个后台任务。"""
+    """必要时为持仓启动逐symbol研究；同一symbol防重，不同symbol允许并行。"""
     state = state if isinstance(state, dict) else {}
     guard = get_ai_guard_for_symbol(symbol)
     state['ai_guard_snapshot'] = ai_guard_snapshot(guard)
@@ -567,7 +567,7 @@ def ensure_manual_ai_research_job(symbol, state=None):
         log_handle.close()
         jobs[compact_symbol] = {'process': None, 'last_attempt': time.monotonic(), 'error': str(e)}
         state['ai_research_status'] = 'start_failed'
-        logging.warning(f"启动手动仓位 TradingAgents 失败: symbol={compact_symbol}, error={e}")
+        logging.warning(f"启动持仓 TradingAgents 失败: symbol={compact_symbol}, error={e}")
         return guard
 
     jobs[compact_symbol] = {
@@ -578,7 +578,7 @@ def ensure_manual_ai_research_job(symbol, state=None):
     }
     state['ai_research_status'] = 'running'
     logging.warning(
-        "已后台启动手动仓位 TradingAgents: symbol=%s pid=%s log=%s",
+        "已后台启动持仓 TradingAgents: symbol=%s pid=%s log=%s",
         compact_symbol, process.pid, log_path,
     )
     return guard
@@ -6395,7 +6395,7 @@ def ai_reduce_existing_position(position_risk, decision, guard, signal_bar_15m='
 
 
 def apply_ai_position_guard(position_risk, signal_bar_15m=''):
-    """评估已有仓位；默认只审计，显式开启后才调用reduceOnly。"""
+    """管理脚本ETH仓位：自动刷新ETH研究，再按安全开关评估受限减仓。"""
     side = position_risk.get('side')
     current_amount = abs(price_to_float(position_risk.get('position_amt')))
     initial_amount = price_to_float(trade_state.get('entry_initial_amount'))
@@ -6405,7 +6405,8 @@ def apply_ai_position_guard(position_risk, signal_bar_15m=''):
         logging.warning("AI仓位基准缺失，使用当前交易所仓位建立安全baseline: %s", initial_amount)
     trade_state['amount'] = current_amount
 
-    guard = get_current_ai_guard()
+    # 和手动 BTC/SOL 一样按实际 symbol 调度；不同交易对各写自己的 JSON，并可并行研究。
+    guard = ensure_manual_ai_research_job(SYMBOL, state=trade_state)
     decision = evaluate_position_reduction(
         side,
         initial_amount,
