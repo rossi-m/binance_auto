@@ -88,14 +88,14 @@ AI 代码不能修改 Demo/正式环境开关。
 bian_new.py 每轮读取 Binance USD-M 全账户非零仓位
   |
   +-- 原策略创建的 ETH 仓位 -> 原 ETH trade_state 管理
-  |       +-- ETH bias 缺失或临近过期时启动 ETHUSDT 后台研究
+  |       +-- ETH bias 无效时立即补跑，到固定批次时再次运行
   |       +-- 生成并读取 latest_bias_ETHUSDT.json
   |
   +-- 其他仓位 -> manual_position_states 独立管理
           |
           +-- 先选择周期并创建 TAM_ 动态保护止损
           |
-          +-- bias 缺失或接近过期时，异步启动 run_symbol_research.py
+          +-- bias 无效时立即补跑，到固定批次时异步启动 run_symbol_research.py
                   |
                   +-- 每个 symbol 使用独立 flock
                   |
@@ -111,6 +111,8 @@ bian_new.py 每轮读取 Binance USD-M 全账户非零仓位
 ```
 
 后台研究不会阻塞每秒交易循环。脚本 ETH 和手动 BTC 同时持仓时，会分别启动 ETHUSDT、BTCUSDT 任务；两个进程可以并行，分别生成独立 JSON，不会互相覆盖。首次发现手动仓位时，脚本先尝试创建保护止损，然后才启动研究任务。
+
+调度使用“即时补缺 + 固定批次”：bias 缺失、损坏或过期时立即生成一次；只要该交易对仍有持仓，之后重新对齐北京时间 `05:50`、`13:50`、`20:50` 三个固定研究批次。新仓建立前已经错过的批次不补跑；任务失败按重试间隔再次尝试。
 
 ### 4.2 分交易对隔离
 
@@ -339,12 +341,19 @@ AI_ALLOW_REVERSE=0
 AI_BIAS_FUTURE_TOLERANCE_SECONDS=300
 ```
 
-手动仓位研究调度默认值：
+持仓研究调度默认值：
 
 ```env
 MANUAL_AI_RESEARCH_HOURS=9
 MANUAL_AI_RESEARCH_RETRY_SECONDS=1800
-MANUAL_AI_REFRESH_BEFORE_EXPIRY_SECONDS=3600
+```
+
+固定批次直接由 `bian_new.py` 按北京时间判断，不依赖 cron：
+
+```text
+05:50
+13:50
+20:50
 ```
 
 模式能力：

@@ -152,10 +152,8 @@ MANUAL_AI_RESEARCH_ENABLED = os.getenv(
 ).strip().lower() in ('1', 'true', 'yes', 'on')
 MANUAL_AI_RESEARCH_HOURS = max(1, int(os.getenv('MANUAL_AI_RESEARCH_HOURS', '9')))
 MANUAL_AI_RESEARCH_RETRY_SECONDS = max(60, int(os.getenv('MANUAL_AI_RESEARCH_RETRY_SECONDS', '1800')))
-MANUAL_AI_REFRESH_BEFORE_EXPIRY_SECONDS = max(
-    60,
-    int(os.getenv('MANUAL_AI_REFRESH_BEFORE_EXPIRY_SECONDS', '3600')),
-)
+# 有效 bias 不按“生成后每 N 小时”滚动刷新，而是回到北京时间每天三个固定研究批次。
+AI_RESEARCH_SCHEDULE_TIMES = ((5, 50), (13, 50), (20, 50))
 MANUAL_AI_RUNNER_PATH = os.path.join(BASE_DIR, 'tradingAgents', 'run_symbol_research.py')
 MANUAL_AI_RESEARCH_DIR = os.path.dirname(os.path.abspath(AI_RESEARCH_CONFIG.bias_file))
 MANUAL_AI_OUTPUTS_DIR = os.path.join(BASE_DIR, 'tradingAgents', 'outputs')
@@ -485,16 +483,56 @@ def ai_guard_snapshot(guard):
     return {field: guard.get(field) for field in AI_GUARD_SNAPSHOT_FIELDS}
 
 
-def ai_guard_needs_refresh(guard):
-    """bias 无效或距离过期不足一小时（可配置）时，需要重新生成研究报告。"""
-    if not guard.get('valid'):
-        return True
+def parse_ai_schedule_datetime(value):
+    """把持仓/研报时间统一转换为北京时间；无时区的交易时间按北京时间解释。"""
+    if not value:
+        return None
     try:
-        expires_at = datetime.datetime.fromisoformat(str(guard.get('expires_at')).replace('Z', '+00:00'))
-        now = datetime.datetime.now(datetime.timezone.utc)
-        return (expires_at.astimezone(datetime.timezone.utc) - now).total_seconds() <= MANUAL_AI_REFRESH_BEFORE_EXPIRY_SECONDS
+        parsed = datetime.datetime.fromisoformat(str(value).strip().replace('Z', '+00:00'))
     except Exception:
-        return True
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return parsed.replace(tzinfo=EXCHANGE_TZ)
+    return parsed.astimezone(EXCHANGE_TZ)
+
+
+def latest_ai_research_schedule_slot(now_dt=None):
+    """返回当前时刻已经到达的最近一个固定批次：北京时间05:50、13:50或20:50。"""
+    now_dt = now_dt or datetime.datetime.now(EXCHANGE_TZ)
+    if now_dt.tzinfo is None or now_dt.utcoffset() is None:
+        now_dt = now_dt.replace(tzinfo=EXCHANGE_TZ)
+    else:
+        now_dt = now_dt.astimezone(EXCHANGE_TZ)
+    slots = [
+        now_dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        for hour, minute in AI_RESEARCH_SCHEDULE_TIMES
+    ]
+    reached = [slot for slot in slots if slot <= now_dt]
+    if reached:
+        return reached[-1]
+    yesterday = now_dt - datetime.timedelta(days=1)
+    hour, minute = AI_RESEARCH_SCHEDULE_TIMES[-1]
+    return yesterday.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+
+def ai_research_refresh_reason(guard, state=None, now_dt=None):
+    """无有效bias立即补跑；有效bias只补持仓期间已经到点但尚未完成的固定批次。"""
+    if not guard.get('valid'):
+        return 'invalid_bias_immediate'
+    generated_at = parse_ai_schedule_datetime(guard.get('generated_at'))
+    if generated_at is None:
+        return 'invalid_bias_immediate'
+    latest_slot = latest_ai_research_schedule_slot(now_dt=now_dt)
+    state = state if isinstance(state, dict) else {}
+    position_started_at = parse_ai_schedule_datetime(
+        state.get('entry_time') or state.get('detected_time')
+    )
+    # 新仓建立前已经错过的固定批次不补跑；等待该仓位建立后的下一个固定点。
+    if position_started_at is not None and latest_slot < position_started_at:
+        return ''
+    if generated_at < latest_slot:
+        return f"scheduled_{latest_slot:%Y%m%d_%H%M}"
+    return ''
 
 
 def reap_manual_ai_jobs():
@@ -525,7 +563,9 @@ def ensure_manual_ai_research_job(symbol, state=None):
     if not MANUAL_AI_RESEARCH_ENABLED:
         state['ai_research_status'] = 'disabled'
         return guard
-    if not ai_guard_needs_refresh(guard):
+    refresh_reason = ai_research_refresh_reason(guard, state=state)
+    state['ai_research_trigger'] = refresh_reason
+    if not refresh_reason:
         state['ai_research_status'] = 'ready'
         return guard
 
@@ -575,11 +615,12 @@ def ensure_manual_ai_research_job(symbol, state=None):
         'log_handle': log_handle,
         'last_attempt': time.monotonic(),
         'log_path': log_path,
+        'trigger': refresh_reason,
     }
     state['ai_research_status'] = 'running'
     logging.warning(
-        "已后台启动持仓 TradingAgents: symbol=%s pid=%s log=%s",
-        compact_symbol, process.pid, log_path,
+        "已后台启动持仓 TradingAgents: symbol=%s pid=%s trigger=%s log=%s",
+        compact_symbol, process.pid, refresh_reason, log_path,
     )
     return guard
 
