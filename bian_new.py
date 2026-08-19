@@ -88,6 +88,20 @@ def require_env(name):
     return value
 
 
+def load_binance_trading_config():
+    """按交易模式读取对应的 Binance API 密钥。"""
+    mode = os.getenv('BINANCE_TRADING_MODE', 'demo').strip().lower()
+    credential_names = {
+        'demo': ('BINANCE_DEMO_API_KEY', 'BINANCE_DEMO_SECRET_KEY'),
+        'live': ('BINANCE_LIVE_API_KEY', 'BINANCE_LIVE_SECRET_KEY'),
+    }
+    if mode not in credential_names:
+        raise RuntimeError('BINANCE_TRADING_MODE 只能设置为 demo 或 live')
+
+    api_key_name, secret_key_name = credential_names[mode]
+    return mode, require_env(api_key_name), require_env(secret_key_name)
+
+
 load_local_env()
 
 # ==========================================
@@ -95,8 +109,8 @@ load_local_env()
 # ==========================================
 
 # --- 币安 API 配置 ---
-API_KEY = require_env('BINANCE_API_KEY')  # 从环境变量读取币安 API 公钥
-SECRET_KEY = require_env('BINANCE_SECRET_KEY')  # 从环境变量读取币安 API 私钥
+BINANCE_TRADING_MODE, API_KEY, SECRET_KEY = load_binance_trading_config()
+IS_DEMO_TRADING = BINANCE_TRADING_MODE == 'demo'
 
 # --- 邮件通知配置 (以QQ邮箱为例) ---
 SMTP_HOST = os.getenv('SMTP_HOST', 'smtp.qq.com')  # 设置QQ邮箱的SMTP服务器地址
@@ -404,14 +418,18 @@ exchange = ccxt.binance({
     'enableRateLimit': True,  # 开启内置的速率限制功能，防止请求频率过高被封IP
     'timeout': EXCHANGE_HTTP_TIMEOUT_MS,  # 给交易所HTTP请求设置硬超时，避免网络卡死时无限等待
 })
-exchange.enable_demo_trading(True)
+if IS_DEMO_TRADING:
+    exchange.enable_demo_trading(True)
 
 # 日志配置
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
-logging.info("Binance Demo U本位合约 API 已初始化")
+if IS_DEMO_TRADING:
+    logging.info("Binance Demo U本位合约 API 已初始化（模拟交易）")
+else:
+    logging.warning("Binance Live U本位合约 API 已初始化（正式实盘，会产生真实交易）")
 logging.info("AI research guard 配置: %s", config_for_log(AI_RESEARCH_CONFIG))
 logging.info(
     "逐交易对持仓 TradingAgents 配置: enabled=%s, hours=%s, retry_seconds=%s",
