@@ -148,6 +148,10 @@ DRY_RUN_OPEN_ORDER = False  # 运行时 dry-run 开关；开启后只走信号�
 # 脚本创建的保护单都带客户端ID前缀，持仓存在期间只允许修改脚本自己的订单。
 STRATEGY_STOP_CLIENT_PREFIX = 'TAS_'
 MANUAL_STOP_CLIENT_PREFIX = 'TAM_'
+# 策略入场条件单使用独立前缀；进程重启后只清理这个前缀，绝不碰手工挂单。
+STRATEGY_ENTRY_CLIENT_PREFIX = 'TAE_'
+# 只有经过交易所规格确认的品种才允许在市场元数据失败时使用静态 tick。
+VERIFIED_PRICE_TICK_FALLBACK = {'ETH/USDT': 0.01}
 # 手动仓位同时评估两套管理周期，选中后在该笔持仓生命周期内保持不变。
 MANUAL_POSITION_PROFILES = (
     {'name': '4h_1h', 'background_tf': '4h', 'exit_tf': '1h'},
@@ -388,6 +392,7 @@ trade_state = {
     'stop_order_refresh_fail_count': 0,  # 连续几次更新服务端止损单失败，达到阈值后才保护性平仓
     'last_stop_order_refresh_error': '',  # 最近一次服务端止损更新失败的原始错误文本
     'pending_entry_order_id': '',  # 等待成交的 STOP_LIMIT 入场单ID
+    'pending_entry_client_order_id': '',  # 策略入场单客户端ID，用于重启后识别所有权
     'pending_entry_side': '',  # pending 入场方向：long / short
     'pending_entry_amount': 0.0,  # 计划开仓数量
     'pending_entry_stop_price': 0.0,  # STOP_LIMIT 触发价
@@ -840,6 +845,16 @@ def is_script_owned_protective_order(order, tracked_order_id='', prefixes=None):
     client_id = extract_order_client_id(order)
     prefixes = prefixes or (STRATEGY_STOP_CLIENT_PREFIX, MANUAL_STOP_CLIENT_PREFIX)
     return any(client_id.startswith(prefix) for prefix in prefixes if prefix)
+
+
+def is_script_owned_entry_order(order, tracked_order_id=''):
+    """只识别本脚本创建的非减仓入场单。"""
+    order_id = extract_order_id(order)
+    if tracked_order_id and order_id == str(tracked_order_id):
+        return True
+    if is_close_position_conditional_order(order):
+        return False
+    return extract_order_client_id(order).startswith(STRATEGY_ENTRY_CLIENT_PREFIX)
 
 
 def format_exception_message(error):
@@ -2797,6 +2812,7 @@ def log_trade_to_csv(entry_time, side, cond_4h, cond_1h, cond_15m, entry_reason,
 
 PENDING_ENTRY_FIELDS = (
     'pending_entry_order_id',
+    'pending_entry_client_order_id',
     'pending_entry_side',
     'pending_entry_amount',
     'pending_entry_stop_price',
@@ -2887,6 +2903,14 @@ def extract_order_filled_amount(order):
     return 0.0
 
 
+def pending_order_has_fill_evidence(order):
+    """订单自身必须显示成交，不能仅凭同方向仓位推断 pending 已成交。"""
+    return (
+        extract_order_status_lower(order) in ('closed', 'filled')
+        or extract_order_filled_amount(order) > 0
+    )
+
+
 def extract_order_average_price(order):
     if not isinstance(order, dict):
         return 0.0
@@ -2909,15 +2933,18 @@ def extract_order_average_price(order):
 def fetch_all_open_orders_for_symbol():
     """读取当前交易对全部未成交单，包含 CCXT 统一接口和 Binance 原始接口。"""
     open_orders = []
+    unified_fetch_failed = False
     try:
         # 获取 CCXT 统一接口的未成交单
         open_orders = exchange.fetch_open_orders(SYMBOL)
     except Exception as e:
         logging.warning(f"查询未成交单失败: {e}")
+        unified_fetch_failed = True
         open_orders = []
 
     # 添加 Binance 原生接口的普通挂单（LIMIT、STOP_LIMIT 等）,普通挂单是：限价成交	
     raw_open_orders = fetch_raw_future_open_orders()
+    raw_open_fetch_failed = raw_open_orders is None
     if raw_open_orders:
         known_order_ids = {extract_order_id(order) for order in open_orders if extract_order_id(order)}
         for raw_order in raw_open_orders:
@@ -2928,6 +2955,7 @@ def fetch_all_open_orders_for_symbol():
 
     # 添加 Binance 原生接口的条件委托挂单（STOP_MARKET、TAKE_PROFIT_MARKET、TRAILING_STOP_MARKET等），条件委托是：市价成交
     raw_algo_orders = fetch_raw_future_open_algo_orders()
+    raw_algo_fetch_failed = raw_algo_orders is None
     if raw_algo_orders:
         known_order_ids = {extract_order_id(order) for order in open_orders if extract_order_id(order)}
         for raw_order in raw_algo_orders:
@@ -2936,7 +2964,71 @@ def fetch_all_open_orders_for_symbol():
                 continue
             open_orders.append(raw_order)
 
+    if unified_fetch_failed and raw_open_fetch_failed and raw_algo_fetch_failed:
+        return None
     return open_orders
+
+
+def fetch_open_strategy_entry_orders():
+    """从 Binance 原生接口读取脚本自有入场单；任一订单源失败时禁止开仓。"""
+    # 普通挂单和 algo 条件单由不同原生接口覆盖。不能因统一接口或其中一个
+    # 原生接口返回成功，就把另一个接口的失败误判为“没有遗留入场单”。
+    raw_open_orders = fetch_raw_future_open_orders()
+    raw_algo_orders = fetch_raw_future_open_algo_orders()
+    if raw_open_orders is None or raw_algo_orders is None:
+        return None
+
+    open_orders = []
+    known_order_ids = set()
+    for order in [*(raw_open_orders or []), *(raw_algo_orders or [])]:
+        order_id = extract_order_id(order)
+        if order_id and order_id in known_order_ids:
+            continue
+        if order_id:
+            known_order_ids.add(order_id)
+        open_orders.append(order)
+
+    tracked_order_id = trade_state.get('pending_entry_order_id', '')
+    return [
+        order for order in open_orders
+        if is_script_owned_entry_order(order, tracked_order_id=tracked_order_id)
+    ]
+
+
+def reconcile_orphan_strategy_entry_orders(silent=True):
+    """精确撤销本地未跟踪的脚本入场单，防止重启后重复或意外加仓。"""
+    owned_orders = fetch_open_strategy_entry_orders()
+    if owned_orders is None:
+        logging.warning("无法确认脚本入场条件单状态，本轮禁止新开仓")
+        return False
+
+    tracked_order_id = str(trade_state.get('pending_entry_order_id') or '')
+    orphan_orders = [
+        order for order in owned_orders
+        if not tracked_order_id or extract_order_id(order) != tracked_order_id
+    ]
+    if not orphan_orders:
+        return True
+
+    order_ids = [extract_order_id(order) for order in orphan_orders if extract_order_id(order)]
+    if not cancel_conditional_orders(
+        orphan_orders,
+        silent=silent,
+        reason='清理脚本遗留入场条件单',
+    ):
+        return False
+
+    for _attempt in range(STOP_ORDER_CANCEL_CONFIRM_RETRIES):
+        remaining = fetch_open_strategy_entry_orders()
+        if remaining is None:
+            return False
+        remaining_ids = {extract_order_id(order) for order in remaining}
+        if not any(order_id in remaining_ids for order_id in order_ids):
+            logging.warning(f"已清理脚本遗留入场条件单: order_ids={order_ids}")
+            return True
+        time.sleep(STOP_ORDER_CANCEL_CONFIRM_SLEEP_SECONDS)
+    logging.error(f"脚本遗留入场条件单撤销后仍可见，本轮禁止开仓: order_ids={order_ids}")
+    return False
 
 
 def fetch_pending_entry_order():
@@ -2954,7 +3046,7 @@ def fetch_pending_entry_order():
             logging.warning(f"查询 pending 入场单详情失败，将用未成交列表兜底: id={order_id}, error={e}")
 
     # 获取所有未成交挂单
-    for order in fetch_all_open_orders_for_symbol():
+    for order in fetch_all_open_orders_for_symbol() or []:
         if extract_order_id(order) == order_id:
             return order
     return None
@@ -3316,16 +3408,14 @@ def place_pending_entry_order(side, candidate, curr_price, state_4h, state_1h, s
         )
         return False
     
-    entry_level = precision_price(price_to_float(candidate.get('entry_level')))
-    #触发价格
-    stop_price = entry_level
-    # 计算允许的滑点
-    allowed_slippage = candidate_entry_allowed_slippage(candidate, entry_level)
-    # 计算限价
-    if side == 'long':
-        limit_price = precision_price(entry_level + allowed_slippage)
-    else:
-        limit_price = precision_price(entry_level - allowed_slippage)
+    pending_prices, price_reason = resolve_pending_entry_prices(candidate, curr_price)
+    if not pending_prices:
+        logging.info(f"拒绝挂 STOP_LIMIT 入场：{price_reason}")
+        return False
+    entry_level = pending_prices['entry_level']
+    stop_price = pending_prices['stop_price']
+    limit_price = pending_prices['limit_price']
+    allowed_slippage = pending_prices['allowed_slippage']
 
     protective_stop = price_to_float(candidate.get('stop'))
     # 把止损价推至保护侧(不会触发强平)
@@ -3391,10 +3481,12 @@ def place_pending_entry_order(side, candidate, curr_price, state_4h, state_1h, s
         exchange.set_leverage(LEVERAGE, SYMBOL)
 
         order_side = 'buy' if side == 'long' else 'sell'
+        entry_client_order_id = make_protective_client_order_id(STRATEGY_ENTRY_CLIENT_PREFIX)
         params = {
             'stopPrice': stop_price, # 触发价：标记价 ≥ 3010 时激活
             'timeInForce': 'GTC', #  一直有效直到成交或 45 分钟超时
-            'workingType': STOP_WORKING_TYPE # 按标记价触发（非最新成交价）
+            'workingType': STOP_WORKING_TYPE, # 按标记价触发（非最新成交价）
+            'newClientOrderId': entry_client_order_id,
         }
         order = exchange.create_order(
             SYMBOL,
@@ -3412,6 +3504,7 @@ def place_pending_entry_order(side, candidate, curr_price, state_4h, state_1h, s
         background_tf = STRATEGY_BACKGROUND_TF.get(candidate.get('strategy_tf'), '1h')
         trade_state.update({
             'pending_entry_order_id': order_id,
+            'pending_entry_client_order_id': extract_order_client_id(order) or entry_client_order_id,
             'pending_entry_side': side,
             'pending_entry_amount': amount,
             'pending_entry_stop_price': stop_price,
@@ -3480,6 +3573,13 @@ def manage_pending_entry(context, signal_bar_15m='', perf=None):
     if position_risk and position_risk.get('fetch_failed'):
         logging.warning("pending 入场管理无法确认仓位，本轮跳过，避免误处理")
         return 'pending_position_fetch_failed'
+
+    if position_risk is not None and not pending_order_has_fill_evidence(order):
+        cancel_pending_entry_order(
+            '发现同方向仓位但 pending 订单没有成交证据，按手动仓处理并撤销 pending',
+            silent=False,
+        )
+        return 'pending_entry_external_position_detected'
 
     if position_risk is not None:
         finalize_pending_entry_position(order=order, position_risk=position_risk, signal_bar_15m=signal_bar_15m)
@@ -3580,6 +3680,13 @@ def sync_pending_entry_fill_if_needed(signal_bar_15m=''):
     if position_risk and position_risk.get('fetch_failed'):
         logging.warning("pending 入场早期同步无法确认仓位，本轮继续后续流程")
         return ''
+
+    if position_risk is not None and not pending_order_has_fill_evidence(order):
+        cancel_pending_entry_order(
+            '发现同方向仓位但 pending 订单没有成交证据，按手动仓处理并撤销 pending',
+            silent=False,
+        )
+        return 'pending_entry_external_position_detected'
 
     if position_risk is not None:
         # pending 入场后，判断入场价格是否合理/利润预期空间是否足够，如果否，则立即平仓，并且清空挂单，重置本地止损状态，重置本地Pending状态,更新保护止损，持仓信息同步到本地
@@ -3929,9 +4036,7 @@ def get_price_tick(reference_price=None, symbol=SYMBOL):
             return precision
     except Exception:
         pass
-    if reference_price:
-        return max(float(reference_price) * 0.00001, 0.01)
-    return 0.01
+    return VERIFIED_PRICE_TICK_FALLBACK.get(normalize_futures_symbol(symbol), 0.0)
 
 
 def candle_parts(row):
@@ -4662,12 +4767,28 @@ def context_allows_side(local_state, background_state, side):
     local_open_key = 'can_open_long' if side == 'long' else 'can_open_short'
     if not local_state.get(local_open_key) and local_state.get('direction') != side:
         return False, context_deny_reason(side, f"{local_state.get('timeframe')} 本级别未给出{side_label(side)}方向", local_state, background_state)
+    if local_state.get('status') == f'ema20_{side}_persistence':
+        local_soft_allow, local_soft_reason = background_soft_allows_side(local_state, side)
+        if not local_soft_allow:
+            return False, context_deny_reason(
+                side,
+                f"{local_state.get('timeframe')} EMA持续性状态未通过严格校验: {local_soft_reason}",
+                local_state,
+                background_state,
+            )
 
-    # 背景周期：方向一致 + (明确允许开仓 或 严格软通过 flat_adx/ema_persistence)
+    # 背景周期的软状态必须通过严格校验，不能被 can_open 标志绕过。
     bg_same_side = background_state.get('direction') == side
     bg_open_key = 'can_open_long' if side == 'long' else 'can_open_short'
     bg_soft_allow, bg_soft_reason = background_soft_allows_side(background_state, side)
-    if not bg_same_side or (not background_state.get(bg_open_key) and not bg_soft_allow):
+    bg_status = background_state.get('status')
+    bg_requires_soft_allow = bg_status in (
+        f'{side}_weakening',
+        f'{side}_flat_adx',
+        f'ema20_{side}_persistence',
+    )
+    bg_confirmed = bg_soft_allow if bg_requires_soft_allow else bool(background_state.get(bg_open_key))
+    if not bg_same_side or not bg_confirmed:
         return False, context_deny_reason(
             side,
             f"{background_state.get('timeframe')} 背景未确认{side_label(side)}方向: {bg_soft_reason}",
@@ -4727,6 +4848,9 @@ def select_adaptive_trend_entry_buffer(local_state, side):
         or ema_cross_count >= 2
     )
     direction_matches = state.get('direction') == side
+    plus_di = price_to_float(details.get('plus_di'))
+    minus_di = price_to_float(details.get('minus_di'))
+    di_same_side = plus_di > minus_di if side == 'long' else minus_di > plus_di
     metrics = {
         'timeframe': state.get('timeframe', ''),
         'adx': adx,
@@ -4742,10 +4866,12 @@ def select_adaptive_trend_entry_buffer(local_state, side):
         'atr_ratio_sample_count': volatility_samples,
         'high_volatility': high_volatility,
         'direction_choppy': direction_choppy,
+        'di_same_side': di_same_side,
     }
 
     if (
         direction_matches
+        and di_same_side
         and bool(details.get('extreme_adx'))
         and adx_rising
         and di_gap >= ADAPTIVE_ENTRY_EXTREME_DI_GAP
@@ -4778,6 +4904,7 @@ def select_adaptive_trend_entry_buffer(local_state, side):
 
     if (
         direction_matches
+        and di_same_side
         and adx_rising
         and di_gap >= ADAPTIVE_ENTRY_CLEAN_DI_GAP
         and ema_clean
@@ -5571,10 +5698,8 @@ def candidate_entry_price_still_valid(candidate, curr_price):
     entry_level = price_to_float(candidate.get('entry_level'))
     if entry_level <= 0:
         return False, f"候选入场价无效: module={candidate.get('module')}, entry_level={candidate.get('entry_level')}"
-    if side == 'long' and curr_price < entry_level:
-        return False, f"多单触发价已失效: module={candidate.get('module')}, current={curr_price}, entry_level={entry_level}"
-    if side == 'short' and curr_price > entry_level:
-        return False, f"空单触发价已失效: module={candidate.get('module')}, current={curr_price}, entry_level={entry_level}"
+    if side not in ('long', 'short'):
+        return False, f"候选方向无效: module={candidate.get('module')}, side={side}"
     allowed_slippage = candidate_entry_allowed_slippage(candidate, entry_level)
     if side == 'long' and curr_price > entry_level + allowed_slippage:
         return False, (
@@ -5603,6 +5728,45 @@ def candidate_entry_allowed_slippage(candidate, entry_level=None):
     if profit_distance <= 0:
         return 0.0
     return profit_distance * ENTRY_MAX_SLIPPAGE_PROFIT_RATIO
+
+
+def resolve_pending_entry_prices(candidate, curr_price):
+    """生成尚未被当前价格触发的 STOP_LIMIT 价格，并保留原候选滑点上限。"""
+    side = candidate.get('side')
+    original_entry = precision_price(price_to_float(candidate.get('entry_level')))
+    curr_price = price_to_float(curr_price)
+    if side not in ('long', 'short') or original_entry <= 0 or curr_price <= 0:
+        return None, f"候选方向或价格无效: side={side}, entry={original_entry}, current={curr_price}"
+
+    allowed_slippage = candidate_entry_allowed_slippage(candidate, original_entry)
+    tick = get_price_tick(curr_price)
+    if tick <= 0:
+        return None, f"无法取得有效价格精度: current={curr_price}"
+
+    if side == 'long':
+        limit_price = precision_price(original_entry + allowed_slippage)
+        stop_price = precision_price(max(original_entry, curr_price + tick))
+        if stop_price > limit_price:
+            return None, (
+                f"多单当前价已超过可提交的STOP_LIMIT范围: current={curr_price}, "
+                f"stop={stop_price}, limit={limit_price}"
+            )
+    else:
+        limit_price = precision_price(original_entry - allowed_slippage)
+        stop_price = precision_price(min(original_entry, curr_price - tick))
+        if stop_price < limit_price:
+            return None, (
+                f"空单当前价已超过可提交的STOP_LIMIT范围: current={curr_price}, "
+                f"stop={stop_price}, limit={limit_price}"
+            )
+
+    return {
+        'entry_level': stop_price,
+        'original_entry_level': original_entry,
+        'stop_price': stop_price,
+        'limit_price': limit_price,
+        'allowed_slippage': allowed_slippage,
+    }, 'ok'
 
 
 def candidate_target_profit_still_valid(candidate, curr_price):
@@ -7528,6 +7692,10 @@ def _run_strategy_impl(perf):
     global trade_state
     gate_result = {}
 
+    # 每轮先确认脚本自有入场单没有因重启/异常失去本地跟踪；无法确认时禁止新开仓。
+    if not reconcile_orphan_strategy_entry_orders(silent=True):
+        return 'strategy_entry_order_reconcile_failed'
+
     # 每轮最先扫描全账户仓位。手动仓位接管不受ETH冷却影响，也不依赖交易对白名单。
     account_snapshot = fetch_all_account_positions()
     if account_snapshot.get('fetch_failed'):
@@ -7813,13 +7981,17 @@ def cleanup_conditional_orders_once():
 
 
 def cli_arg_value(name):
-    """读取形如 --observe-seconds 180 的简单命令行参数。"""
-    if name not in sys.argv:
-        return None
-    idx = sys.argv.index(name)
-    if idx + 1 >= len(sys.argv):
-        return None
-    return sys.argv[idx + 1]
+    """读取 --name value 或 --name=value 形式的简单命令行参数。"""
+    if name in sys.argv:
+        idx = sys.argv.index(name)
+        if idx + 1 >= len(sys.argv):
+            return None
+        return sys.argv[idx + 1]
+    prefix = f'{name}='
+    for arg in sys.argv[1:]:
+        if arg.startswith(prefix):
+            return arg[len(prefix):]
+    return None
 
 
 def parse_risk_per_trade(value):
@@ -7837,8 +8009,11 @@ def parse_risk_per_trade(value):
 # 4. 程序入口
 # ==========================================
 if __name__ == '__main__':
-    if '--risk-per-trade' in sys.argv:
-        risk_per_trade_raw = cli_arg_value('--risk-per-trade')
+    risk_arg_present = '--risk-per-trade' in sys.argv or any(
+        arg.startswith('--risk-per-trade=') for arg in sys.argv[1:]
+    )
+    risk_per_trade_raw = cli_arg_value('--risk-per-trade')
+    if risk_arg_present:
         try:
             RISK_PER_TRADE = parse_risk_per_trade(risk_per_trade_raw)
         except ValueError as exc:
