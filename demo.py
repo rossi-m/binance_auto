@@ -60,6 +60,7 @@ backtest_runtime = {
     "trend_state_cache": {},
     "candidate_cache": {},
     "closed_ms_by_tf": {},
+    "delayed_trend_entry": None,
 }
 
 
@@ -107,6 +108,15 @@ def parse_args():
     )
     parser.add_argument("--strategy-timeframes", default="", help="Comma-separated backtest-only strategy timeframes, e.g. 4h or 4h,1h.")
     parser.add_argument("--enable-single-strong-entry", action="store_true", help="Backtest-only override for ENABLE_SINGLE_STRONG_ENTRY.")
+    parser.add_argument(
+        "--trend-entry-delay",
+        choices=("none", "fixed-15m", "exit-timeframe"),
+        default="none",
+        help=(
+            "Backtest-only delay before placing trend-trigger entries. fixed-15m waits 15 minutes for all trend entries; "
+            "exit-timeframe waits 15m for 1h strategies and 1h for 4h strategies."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -574,6 +584,138 @@ def choose_candidate_like_bian_new(candidates, context, curr_price, signal_bar_1
     return candidate, reason
 
 
+def trend_entry_delay_ms(candidate, mode):
+    """Return the backtest-only confirmation delay for a trend candidate."""
+    if candidate.get("module") != "trend_trigger" or mode == "none":
+        return 0
+    if mode == "fixed-15m":
+        return TIMEFRAME_MS["15m"]
+    if mode == "exit-timeframe":
+        exit_tf = candidate.get("exit_tf") or strategy.STRATEGY_EXIT_TF.get(candidate.get("strategy_tf"))
+        if exit_tf not in ("15m", "1h"):
+            raise ValueError(f"Unsupported delayed trend exit timeframe: {exit_tf}")
+        return TIMEFRAME_MS[exit_tf]
+    raise ValueError(f"Unsupported trend entry delay mode: {mode}")
+
+
+def delayed_entry_price_crossed(candidate, curr_price):
+    """判断等待结束价格是否仍越过原趋势触发价。"""
+    side = candidate.get("side")
+    original_entry = strategy.price_to_float(candidate.get("entry_level"))
+    return (
+        (side == "long" and curr_price >= original_entry)
+        or (side == "short" and curr_price <= original_entry)
+    )
+
+
+def delayed_candidate_for_release(delayed, current_context, curr_price):
+    """按当前趋势复核延迟信号；越过原触发价时用延迟K线完整重建候选。"""
+    original = delayed["candidate"]
+    side = original.get("side")
+    strategy_tf = original.get("strategy_tf")
+    background_tf = strategy.STRATEGY_BACKGROUND_TF.get(strategy_tf)
+    crossed = delayed_entry_price_crossed(original, curr_price)
+
+    allowed, deny_reason = strategy.entry_context_allows_side(
+        current_context,
+        strategy_tf,
+        background_tf,
+        side,
+    )
+    if not allowed:
+        return None, crossed, f"延迟结束时趋势已失效: {deny_reason}"
+
+    if not crossed:
+        candidate = dict(original)
+        candidate["delay_original_entry_level"] = strategy.price_to_float(original.get("entry_level"))
+        candidate["delay_price_crossed"] = False
+        return candidate, False, "价格未越过原触发价，继续使用原条件单"
+
+    fresh_candidates = strategy.build_trend_trigger_candidates(current_context)
+    for fresh in fresh_candidates:
+        if (
+            fresh.get("module") == "trend_trigger"
+            and fresh.get("strategy_tf") == strategy_tf
+            and fresh.get("side") == side
+        ):
+            candidate = dict(fresh)
+            candidate["delay_original_entry_level"] = strategy.price_to_float(original.get("entry_level"))
+            candidate["delay_price_crossed"] = True
+            return candidate, True, "价格仍越过原触发价，已按延迟结束K线重建趋势候选"
+    return None, True, "价格仍越过原触发价，但延迟结束K线无法生成新的趋势触发候选"
+
+
+def stage_delayed_trend_entry(candidate, context, now_ms, trade_seq, signal_bar_15m, mode):
+    delay_ms = trend_entry_delay_ms(candidate, mode)
+    if delay_ms <= 0:
+        return False
+    backtest_runtime["delayed_trend_entry"] = {
+        "candidate": candidate,
+        "context": context,
+        "created_ms": now_ms,
+        "eligible_ms": now_ms + delay_ms,
+        "trade_seq": trade_seq,
+        "signal_bar_15m": signal_bar_15m,
+        "mode": mode,
+        "delay_ms": delay_ms,
+    }
+    backtest_runtime["events"].append(make_event(
+        "TREND_ENTRY_WAIT",
+        now_ms,
+        side=candidate.get("side", ""),
+        price=backtest_runtime.get("latest_price", ""),
+        reason=f"趋势入场延迟确认 {delay_ms // 60_000} 分钟",
+        source="backtest_trend_entry_delay",
+        details={
+            "candidate": candidate,
+            "mode": mode,
+            "delay_minutes": delay_ms // 60_000,
+            "eligible_time": format_ms(now_ms + delay_ms),
+            "original_entry_level": candidate.get("entry_level"),
+        },
+    ))
+    return True
+
+
+def release_delayed_trend_entry(row, now_ms, cash_equity, current_context):
+    delayed = backtest_runtime.get("delayed_trend_entry")
+    if not delayed or now_ms < delayed["eligible_ms"]:
+        return cash_equity, None, False
+
+    backtest_runtime["delayed_trend_entry"] = None
+    curr_price = float(row["close"])
+    candidate, crossed, release_reason = delayed_candidate_for_release(delayed, current_context, curr_price)
+    backtest_runtime["events"].append(make_event(
+        "TREND_ENTRY_RELEASE",
+        now_ms,
+        side=delayed["candidate"].get("side", ""),
+        price=curr_price,
+        reason=release_reason,
+        source="backtest_trend_entry_delay",
+        details={
+            "mode": delayed["mode"],
+            "delay_minutes": delayed["delay_ms"] // 60_000,
+            "original_entry_level": delayed["candidate"].get("entry_level"),
+            "released_entry_level": candidate.get("entry_level") if candidate else None,
+            "released_stop": candidate.get("stop") if candidate else None,
+            "price_crossed": crossed,
+        },
+    ))
+    if not candidate:
+        return cash_equity, None, True
+
+    pending_id = place_pending_entry_for_backtest(
+        candidate,
+        current_context,
+        now_ms,
+        curr_price,
+        cash_equity,
+        delayed["trade_seq"],
+        delayed["signal_bar_15m"],
+    )
+    return cash_equity, None, True
+
+
 def cancel_pending_entry_for_backtest(now_ms, reason):
     if not strategy.has_pending_entry():
         return
@@ -934,6 +1076,7 @@ def run_backtest(args):
     backtest_runtime["full_context_cache"] = {}
     backtest_runtime["trend_state_cache"] = {}
     backtest_runtime["candidate_cache"] = {}
+    backtest_runtime["delayed_trend_entry"] = None
     strategy.sr_breakout_failure_cooldowns["side"] = {}
     strategy.sr_breakout_failure_cooldowns["zone"] = {}
     patch_strategy_side_effects()
@@ -1010,6 +1153,8 @@ def run_backtest(args):
         }
         backtest_runtime["latest_price"] = curr_price
         backtest_runtime["now_ms"] = now_ms
+        delayed_active_at_bar_start = bool(backtest_runtime.get("delayed_trend_entry"))
+        delayed_released_this_bar = False
 
         if idx >= next_progress:
             print(f"进度 {idx}/{len(execution_rows)} {format_ms(bar_ms)} trades={len(trades)} cash={cash_equity:.2f}", flush=True)
@@ -1041,9 +1186,22 @@ def run_backtest(args):
                     price_ts=time.monotonic(),
                 )
 
+        if not strategy.trade_state.get("has_position") and delayed_active_at_bar_start:
+            delayed_context = get_full_context(dfs, now_dt)
+            cash_equity, opened_trade_id, delayed_released_this_bar = release_delayed_trend_entry(
+                row_data,
+                now_ms,
+                cash_equity,
+                delayed_context,
+            )
+            if opened_trade_id and args.limit_trades and len(trades) >= args.limit_trades:
+                break
+
+        pending_created_this_bar = delayed_released_this_bar and strategy.has_pending_entry()
         if (
             not strategy.trade_state.get("has_position")
             and strategy.has_pending_entry()
+            and not pending_created_this_bar
         ):
             mark = mark_by_ms.get(bar_ms, row_data)
             cash_equity, opened_trade_id = process_pending_entry_for_backtest(row_data, mark, now_ms, cash_equity)
@@ -1062,6 +1220,8 @@ def run_backtest(args):
         if (
             not strategy.trade_state.get("has_position")
             and not strategy.has_pending_entry()
+            and not backtest_runtime.get("delayed_trend_entry")
+            and not delayed_released_this_bar
             and signal_guard_5m["valid"]
             and signal_guard_5m["is_new"]
             and not strategy.is_in_post_exit_cooldown(now_dt)
@@ -1079,15 +1239,23 @@ def run_backtest(args):
             if candidate:
                 trade_seq += 1
                 candidate_signal_bar = signal_bar_15m if signal_guard_15m.get("valid") else ""
-                place_pending_entry_for_backtest(
+                if not stage_delayed_trend_entry(
                     candidate,
                     context,
                     now_ms,
-                    curr_price,
-                    cash_equity,
                     trade_seq,
                     candidate_signal_bar,
-                )
+                    args.trend_entry_delay,
+                ):
+                    place_pending_entry_for_backtest(
+                        candidate,
+                        context,
+                        now_ms,
+                        curr_price,
+                        cash_equity,
+                        trade_seq,
+                        candidate_signal_bar,
+                    )
             elif candidates:
                 backtest_runtime["events"].append(make_event(
                     "SKIP",
@@ -1098,6 +1266,12 @@ def run_backtest(args):
                     details={"candidate_count": len(candidates)},
                 ))
             strategy.trade_state["last_processed_bar_5m"] = signal_bar_5m
+            if signal_guard_15m.get("valid") and signal_guard_15m.get("is_new"):
+                strategy.trade_state["last_processed_bar_15m"] = signal_bar_15m
+
+        if delayed_active_at_bar_start:
+            if signal_guard_5m.get("valid") and signal_guard_5m.get("is_new"):
+                strategy.trade_state["last_processed_bar_5m"] = signal_bar_5m
             if signal_guard_15m.get("valid") and signal_guard_15m.get("is_new"):
                 strategy.trade_state["last_processed_bar_15m"] = signal_bar_15m
 
@@ -1209,6 +1383,7 @@ def run_backtest(args):
             "defensive_atr_multiplier": strategy.ADAPTIVE_ENTRY_DEFENSIVE_ATR_MULTIPLIER,
         },
         "strategy_timeframes": list(strategy.STRATEGY_TIMEFRAMES),
+        "trend_entry_delay": args.trend_entry_delay,
         "enable_single_strong_entry": strategy.ENABLE_SINGLE_STRONG_ENTRY,
         "enable_synthetic_strong_entry": strategy.ENABLE_SYNTHETIC_STRONG_ENTRY,
         "ai_research_mode": strategy.AI_RESEARCH_CONFIG.mode,
@@ -1227,6 +1402,8 @@ def run_backtest(args):
         "pending_entry_count": len([e for e in backtest_runtime["events"] if e["event_type"] == "PENDING_ENTRY"]),
         "pending_trigger_count": len([e for e in backtest_runtime["events"] if e["event_type"] == "PENDING_TRIGGER"]),
         "pending_cancel_count": len([e for e in backtest_runtime["events"] if e["event_type"] == "PENDING_CANCEL"]),
+        "trend_entry_wait_count": len([e for e in backtest_runtime["events"] if e["event_type"] == "TREND_ENTRY_WAIT"]),
+        "trend_entry_release_count": len([e for e in backtest_runtime["events"] if e["event_type"] == "TREND_ENTRY_RELEASE"]),
         "open_count": len([e for e in backtest_runtime["events"] if e["event_type"] == "OPEN"]),
         "close_count": len([e for e in backtest_runtime["events"] if e["event_type"] == "CLOSE"]),
         "assumptions": [
@@ -1238,6 +1415,8 @@ def run_backtest(args):
             f"If trigger and fill happen within the same {execution_timeframe} candle, intrabar order is approximated from OHLC range.",
             f"STOP_MARKET workingType=MARK_PRICE is simulated with {execution_timeframe} mark-price candles when available.",
             "No fixed take-profit limit order and no half take-profit are simulated.",
+            "Trend-entry delay applies only to trend_trigger candidates; SR rebound and breakout candidates are unchanged.",
+            "At delay expiry, current trend filters are revalidated. A still-crossed original trigger is rebuilt from the delayed candle; otherwise the original trigger remains pending.",
             "Every simulated STOP_LIMIT trigger is placed on the not-yet-triggered side of the observable close.",
         ],
         "outputs": {
