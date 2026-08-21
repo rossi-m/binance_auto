@@ -122,7 +122,8 @@ EMAIL_RECEIVER = os.getenv('EMAIL_RECEIVER', EMAIL_SENDER).strip()  # 默认把�
 # --- 交易策略参数 ---
 SYMBOL = 'ETH/USDT'  # 设置交易对为ETH/USDT
 LEVERAGE = 10  # 设置合约的杠杆倍数为10倍
-MARGIN_RATE = 0.6  # 设置每次开仓使用的保证金比例，使用余额的60%
+MARGIN_RATE = 0.6  # 单笔最多使用余额的60%作为保证金。
+RISK_PER_TRADE = 0.02  # 默认单笔价格风险为账户权益的2%；可用 --risk-per-trade 覆盖。
 STOP_WORKING_TYPE = 'MARK_PRICE'  # 服务端条件止损按标记价格触发，避免只看最新成交价带来的偏差
 STOP_ORDER_CANCEL_CONFIRM_RETRIES = 5  # 撤掉旧条件单后，最多确认 5 次交易所侧是否真的消失
 STOP_ORDER_CANCEL_CONFIRM_SLEEP_SECONDS = 0.2  # 每次确认旧条件单状态之间的等待时间
@@ -264,6 +265,10 @@ OPPOSITE_STRONG_LOOKBACK = 24
 STRONG_CHOP_LOOKBACK_BARS = 4
 # 初始止损距离使用 ATR 的倍数，决定入场后第一版保护止损有多宽。
 ENTRY_ATR_STOP_MULTIPLIER = 1.0
+# 趋势条件单相对触发K线高/低点的入场缓冲，使用触发周期自身的 ATR。
+ENTRY_TRIGGER_ATR_MULTIPLIER = 1.0
+# 生产策略默认使用 ATR；回测器可临时切换为 tick，用于同参数基准对比。
+ENTRY_TRIGGER_BUFFER_MODE = 'atr'
 # 极强趋势下把原始止损距离缩到该比例，0.5 表示止损距离减半。
 EXTREME_ADX_STOP_RISK_RATIO = 0.5
 # 趋势触发开仓的初始风险距离至少要达到策略周期 ATR 的比例，过滤贴脸止损。
@@ -1271,13 +1276,58 @@ def sr_breakout_reverse_reclaimed_zone(side, zone, strong):
     return close <= price_to_float(zone.get('upper'))
 
 
-def calculate_candidate_amount(entry_price, stop_price, candidate=None, account_equity=None):
-    """按候选信号计算仓位；SR breakout 只过滤过宽止损，其它保持原仓位模型。"""
+def calculate_candidate_amount_raw(entry_price, stop_price, candidate=None, account_equity=0.0):
+    """按2%固定风险定仓，并用60%保证金上限约束数量。"""
     candidate = candidate or {}
     entry_price = price_to_float(entry_price)
     stop_price = price_to_float(stop_price)
-    if entry_price <= 0:
-        return 0, {'mode': 'invalid_entry_price'}
+    account_equity = price_to_float(account_equity)
+    if entry_price <= 0 or account_equity <= 0:
+        return 0, {'mode': 'invalid_entry_or_equity'}
+
+    risk_distance = abs(entry_price - stop_price)
+    if risk_distance <= 0:
+        return 0, {
+            'mode': 'invalid_risk_distance',
+            'entry_price': entry_price,
+            'stop_price': stop_price,
+            'risk_distance': risk_distance,
+        }
+
+    atr_4h = price_to_float(candidate.get('profit_check_atr'))
+    risk_atr = risk_distance / atr_4h if atr_4h > 0 else 0.0
+    if candidate.get('module') == 'sr_breakout' and not sr_breakout_risk_distance_allowed(risk_distance, atr_4h):
+        return 0, {
+            'mode': 'sr_breakout_risk_skip',
+            'risk_distance': risk_distance,
+            'atr_4h': atr_4h,
+            'risk_atr': risk_atr
+        }
+
+    risk_budget = account_equity * RISK_PER_TRADE
+    risk_amount = risk_budget / risk_distance
+    max_margin_amount = account_equity * MARGIN_RATE * LEVERAGE / entry_price
+    amount = min(risk_amount, max_margin_amount)
+    estimated_stop_loss = amount * risk_distance
+    capped_by_margin = max_margin_amount < risk_amount
+    return amount, {
+        'mode': 'fixed_risk_capped_by_margin' if capped_by_margin else 'fixed_risk',
+        'risk_per_trade': RISK_PER_TRADE,
+        'risk_budget': risk_budget,
+        'risk_distance': risk_distance,
+        'atr_4h': atr_4h,
+        'risk_atr': risk_atr,
+        'risk_amount': risk_amount,
+        'max_margin_amount': max_margin_amount,
+        'selected_amount': amount,
+        'estimated_stop_loss': estimated_stop_loss,
+        'estimated_risk_ratio': estimated_stop_loss / account_equity,
+        'account_equity': account_equity,
+    }
+
+
+def calculate_candidate_amount(entry_price, stop_price, candidate=None, account_equity=None):
+    """按候选信号计算仓位；实盘额外套用交易所数量精度。"""
 
     try:
         if account_equity is None:
@@ -1289,33 +1339,15 @@ def calculate_candidate_amount(entry_price, stop_price, candidate=None, account_
         logging.error(f"计算候选仓位读取账户余额失败: {e}")
         return 0, {'mode': 'balance_failed', 'error': str(e)}
 
-    normal_amount = account_equity * MARGIN_RATE * LEVERAGE / entry_price
-    if candidate.get('module') != 'sr_breakout':
-        return exchange.amount_to_precision(SYMBOL, normal_amount), {
-            'mode': 'normal_notional',
-            'normal_amount': normal_amount,
-            'account_equity': account_equity
-        }
-
-    risk_distance = abs(entry_price - stop_price)
-    atr_4h = price_to_float(candidate.get('profit_check_atr'))
-    risk_atr = risk_distance / atr_4h if atr_4h > 0 else 0.0
-    if not sr_breakout_risk_distance_allowed(risk_distance, atr_4h):
-        return 0, {
-            'mode': 'sr_breakout_risk_skip',
-            'risk_distance': risk_distance,
-            'atr_4h': atr_4h,
-            'risk_atr': risk_atr
-        }
-
-    return exchange.amount_to_precision(SYMBOL, normal_amount), {
-        'mode': 'sr_breakout_normal_notional_after_risk_filter',
-        'risk_distance': risk_distance,
-        'atr_4h': atr_4h,
-        'risk_atr': risk_atr,
-        'normal_amount': normal_amount,
-        'account_equity': account_equity
-    }
+    raw_amount, amount_meta = calculate_candidate_amount_raw(
+        entry_price,
+        stop_price,
+        candidate=candidate,
+        account_equity=account_equity,
+    )
+    if raw_amount <= 0:
+        return 0, amount_meta
+    return exchange.amount_to_precision(SYMBOL, raw_amount), amount_meta
 
 
 def get_trading_fee_rate(symbol=SYMBOL):
@@ -3033,6 +3065,22 @@ def pending_entry_price_still_reasonable(curr_price):
     return True, 'ok'
 
 
+def pending_entry_cancel_decision(context, curr_price):
+    """返回 pending 入场是否应撤销，供实盘管理和历史回放共用。"""
+    price_ok, price_reason = pending_entry_price_still_reasonable(curr_price)
+    if not price_ok:
+        return 'pending_entry_price_invalid', price_reason, 0
+
+    trend_ok, trend_reason = pending_entry_trend_still_valid(context)
+    if not trend_ok:
+        return 'pending_entry_trend_invalid', f"趋势不再支持 pending 方向: {trend_reason}", 0
+
+    age = pending_entry_age_seconds(now_dt=context.get('now_dt'))
+    if age > PENDING_ENTRY_MAX_AGE_SECONDS:
+        return 'pending_entry_expired', f"pending 入场单超时: age={age}s", age
+    return '', '', age
+
+
 def panic_close_pending_entry(side, amount, actual_price, reason, order=None):
     """pending 入场成交后发现无效，未转正式持仓前直接反向市价撤退。"""
     close_order_id = ''
@@ -3285,6 +3333,7 @@ def place_pending_entry_order(side, candidate, curr_price, state_4h, state_1h, s
         logging.error(f"拒绝挂 STOP_LIMIT 入场：读取账户资金失败: {e}")
         return False
 
+    # 固定风险只按策略明确的条件触发入场价与初始止损价计算，不计手续费和成交滑点。
     amount_raw, amount_meta = calculate_candidate_amount(
         entry_level,
         estimated_safe_stop,
@@ -3377,7 +3426,11 @@ def place_pending_entry_order(side, candidate, curr_price, state_4h, state_1h, s
             f"方向: {side}\n触发价: {stop_price}\n限价: {limit_price}\n当前价: {curr_price}\n"
             f"数量: {amount}\n保护止损: {precision_price(estimated_safe_stop)}\n目标位: {target}\n"
             f"允许滑点: {allowed_slippage:.4f}\n入场原因: {entry_reason}\n"
-            f"触发周期: {trade_state.get('pending_entry_trigger_tf')}\n仓位模式: {amount_meta.get('mode')}\n15M信号时间: {signal_bar_15m}\n"
+            f"触发周期: {trade_state.get('pending_entry_trigger_tf')}\n仓位模式: {amount_meta.get('mode')}\n"
+            f"风险预算: {price_to_float(amount_meta.get('risk_budget')):.4f} USDT\n"
+            f"预计止损亏损: {price_to_float(amount_meta.get('estimated_stop_loss')):.4f} USDT "
+            f"({price_to_float(amount_meta.get('estimated_risk_ratio')):.2%})\n"
+            f"15M信号时间: {signal_bar_15m}\n"
             f"开仓条件明细:\n{open_condition_details}\n开仓订单ID: {order_id}"
         )
         logging.info(
@@ -3480,24 +3533,10 @@ def manage_pending_entry(context, signal_bar_15m='', perf=None):
         return 'pending_entry_ai_filtered'
 
     curr_price = get_latest_price()
-    # 判断pending 入场价格是否仍然合理
-    price_ok, price_reason = pending_entry_price_still_reasonable(curr_price)
-    if not price_ok:
-        #取消条件委托
-        cancel_pending_entry_order(price_reason)
-        return 'pending_entry_price_invalid'
-
-    # 判断pending 入场趋势是否仍然支持
-    trend_ok, trend_reason = pending_entry_trend_still_valid(context)
-    if not trend_ok:
-        cancel_pending_entry_order(f"趋势不再支持 pending 方向: {trend_reason}")
-        return 'pending_entry_trend_invalid'
-
-    # 判断pending 入场订单是否超时
-    age = pending_entry_age_seconds(now_dt=context.get('now_dt'))
-    if age > PENDING_ENTRY_MAX_AGE_SECONDS:
-        cancel_pending_entry_order(f"pending 入场单超时: age={age}s")
-        return 'pending_entry_expired'
+    cancel_code, cancel_reason, age = pending_entry_cancel_decision(context, curr_price)
+    if cancel_code:
+        cancel_pending_entry_order(cancel_reason)
+        return cancel_code
 
     logging.info(
         f"pending STOP_LIMIT 入场继续等待: id={trade_state.get('pending_entry_order_id')}, "
@@ -4544,6 +4583,18 @@ def detect_entry_trigger(df, timeframe, side, now_dt=None):
     close = price_to_float(last.get('close'))
     atr = price_to_float(last.get('atr'))
     tick = get_price_tick(last.get('close'))
+    if ENTRY_TRIGGER_BUFFER_MODE == 'tick':
+        entry_buffer = tick
+    elif ENTRY_TRIGGER_BUFFER_MODE == 'atr':
+        entry_buffer = atr * ENTRY_TRIGGER_ATR_MULTIPLIER if atr > 0 else 0.0
+    else:
+        raise ValueError(f"不支持的趋势入场缓冲模式: {ENTRY_TRIGGER_BUFFER_MODE}")
+    if entry_buffer <= 0:
+        logging.info(
+            f"跳过{timeframe}趋势入场触发: 入场缓冲无效 "
+            f"mode={ENTRY_TRIGGER_BUFFER_MODE}, atr={atr}, tick={tick}"
+        )
+        return None
     # 最新一根 K线是否为大强K线
     large = latest_large_strong(df_closed)
     if large:
@@ -4557,14 +4608,14 @@ def detect_entry_trigger(df, timeframe, side, now_dt=None):
     if previous_large:
         if side == 'long':
             level = previous_large['high']
-            entry_level = level + tick
+            entry_level = level + entry_buffer
             structure_stop = previous_large['low'] - tick
             atr_stop = entry_level - ENTRY_ATR_STOP_MULTIPLIER * atr if atr > 0 else structure_stop
             stop = max(structure_stop, atr_stop)
             reason = f"{timeframe}前大强阳线高点触发位"
         else:
             level = previous_large['low']
-            entry_level = level - tick
+            entry_level = level - entry_buffer
             structure_stop = previous_large['high'] + tick
             atr_stop = entry_level + ENTRY_ATR_STOP_MULTIPLIER * atr if atr > 0 else structure_stop
             stop = min(structure_stop, atr_stop)
@@ -4583,6 +4634,7 @@ def detect_entry_trigger(df, timeframe, side, now_dt=None):
             'stop': precision_price(stop),
             'trigger': previous_large,
             'reason': reason,
+            'entry_buffer_atr': precision_price(entry_buffer),
             'structure_stop': precision_price(structure_stop),
             'atr_stop': precision_price(atr_stop),
             'stop_model': 'structure_with_atr_cap'
@@ -4593,10 +4645,10 @@ def detect_entry_trigger(df, timeframe, side, now_dt=None):
         if not strong:
             return None
         if side == 'long':
-            entry_level = strong['high'] + tick
+            entry_level = strong['high'] + entry_buffer
             stop = strong['low'] - tick
         else:
-            entry_level = strong['low'] - tick
+            entry_level = strong['low'] - entry_buffer
             stop = strong['high'] + tick
         logging.info(
             f"detect_entry_trigger命中 strong_candle: "
@@ -4611,6 +4663,7 @@ def detect_entry_trigger(df, timeframe, side, now_dt=None):
             'entry_level': precision_price(entry_level),
             'stop': precision_price(stop),
             'trigger': strong,
+            'entry_buffer_atr': precision_price(entry_buffer),
             'reason': f"{timeframe}最新{strong['kind']}强{'阳' if side == 'long' else '阴'}线"
         }
 
@@ -4624,11 +4677,11 @@ def detect_entry_trigger(df, timeframe, side, now_dt=None):
         if side == 'long':
             level = previous['high']
             stop = close - ENTRY_ATR_STOP_MULTIPLIER * atr
-            entry_level = level + tick
+            entry_level = level + entry_buffer
         else:
             level = previous['low']
             stop = close + ENTRY_ATR_STOP_MULTIPLIER * atr
-            entry_level = level - tick
+            entry_level = level - entry_buffer
         logging.info(
             f"detect_entry_trigger生成 opposite_strong_break: "
             f"timeframe={timeframe}, side={side}, level={level}, close={close}, "
@@ -4642,6 +4695,7 @@ def detect_entry_trigger(df, timeframe, side, now_dt=None):
             'entry_level': precision_price(entry_level),
             'stop': precision_price(stop),
             'trigger': previous,
+            'entry_buffer_atr': precision_price(entry_buffer),
             'reason': f"{timeframe}前强{'阴' if side == 'long' else '阳'}线关键位触发位"
         }
 
@@ -5272,6 +5326,40 @@ def candidate_target_profit_still_valid(candidate, curr_price):
     target = price_to_float(candidate.get('target'))
     atr = price_to_float(candidate.get('profit_check_atr'))
     return target_profit_still_valid(side, curr_price, stop, target, atr)
+
+
+def select_entry_candidate(candidates, context, curr_price, signal_bar_15m=''):
+    """Select and validate the entry candidate used by both live trading and replay."""
+    if not candidates:
+        return None, 'no_candidates', 'no_candidates'
+
+    best_priority = candidate_priority(candidates[0])
+    top_candidates = [
+        candidate for candidate in candidates
+        if candidate_priority(candidate) == best_priority
+    ]
+    if len({candidate.get('side') for candidate in top_candidates}) > 1:
+        return None, 'top_candidate_side_conflict', f'同权重候选多空冲突，跳过本轮: {top_candidates}'
+
+    candidate = top_candidates[0]
+    if (
+        candidate.get('strategy_tf') == '15m'
+        and signal_bar_15m in (
+            trade_state.get('last_entry_bar_15m'),
+            trade_state.get('last_exit_bar_15m'),
+        )
+    ):
+        return None, 'same_15m_bar_traded', f'同一15M K线内已交易/刚平仓，跳过15M策略开仓: {signal_bar_15m}'
+
+    checks = (
+        ('entry_price_invalid', candidate_entry_price_still_valid(candidate, curr_price)),
+        ('sr_zone_invalid', candidate_sr_entry_zone_still_valid(candidate, context, curr_price)),
+        ('target_profit_invalid', candidate_target_profit_still_valid(candidate, curr_price)),
+    )
+    for code, (valid, reason) in checks:
+        if not valid:
+            return None, code, reason
+    return candidate, 'ok', 'ok'
 
 
 def build_trend_trigger_candidates(context):
@@ -6547,18 +6635,40 @@ def is_in_post_exit_cooldown(now_dt):
     return (now_dt - last_exit_dt).total_seconds() < POST_EXIT_COOLDOWN_SECONDS
 
 
+def stop_candidate_is_executable(side, new_stop, current_stop, curr_price, tick):
+    """Return whether a stop is tighter and still placeable at the current price."""
+    if new_stop <= 0:
+        return False
+    if side == 'long':
+        return new_stop > current_stop and new_stop <= curr_price - tick
+    if side == 'short':
+        return (current_stop <= 0 or new_stop < current_stop) and new_stop >= curr_price + tick
+    return False
+
+
+def select_executable_stop_candidate(side, stop_candidates, current_stop, curr_price, tick):
+    """Choose the tightest currently executable stop, falling back from crossed candidates."""
+    executable = [
+        candidate for candidate in stop_candidates
+        if stop_candidate_is_executable(
+            side,
+            price_to_float(candidate[0]),
+            current_stop,
+            curr_price,
+            tick,
+        )
+    ]
+    if not executable:
+        return None
+    return max(executable, key=lambda item: item[0]) if side == 'long' else min(executable, key=lambda item: item[0])
+
+
 def update_stop_if_tighter(side, new_stop, reason, curr_price, signal_bar_15m='', perf=None):
     current_stop = price_to_float(trade_state.get('stop_loss_price'))
     new_stop = precision_price(new_stop)
     tick = get_price_tick(curr_price)
-    if new_stop <= 0:
+    if not stop_candidate_is_executable(side, new_stop, current_stop, curr_price, tick):
         return False
-    if side == 'long':
-        if new_stop <= current_stop or new_stop > curr_price - tick:
-            return False
-    else:
-        if (current_stop > 0 and new_stop >= current_stop) or new_stop < curr_price + tick:
-            return False
     refresh_start = time.monotonic()
     refreshed = refresh_protective_stop_order(new_stop)
     record_perf(perf, 'refresh_protective_stop_order', refresh_start)
@@ -6717,11 +6827,17 @@ def apply_new_exit_rules(context, signal_bar_15m='', curr_price=None, price_ts=N
         # 无候选止损位 → 不用调整
         if not stop_candidates:
             return
-        # 做多取最大止损价（最高防线）、做空取最小止损价（最低防线）
-        if side == 'long':
-            best_stop, reason = max(stop_candidates, key=lambda item: item[0])
-        else:
-            best_stop, reason = min(stop_candidates, key=lambda item: item[0])
+        current_stop = price_to_float(trade_state.get('stop_loss_price'))
+        best_candidate = select_executable_stop_candidate(
+            side,
+            stop_candidates,
+            current_stop,
+            curr_price,
+            tick,
+        )
+        if best_candidate is None:
+            return
+        best_stop, reason = best_candidate
         # 仅当新止损比当前止损更有利于仓位时才更新
         update_stop_if_tighter(side, best_stop, reason, curr_price, signal_bar_15m=signal_bar_15m, perf=perf)
     finally:
@@ -7272,51 +7388,21 @@ def _run_strategy_impl(perf):
             trade_state['last_processed_bar_15m'] = signal_bar_15m
         return 'no_candidates'
 
-    #这里选择优先级最高的候选信号，如果优先级相同并且有多个多空冲突则跳过
-    best_priority = candidate_priority(candidates[0])
-    top_candidates = [candidate for candidate in candidates if candidate_priority(candidate) == best_priority]
-    top_sides = {candidate['side'] for candidate in top_candidates}
-    if len(top_sides) > 1:
-        logging.info(f"同权重候选多空冲突，跳过本轮: {top_candidates}")
-        trade_state['last_processed_bar_5m'] = signal_bar_5m
-        if is_new_signal_15m:
-            trade_state['last_processed_bar_15m'] = signal_bar_15m
-        return 'top_candidate_side_conflict'
-
-    candidate = top_candidates[0]
-    if candidate['strategy_tf'] == '15m' and signal_bar_15m in (trade_state.get('last_entry_bar_15m'), trade_state.get('last_exit_bar_15m')):
-        logging.info(f"同一15M K线内已交易/刚平仓，跳过15M策略开仓: {signal_bar_15m}")
-        trade_state['last_processed_bar_5m'] = signal_bar_5m
-        if is_new_signal_15m:
-            trade_state['last_processed_bar_15m'] = signal_bar_15m
-        return 'same_15m_bar_traded'
     price_start = time.monotonic()
     curr_price = get_latest_price()
     record_perf(perf, 'get_latest_price', price_start)
-    #判断候选信号的入场价格是否仍然有效
-    entry_still_valid, entry_invalid_reason = candidate_entry_price_still_valid(candidate, curr_price)
-    if not entry_still_valid:
-        logging.info(entry_invalid_reason)
+    candidate, candidate_code, candidate_reason = select_entry_candidate(
+        candidates,
+        context,
+        curr_price,
+        signal_bar_15m=signal_bar_15m,
+    )
+    if candidate is None:
+        logging.info(candidate_reason)
         trade_state['last_processed_bar_5m'] = signal_bar_5m
         if is_new_signal_15m:
             trade_state['last_processed_bar_15m'] = signal_bar_15m
-        return 'entry_price_invalid'
-    #判断候选信号的入场价格是否仍然在支撑阻力区域内
-    sr_zone_still_valid, sr_zone_invalid_reason = candidate_sr_entry_zone_still_valid(candidate, context, curr_price)
-    if not sr_zone_still_valid:
-        logging.info(sr_zone_invalid_reason)
-        trade_state['last_processed_bar_5m'] = signal_bar_5m
-        if is_new_signal_15m:
-            trade_state['last_processed_bar_15m'] = signal_bar_15m
-        return 'sr_zone_invalid'
-    #判断候选信号的入场价格是否仍然在目标利润区域内
-    target_still_valid, target_invalid_reason = candidate_target_profit_still_valid(candidate, curr_price)
-    if not target_still_valid:
-        logging.info(target_invalid_reason)
-        trade_state['last_processed_bar_5m'] = signal_bar_5m
-        if is_new_signal_15m:
-            trade_state['last_processed_bar_15m'] = signal_bar_15m
-        return 'target_profit_invalid'
+        return candidate_code
 
     ai_guard = get_current_ai_guard()
     ai_entry_decision = evaluate_entry_candidate(candidate['side'], ai_guard, AI_RESEARCH_CONFIG)
@@ -7421,10 +7507,30 @@ def cli_arg_value(name):
     return sys.argv[idx + 1]
 
 
+def parse_risk_per_trade(value):
+    """解析单笔风险小数比例；0.02表示账户权益的2%。"""
+    try:
+        risk = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("--risk-per-trade 必须是小数比例，例如 0.02 表示2%") from exc
+    if not 0 < risk <= 1:
+        raise ValueError("--risk-per-trade 必须大于0且不超过1，例如 0.02 表示2%")
+    return risk
+
+
 # ==========================================
 # 4. 程序入口
 # ==========================================
 if __name__ == '__main__':
+    if '--risk-per-trade' in sys.argv:
+        risk_per_trade_raw = cli_arg_value('--risk-per-trade')
+        try:
+            RISK_PER_TRADE = parse_risk_per_trade(risk_per_trade_raw)
+        except ValueError as exc:
+            logging.error(str(exc))
+            sys.exit(2)
+    logging.info(f"单笔固定风险配置: {RISK_PER_TRADE:.2%}")
+
     if '--dry-run-open-order' in sys.argv:
         DRY_RUN_OPEN_ORDER = True
         logging.warning("DRY_RUN_OPEN_ORDER 已启用：本进程会拦截所有开仓，不会创建开仓订单")
