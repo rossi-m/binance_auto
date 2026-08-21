@@ -265,10 +265,32 @@ OPPOSITE_STRONG_LOOKBACK = 24
 STRONG_CHOP_LOOKBACK_BARS = 4
 # 初始止损距离使用 ATR 的倍数，决定入场后第一版保护止损有多宽。
 ENTRY_ATR_STOP_MULTIPLIER = 1.0
-# 趋势条件单相对触发K线高/低点的入场缓冲，使用触发周期自身的 ATR。
+# 固定 ATR 模式下，趋势条件单相对触发K线高/低点的入场缓冲倍数。
 ENTRY_TRIGGER_ATR_MULTIPLIER = 1.0
-# 生产策略默认使用 ATR；回测器可临时切换为 tick，用于同参数基准对比。
-ENTRY_TRIGGER_BUFFER_MODE = 'atr'
+# 生产策略默认按主趋势周期的 ADX/DI/EMA/波动率选择 tick、0.5 ATR 或 1 ATR。
+# 缓冲金额始终使用实际触发周期自身的 ATR；回测器仍可强制切换为固定 atr/tick。
+ENTRY_TRIGGER_BUFFER_MODE = 'adaptive'
+# ADX 上升、DI 方向差距清楚且 EMA 走势干净时，使用较近的 0.5 ATR 确认突破。
+ADAPTIVE_ENTRY_CLEAN_DI_GAP = 8.0
+ADAPTIVE_ENTRY_CLEAN_ATR_MULTIPLIER = 0.5
+# 极强趋势要求更大的 DI 差距；满足时直接使用交易品种的 1 tick。
+ADAPTIVE_ENTRY_EXTREME_DI_GAP = 12.0
+# 用 ATR/收盘价在最近样本中的百分位识别高波动，避免绑定某个固定价格或年份。
+ADAPTIVE_ENTRY_VOLATILITY_LOOKBACK = 100
+ADAPTIVE_ENTRY_HIGH_VOLATILITY_PERCENTILE = 0.70
+ADAPTIVE_ENTRY_VOLATILITY_MIN_SAMPLES = 30
+# 最近这些K线内 DI 主导方向至少切换两次，视为方向反复。
+ADAPTIVE_ENTRY_CHOP_LOOKBACK = 8
+ADAPTIVE_ENTRY_CHOP_MIN_DI_FLIPS = 2
+# ADX 下降且高波动或方向反复，以及无法明确分类的行情，都使用 1 ATR。
+ADAPTIVE_ENTRY_DEFENSIVE_ATR_MULTIPLIER = 1.0
+# 多单必须同时得到日线与4小时 EMA20 上行确认，避免在大级别下跌中的反弹阶段开多。
+ENABLE_DAILY_4H_LONG_EMA_FILTER = True
+# 背景 ADX 已下降时不再软放行新仓；回测 legacy 模式可恢复旧行为作对照。
+ALLOW_BACKGROUND_WEAKENING_SOFT = False
+# flat_adx / EMA持续性背景只有在 EMA 干净且 DI 仍明确同向时才软放行。
+STRICT_BACKGROUND_SOFT_ALLOW = True
+BACKGROUND_SOFT_ALLOW_MIN_DI_GAP = 8.0
 # 极强趋势下把原始止损距离缩到该比例，0.5 表示止损距离减半。
 EXTREME_ADX_STOP_RISK_RATIO = 0.5
 # 趋势触发开仓的初始风险距离至少要达到策略周期 ATR 的比例，过滤贴脸止损。
@@ -3044,9 +3066,7 @@ def pending_entry_trend_still_valid(context):
         return False, 'pending 入场方向/策略周期缺失'
 
     background_tf = trade_state.get('pending_entry_background_tf') or STRATEGY_BACKGROUND_TF.get(strategy_tf)
-    local_state = context.get('trend_states', {}).get(strategy_tf)
-    background_state = context.get('trend_states', {}).get(background_tf)
-    return context_allows_side(local_state, background_state, side)
+    return entry_context_allows_side(context, strategy_tf, background_tf, side)
 
 
 def pending_entry_price_still_reasonable(curr_price):
@@ -4214,6 +4234,41 @@ def count_ema_crosses(df_closed):
     return up_cross, down_cross
 
 
+def count_di_direction_flips(df_closed, lookback=ADAPTIVE_ENTRY_CHOP_LOOKBACK):
+    """统计最近若干根K线中 +DI/-DI 主导方向切换次数。"""
+    if df_closed is None or len(df_closed) == 0:
+        return 0
+    directions = []
+    for _, row in df_closed.tail(lookback).iterrows():
+        plus_di = price_to_float(row.get('plus_di'))
+        minus_di = price_to_float(row.get('minus_di'))
+        if plus_di > minus_di:
+            directions.append('long')
+        elif minus_di > plus_di:
+            directions.append('short')
+    return sum(1 for previous, current in zip(directions, directions[1:]) if previous != current)
+
+
+def atr_ratio_percentile_metrics(df_closed, lookback=ADAPTIVE_ENTRY_VOLATILITY_LOOKBACK):
+    """返回当前 ATR/收盘价及其在最近样本中的百分位，只使用已收盘K线。"""
+    ratios = []
+    if df_closed is not None:
+        for _, row in df_closed.tail(lookback).iterrows():
+            atr = price_to_float(row.get('atr'))
+            close = price_to_float(row.get('close'))
+            if atr > 0 and close > 0:
+                ratios.append(atr / close)
+    if not ratios:
+        return {'atr_ratio': 0.0, 'atr_ratio_percentile': 0.0, 'atr_ratio_sample_count': 0}
+    current = ratios[-1]
+    percentile = sum(1 for value in ratios if value <= current) / len(ratios)
+    return {
+        'atr_ratio': current,
+        'atr_ratio_percentile': percentile,
+        'atr_ratio_sample_count': len(ratios)
+    }
+
+
 def persistent_direction_before_index(df_closed, end_idx):
     """
     检查在 end_idx 之前的 EMA_PERSISTENCE_BARS(20) 根 K 线中，
@@ -4379,12 +4434,16 @@ def evaluate_adx_ema_context(df, timeframe, now_dt=None):
     ema20_ref = price_to_float(ema_ref.get('ema20'))
     #判断最近4根k线是否上下穿ema20
     up_cross, down_cross = count_ema_crosses(df_closed)
+    ema_cross_count = up_cross + down_cross
     ema_clean = up_cross <= 1 and down_cross <= 1
     ema_up = ema20 > ema20_ref
     ema_down = ema20 < ema20_ref
     adx_rising = adx > prev_adx
     adx_falling = adx < prev_adx
     extreme = adx > adx_extreme
+    di_gap = abs(plus_di - minus_di)
+    di_direction_flips = count_di_direction_flips(df_closed)
+    volatility = atr_ratio_percentile_metrics(df_closed)
     persistence = recent_ema_persistence(df_closed) if timeframe in ('15m', '1h', '4h') else {'direction': None}
 
     # details 会写入日志/CSV/状态摘要，保留实际使用的 ADX 配置便于复盘。
@@ -4396,15 +4455,21 @@ def evaluate_adx_ema_context(df, timeframe, now_dt=None):
         'adx_extreme': adx_extreme,
         'adx': adx,
         'prev_adx': prev_adx,
+        'adx_rising': adx_rising,
+        'adx_falling': adx_falling,
         'plus_di': plus_di,
         'minus_di': minus_di,
+        'di_gap': di_gap,
+        'di_direction_flips': di_direction_flips,
         'ema20': ema20,
         'ema20_ref': ema20_ref,
         'up_cross': up_cross,
         'down_cross': down_cross,
+        'ema_cross_count': ema_cross_count,
         'ema_clean': ema_clean,
         'ema_persistence': persistence,
-        'extreme_adx': extreme
+        'extreme_adx': extreme,
+        **volatility
     }
 
     if (
@@ -4519,6 +4584,53 @@ def context_deny_reason(side, reason, local_state, background_state):
     )
 
 
+def state_ema_slope_direction(state):
+    """根据当前 EMA20 与回看 EMA20 判断均线斜率方向。"""
+    details = state.get('details') if isinstance(state, dict) else None
+    if not isinstance(details, dict):
+        return None
+    ema20 = price_to_float(details.get('ema20'))
+    ema20_ref = price_to_float(details.get('ema20_ref'))
+    if ema20 <= 0 or ema20_ref <= 0:
+        return None
+    if ema20 > ema20_ref:
+        return 'long'
+    if ema20 < ema20_ref:
+        return 'short'
+    return 'flat'
+
+
+def background_soft_allows_side(background_state, side):
+    """严格校验 weakening/flat_adx/EMA持续性背景是否可以软放行。"""
+    status = background_state.get('status') if isinstance(background_state, dict) else None
+    if status == f'{side}_weakening':
+        if ALLOW_BACKGROUND_WEAKENING_SOFT:
+            return True, 'legacy weakening软放行'
+        return False, '背景ADX下降，禁止weakening软放行'
+
+    if status not in (f'{side}_flat_adx', f'ema20_{side}_persistence'):
+        return False, f'背景状态{status}不在软放行范围'
+    if not STRICT_BACKGROUND_SOFT_ALLOW:
+        return True, 'legacy背景软放行'
+
+    details = background_state.get('details') or {}
+    ema_cross_count = int(price_to_float(details.get('ema_cross_count')))
+    ema_clean = bool(details.get('ema_clean')) and ema_cross_count <= 1
+    plus_di = price_to_float(details.get('plus_di'))
+    minus_di = price_to_float(details.get('minus_di'))
+    di_gap = price_to_float(details.get('di_gap'))
+    if di_gap <= 0:
+        di_gap = abs(plus_di - minus_di)
+    di_same_side = plus_di > minus_di if side == 'long' else minus_di > plus_di
+    if not ema_clean:
+        return False, f'背景EMA不干净或穿越过多: cross={ema_cross_count}'
+    if not di_same_side:
+        return False, '背景DI方向已经反转'
+    if di_gap < BACKGROUND_SOFT_ALLOW_MIN_DI_GAP:
+        return False, f'背景DI差不足: {di_gap:.2f} < {BACKGROUND_SOFT_ALLOW_MIN_DI_GAP:.2f}'
+    return True, f'背景EMA干净且DI同向: gap={di_gap:.2f}'
+
+
 def context_allows_side(local_state, background_state, side):
     """
     多周期趋势联合校验（入场前必须通过）。
@@ -4528,7 +4640,7 @@ def context_allows_side(local_state, background_state, side):
         3. 背景周期方向不能相反
         4. 背景周期状态不能是 range/transition/unclear
         5. 本地周期允许开仓
-        6. 背景周期确认同向（允许 weakening/flat_adx/ema_persistence 软通过）
+        6. 背景周期确认同向（weakening 默认拒绝；flat_adx/ema_persistence 严格软通过）
     返回: (allowed: bool, deny_reason: str)
     """
     if not local_state or not background_state:
@@ -4551,20 +4663,184 @@ def context_allows_side(local_state, background_state, side):
     if not local_state.get(local_open_key) and local_state.get('direction') != side:
         return False, context_deny_reason(side, f"{local_state.get('timeframe')} 本级别未给出{side_label(side)}方向", local_state, background_state)
 
-    # 背景周期：方向一致 + (明确允许开仓 或 软通过状态 weakening/flat_adx/ema_persistence)
+    # 背景周期：方向一致 + (明确允许开仓 或 严格软通过 flat_adx/ema_persistence)
     bg_same_side = background_state.get('direction') == side
     bg_open_key = 'can_open_long' if side == 'long' else 'can_open_short'
-    bg_soft_allow = background_state.get('status') in (
-        f'{side}_weakening',
-        f'{side}_flat_adx',
-        f'ema20_{side}_persistence'
-    )
+    bg_soft_allow, bg_soft_reason = background_soft_allows_side(background_state, side)
     if not bg_same_side or (not background_state.get(bg_open_key) and not bg_soft_allow):
-        return False, context_deny_reason(side, f"{background_state.get('timeframe')} 背景未确认{side_label(side)}方向", local_state, background_state)
+        return False, context_deny_reason(
+            side,
+            f"{background_state.get('timeframe')} 背景未确认{side_label(side)}方向: {bg_soft_reason}",
+            local_state,
+            background_state,
+        )
     return True, 'ok'
 
 
-def detect_entry_trigger(df, timeframe, side, now_dt=None):
+def entry_context_allows_side(context, local_tf, background_tf, side):
+    """统一入场过滤：原多周期判断之上，为多单增加日线与4小时 EMA 同向确认。"""
+    trend_states = context.get('trend_states', {}) if isinstance(context, dict) else {}
+    local_state = trend_states.get(local_tf)
+    background_state = trend_states.get(background_tf)
+    allowed, reason = context_allows_side(local_state, background_state, side)
+    if not allowed:
+        return False, reason
+    if side != 'long' or not ENABLE_DAILY_4H_LONG_EMA_FILTER:
+        return True, 'ok'
+
+    state_4h = trend_states.get('4h')
+    state_1d = trend_states.get('1d')
+    ema_4h = state_ema_slope_direction(state_4h)
+    ema_1d = state_ema_slope_direction(state_1d)
+    if ema_4h != 'long' or ema_1d != 'long':
+        return False, (
+            f"多方向过滤: 日线与4小时EMA20未同时向上 "
+            f"(1d={ema_1d}, 4h={ema_4h}); "
+            f"1d[{format_context_state(state_1d)}]; "
+            f"4h[{format_context_state(state_4h)}]"
+        )
+    return True, 'ok'
+
+
+def select_adaptive_trend_entry_buffer(local_state, side):
+    """根据主趋势周期状态选择 tick、0.5 ATR 或 1 ATR 入场缓冲。"""
+    state = local_state if isinstance(local_state, dict) else {}
+    details = state.get('details') if isinstance(state.get('details'), dict) else {}
+    adx = price_to_float(details.get('adx'))
+    prev_adx = price_to_float(details.get('prev_adx'))
+    adx_rising = bool(details.get('adx_rising', adx > prev_adx))
+    adx_falling = bool(details.get('adx_falling', adx < prev_adx))
+    di_gap = price_to_float(details.get('di_gap'))
+    if di_gap <= 0:
+        di_gap = abs(price_to_float(details.get('plus_di')) - price_to_float(details.get('minus_di')))
+    ema_cross_count = int(price_to_float(details.get('ema_cross_count')))
+    ema_clean = bool(details.get('ema_clean')) and ema_cross_count <= 1
+    di_flips = int(price_to_float(details.get('di_direction_flips')))
+    volatility_percentile = price_to_float(details.get('atr_ratio_percentile'))
+    volatility_samples = int(price_to_float(details.get('atr_ratio_sample_count')))
+    high_volatility = (
+        volatility_samples >= ADAPTIVE_ENTRY_VOLATILITY_MIN_SAMPLES
+        and volatility_percentile >= ADAPTIVE_ENTRY_HIGH_VOLATILITY_PERCENTILE
+    )
+    direction_choppy = (
+        di_flips >= ADAPTIVE_ENTRY_CHOP_MIN_DI_FLIPS
+        or ema_cross_count >= 2
+    )
+    direction_matches = state.get('direction') == side
+    metrics = {
+        'timeframe': state.get('timeframe', ''),
+        'adx': adx,
+        'prev_adx': prev_adx,
+        'adx_rising': adx_rising,
+        'adx_falling': adx_falling,
+        'di_gap': di_gap,
+        'ema_clean': ema_clean,
+        'ema_cross_count': ema_cross_count,
+        'di_direction_flips': di_flips,
+        'atr_ratio': price_to_float(details.get('atr_ratio')),
+        'atr_ratio_percentile': volatility_percentile,
+        'atr_ratio_sample_count': volatility_samples,
+        'high_volatility': high_volatility,
+        'direction_choppy': direction_choppy,
+    }
+
+    if (
+        direction_matches
+        and bool(details.get('extreme_adx'))
+        and adx_rising
+        and di_gap >= ADAPTIVE_ENTRY_EXTREME_DI_GAP
+        and ema_clean
+    ):
+        return {
+            'regime': 'extreme_trend_breakout',
+            'mode': 'tick',
+            'atr_multiplier': 0.0,
+            'reason': (
+                f"极强趋势突破: ADX上升且达到极强阈值, "
+                f"DI差={di_gap:.2f}, EMA干净"
+            ),
+            'metrics': metrics,
+        }
+
+    if direction_matches and adx_falling and (high_volatility or direction_choppy):
+        noisy_reasons = []
+        if high_volatility:
+            noisy_reasons.append(f"波动率百分位={volatility_percentile:.0%}")
+        if direction_choppy:
+            noisy_reasons.append(f"DI切换={di_flips}, EMA穿越={ema_cross_count}")
+        return {
+            'regime': 'weakening_or_choppy',
+            'mode': 'atr',
+            'atr_multiplier': ADAPTIVE_ENTRY_DEFENSIVE_ATR_MULTIPLIER,
+            'reason': f"ADX下降且{'/'.join(noisy_reasons)}",
+            'metrics': metrics,
+        }
+
+    if (
+        direction_matches
+        and adx_rising
+        and di_gap >= ADAPTIVE_ENTRY_CLEAN_DI_GAP
+        and ema_clean
+    ):
+        return {
+            'regime': 'clean_trend',
+            'mode': 'atr',
+            'atr_multiplier': ADAPTIVE_ENTRY_CLEAN_ATR_MULTIPLIER,
+            'reason': f"干净趋势: ADX上升, DI差={di_gap:.2f}, EMA干净",
+            'metrics': metrics,
+        }
+
+    return {
+        'regime': 'default_defensive',
+        'mode': 'atr',
+        'atr_multiplier': ADAPTIVE_ENTRY_DEFENSIVE_ATR_MULTIPLIER,
+        'reason': '未满足极强或干净趋势条件，使用保护档',
+        'metrics': metrics,
+    }
+
+
+def resolve_trend_entry_buffer(atr, tick, adaptive_policy=None):
+    """把全局固定模式或自适应档位转换成实际价格缓冲。"""
+    mode = ENTRY_TRIGGER_BUFFER_MODE
+    if mode == 'adaptive':
+        policy = adaptive_policy or {
+            'regime': 'adaptive_default',
+            'mode': 'atr',
+            'atr_multiplier': ENTRY_TRIGGER_ATR_MULTIPLIER,
+            'reason': '未提供趋势状态，使用固定ATR兜底',
+            'metrics': {},
+        }
+    elif mode == 'tick':
+        policy = {
+            'regime': 'forced_tick',
+            'mode': 'tick',
+            'atr_multiplier': 0.0,
+            'reason': '配置强制使用1 tick',
+            'metrics': {},
+        }
+    elif mode == 'atr':
+        policy = {
+            'regime': 'forced_atr',
+            'mode': 'atr',
+            'atr_multiplier': ENTRY_TRIGGER_ATR_MULTIPLIER,
+            'reason': f"配置强制使用{ENTRY_TRIGGER_ATR_MULTIPLIER:g} ATR",
+            'metrics': {},
+        }
+    else:
+        raise ValueError(f"不支持的趋势入场缓冲模式: {mode}")
+
+    selected_mode = policy.get('mode')
+    if selected_mode == 'tick':
+        entry_buffer = tick
+    elif selected_mode == 'atr':
+        multiplier = price_to_float(policy.get('atr_multiplier'))
+        entry_buffer = atr * multiplier if atr > 0 and multiplier > 0 else 0.0
+    else:
+        raise ValueError(f"不支持的自适应趋势入场缓冲模式: {selected_mode}")
+    return entry_buffer, policy
+
+
+def detect_entry_trigger(df, timeframe, side, now_dt=None, entry_buffer_policy=None):
     """
     入场触发检测器 — 在趋势确认后，寻找具体的 K 线形态入场信号。
     按优先级依次检查：
@@ -4583,18 +4859,27 @@ def detect_entry_trigger(df, timeframe, side, now_dt=None):
     close = price_to_float(last.get('close'))
     atr = price_to_float(last.get('atr'))
     tick = get_price_tick(last.get('close'))
-    if ENTRY_TRIGGER_BUFFER_MODE == 'tick':
-        entry_buffer = tick
-    elif ENTRY_TRIGGER_BUFFER_MODE == 'atr':
-        entry_buffer = atr * ENTRY_TRIGGER_ATR_MULTIPLIER if atr > 0 else 0.0
-    else:
-        raise ValueError(f"不支持的趋势入场缓冲模式: {ENTRY_TRIGGER_BUFFER_MODE}")
+    entry_buffer, resolved_buffer_policy = resolve_trend_entry_buffer(
+        atr,
+        tick,
+        adaptive_policy=entry_buffer_policy,
+    )
     if entry_buffer <= 0:
         logging.info(
             f"跳过{timeframe}趋势入场触发: 入场缓冲无效 "
-            f"mode={ENTRY_TRIGGER_BUFFER_MODE}, atr={atr}, tick={tick}"
+            f"mode={ENTRY_TRIGGER_BUFFER_MODE}, policy={resolved_buffer_policy}, atr={atr}, tick={tick}"
         )
         return None
+    buffer_fields = {
+        # 保留旧字段兼容既有回测输出；新字段明确记录单位和自适应原因。
+        'entry_buffer_atr': precision_price(entry_buffer),
+        'entry_buffer': precision_price(entry_buffer),
+        'entry_buffer_mode': resolved_buffer_policy.get('mode'),
+        'entry_buffer_regime': resolved_buffer_policy.get('regime'),
+        'entry_buffer_atr_multiplier': price_to_float(resolved_buffer_policy.get('atr_multiplier')),
+        'entry_buffer_reason': resolved_buffer_policy.get('reason', ''),
+        'entry_buffer_metrics': resolved_buffer_policy.get('metrics', {}),
+    }
     # 最新一根 K线是否为大强K线
     large = latest_large_strong(df_closed)
     if large:
@@ -4634,7 +4919,7 @@ def detect_entry_trigger(df, timeframe, side, now_dt=None):
             'stop': precision_price(stop),
             'trigger': previous_large,
             'reason': reason,
-            'entry_buffer_atr': precision_price(entry_buffer),
+            **buffer_fields,
             'structure_stop': precision_price(structure_stop),
             'atr_stop': precision_price(atr_stop),
             'stop_model': 'structure_with_atr_cap'
@@ -4663,7 +4948,7 @@ def detect_entry_trigger(df, timeframe, side, now_dt=None):
             'entry_level': precision_price(entry_level),
             'stop': precision_price(stop),
             'trigger': strong,
-            'entry_buffer_atr': precision_price(entry_buffer),
+            **buffer_fields,
             'reason': f"{timeframe}最新{strong['kind']}强{'阳' if side == 'long' else '阴'}线"
         }
 
@@ -4695,7 +4980,7 @@ def detect_entry_trigger(df, timeframe, side, now_dt=None):
             'entry_level': precision_price(entry_level),
             'stop': precision_price(stop),
             'trigger': previous,
-            'entry_buffer_atr': precision_price(entry_buffer),
+            **buffer_fields,
             'reason': f"{timeframe}前强{'阴' if side == 'long' else '阳'}线关键位触发位"
         }
 
@@ -5378,17 +5663,31 @@ def build_trend_trigger_candidates(context):
 
         for side in ('long', 'short'):
             # 多周期校验背景趋势
-            allowed, deny_reason = context_allows_side(local_state, background_state, side)
+            allowed, deny_reason = entry_context_allows_side(context, strategy_tf, background_tf, side)
             if not allowed:
                 logging.info(f"跳过{strategy_tf}->{trigger_tf} {side}: {deny_reason}")
                 continue
+            entry_buffer_policy = select_adaptive_trend_entry_buffer(local_state, side)
             # 在确认趋势条件满足后，用来寻找开仓信号
-            trigger = detect_entry_trigger(trigger_df, trigger_tf, side, now_dt=context['now_dt'])
+            trigger = detect_entry_trigger(
+                trigger_df,
+                trigger_tf,
+                side,
+                now_dt=context['now_dt'],
+                entry_buffer_policy=entry_buffer_policy,
+            )
             if not trigger:
                 continue
             if trigger.get('blocked'):
                 logging.info(trigger.get('reason'))
                 continue
+            logging.info(
+                f"趋势入场缓冲{strategy_tf}->{trigger_tf} {side}: "
+                f"regime={trigger.get('entry_buffer_regime')}, "
+                f"mode={trigger.get('entry_buffer_mode')}, "
+                f"buffer={price_to_float(trigger.get('entry_buffer')):.4f}, "
+                f"reason={trigger.get('entry_buffer_reason')}"
+            )
 
             entry_ref = price_to_float(trigger.get('entry_level'))
             stop = price_to_float(trigger['stop'])
@@ -5442,8 +5741,24 @@ def build_trend_trigger_candidates(context):
                 'target_zone': target_zone,
                 'profit_check_atr': trigger_atr,
                 'sr_filter_atr': sr_filter_atr,
-                'reason': f"{strategy_tf}趋势 + {trigger['reason']}",
-                'state_summary': f"{strategy_tf}/{background_tf}/{trigger_tf}: {trigger['reason']}; bg={background_state.get('status')}",
+                'entry_buffer_regime': trigger.get('entry_buffer_regime', ''),
+                'entry_buffer_mode': trigger.get('entry_buffer_mode', ''),
+                'entry_buffer': trigger.get('entry_buffer', 0.0),
+                'entry_buffer_atr_multiplier': trigger.get('entry_buffer_atr_multiplier', 0.0),
+                'entry_buffer_reason': trigger.get('entry_buffer_reason', ''),
+                'entry_buffer_metrics': trigger.get('entry_buffer_metrics', {}),
+                'reason': (
+                    f"{strategy_tf}趋势 + {trigger['reason']}; "
+                    f"入场缓冲={trigger.get('entry_buffer_regime')}/"
+                    f"{trigger.get('entry_buffer_mode')}({price_to_float(trigger.get('entry_buffer')):.4f})"
+                ),
+                'state_summary': (
+                    f"{strategy_tf}/{background_tf}/{trigger_tf}: {trigger['reason']}; "
+                    f"bg={background_state.get('status')}; "
+                    f"buffer={trigger.get('entry_buffer_regime')}/"
+                    f"{trigger.get('entry_buffer_mode')}({price_to_float(trigger.get('entry_buffer')):.4f}); "
+                    f"{trigger.get('entry_buffer_reason')}"
+                ),
                 'trigger': trigger
             })
     return candidates
@@ -5462,7 +5777,7 @@ def build_entry_candidates(context):
     candidates = build_trend_trigger_candidates(context)
     for side in ('long', 'short'):
         # 15m+1h 多周期校验趋势 → 决定是否生成 SR反弹候选
-        allowed, deny_reason = context_allows_side(context['trend_states'].get('15m'), context['trend_states'].get('1h'), side)
+        allowed, deny_reason = entry_context_allows_side(context, '15m', '1h', side)
         if allowed:
             # 构建SR反弹候选信号：价格到达支撑/阻力位置并站稳，使用1h和15m确认
             candidates.extend(build_sr_rebound_candidates(context, side))
@@ -5470,7 +5785,7 @@ def build_entry_candidates(context):
             logging.info(f"跳过SR反弹{side}: {deny_reason}")
 
         # 4h+1d 多周期校验趋势 → 决定是否生成 SR突破候选
-        allowed, deny_reason = context_allows_side(context['trend_states'].get('4h'), context['trend_states'].get('1d'), side)
+        allowed, deny_reason = entry_context_allows_side(context, '4h', '1d', side)
         if allowed:
             # 构建SR突破候选信号：K线突破了关键位置并且站稳，使用4h
             candidates.extend(build_sr_breakout_candidates(context, side))
