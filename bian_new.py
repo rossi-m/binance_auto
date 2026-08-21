@@ -294,7 +294,7 @@ ENABLE_DAILY_4H_LONG_EMA_FILTER = True
 ALLOW_BACKGROUND_WEAKENING_SOFT = False
 # flat_adx / EMA持续性背景只有在 EMA 干净且 DI 仍明确同向时才软放行。
 STRICT_BACKGROUND_SOFT_ALLOW = True
-BACKGROUND_SOFT_ALLOW_MIN_DI_GAP = 8.0
+BACKGROUND_SOFT_ALLOW_MIN_DI_GAP = 4.0
 # 极强趋势下把原始止损距离缩到该比例，0.5 表示止损距离减半。
 EXTREME_ADX_STOP_RISK_RATIO = 0.5
 # 趋势触发开仓的初始风险距离至少要达到策略周期 ATR 的比例，过滤贴脸止损。
